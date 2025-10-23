@@ -1,0 +1,109 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>AI News Fetcher</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body class="bg-gray-50 text-gray-800">
+    <div class="max-w-3xl mx-auto mt-16 p-6 bg-white rounded-2xl shadow-lg">
+        <h1 class="text-3xl font-bold text-center mb-4">AI News Fetcher 🧠</h1>
+        <p class="text-center text-gray-600 mb-6">
+            Ask for any topic, and I’ll summarize today’s latest news with verified sources.
+        </p>
+
+        <div class="flex gap-2">
+            <input id="query" type="text" class="flex-1 border p-3 rounded-lg" placeholder="Enter your topic, e.g. Google Brain">
+            <button onclick="fetchNews()" class="bg-blue-600 text-white px-4 rounded-lg hover:bg-blue-700">Search</button>
+        </div>
+
+        <div id="loading" class="hidden text-center mt-6 text-blue-600 font-medium">Fetching the latest news...</div>
+
+        <div id="result" class="mt-6 hidden">
+            <h2 class="text-xl font-semibold mb-2">Summary</h2>
+            <p id="summary" class="mb-4 space-y-4"></p>
+
+            <h3 class="font-semibold mb-2">Sources:</h3>
+            <ul id="sources" class="list-disc ml-5 space-y-1"></ul>
+        </div>
+    </div>
+
+    <script>
+        async function fetchNews() {
+            const query = document.getElementById("query").value.trim();
+            const loading = document.getElementById("loading");
+            const resultDiv = document.getElementById("result");
+            const summary = document.getElementById("summary");
+            const sources = document.getElementById("sources");
+
+            if (!query) return alert("Please enter a topic first.");
+
+            loading.classList.remove("hidden");
+            resultDiv.classList.add("hidden");
+            summary.innerHTML = ""; // Clear old results
+            sources.innerHTML = ""; // Clear old results
+
+            // --- THIS IS THE NEW ERROR-HANDLING LOGIC ---
+            try {
+                const response = await fetch("/fetch", {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({ query })
+                });
+
+                // This will read the response as text first, so we can see it
+                const responseText = await response.text();
+                let data;
+
+                try {
+                    // Try to parse it as JSON
+                    data = JSON.parse(responseText);
+                } catch (parseError) {
+                    // If parsing fails, it's an HTML error page
+                    console.error("Failed to parse JSON:", responseText);
+                    alert("The server returned an invalid response (not JSON). Check the console (F12) for the full HTML error log.");
+                    loading.classList.add("hidden"); // Hide loading
+                    return;
+                }
+                
+                // --- This point is only reached if JSON was valid ---
+                loading.classList.add("hidden");
+
+                if (data.error) {
+                    alert(data.error);
+                    return;
+                }
+                
+                // Check if we got any summaries
+                if (data.summaries && data.summaries.length > 0) {
+                    data.summaries.forEach(item => {
+                        summary.innerHTML += `
+                            <div class="prose max-w-none p-4 border rounded-lg bg-gray-50">
+                                ${item.summary}
+                            </div>
+                        `;
+                        sources.innerHTML += `
+                            <li>
+                                <a href="${item.url}" target="_blank" class="text-blue-600 underline">${item.title}</a>
+                            </li>
+                        `;
+                    });
+                } else {
+                    summary.innerHTML = "<p>No summaries could be generated for the articles found.</p>";
+                }
+
+                resultDiv.classList.remove("hidden");
+
+            } catch (networkError) {
+                // This catches network errors (e.g., server is down)
+                console.error("Network error:", networkError);
+                loading.classList.add("hidden");
+                alert("A network error occurred: " + networkError.message);
+            }
+            // --- END OF NEW LOGIC ---
+        }
+    </script>
+</body>
+</html>
+
