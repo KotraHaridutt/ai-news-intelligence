@@ -59,6 +59,7 @@
                 try {
                     // Try to parse it as JSON
                     data = JSON.parse(responseText);
+                    console.log(data);
                 } catch (parseError) {
                     // If parsing fails, it's an HTML error page
                     console.error("Failed to parse JSON:", responseText);
