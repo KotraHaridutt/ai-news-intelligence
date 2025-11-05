@@ -10,3 +10,5 @@ markdown2
 flask
 httpx
 beautifulsoup4
+sentence-transformers
+scikit-learn
