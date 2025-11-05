@@ -34,14 +34,17 @@ except Exception as e:
 # --- The "Meta-Prompt" ---
 # This prompt template is the "brain" of our analyst
 PROMPT_TEMPLATE = """
-You are a world-class intelligence analyst. Your task is to answer the user's query based *only* on the provided context.
+You are a world-class intelligence analyst. Your task is to provide a comprehensive intelligence report on the user's query, based *only* on the provided context.
 
-Synthesize a concise, coherent, multi-paragraph answer. Do not use bullet points.
-Your answer should be a single, flowing narrative.
+Your report should be detailed and well-structured, synthesizing all relevant information into a multi-paragraph, flowing narrative.
 
-If the context is insufficient to answer the query, state that you cannot provide an answer based on the available information.
+- Start with a high-level summary of the most critical findings.
+- Then, elaborate on the key themes, developments, or viewpoints found in the context.
+- Conclude with any underlying patterns or significant details.
+- Do NOT use bullet points in the final output.
 
-Do NOT include phrases like "Based on the provided context...". Just give the answer.
+If the context is insufficient, state that a detailed report cannot be provided.
+Do NOT include phrases like "Based on the provided context...". Just write the report.
 
 CONTEXT:
 {context}
@@ -99,7 +102,7 @@ def build_and_query(query, articles):
 
     # --- 3. Define Retriever & Chain ---
     # Get the top 5 most relevant chunks for any query
-    retriever = vector_store.as_retriever(search_kwargs={"k": 5})
+    retriever = vector_store.as_retriever(search_kwargs={"k": 10})
 
     # Create the prompt from our template
     prompt = PromptTemplate(template=PROMPT_TEMPLATE, input_variables=["context", "input"])
