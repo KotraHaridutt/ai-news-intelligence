@@ -1,14 +1,12 @@
 from flask import Flask, render_template, request, jsonify
 import asyncio
-import markdown2
+import markdown2  # <-- This is used now
 import time 
 
-from app.gemini_summarizer import summarize_with_gemini 
-
-# --- Import our async fetcher ---
+# --- Our Services ---
 from services.news_fetcher import fetch_all_articles 
-# --- IMPORT OUR NEW CLUSTERING SERVICE ---
 from services.clustering_service import group_by_theme
+from services.rag_service import build_and_query # <-- THE NEW BRAIN
 
 app = Flask(__name__)
 
@@ -41,55 +39,32 @@ def query():
     fetch_end_time = time.time()
     print(f"[INFO] Fetched {len(articles)} articles in {fetch_end_time - start_time:.2f}s")
 
-
-    # --- START: REFACTORED SECTION ---
-
     # --- Step 2: Cluster articles by theme ---
-    # This adds 'theme_id' (e.g., 0, 1, -1) to each article
+    # This adds the 'theme_id' metadata we need for the RAG service
     articles = group_by_theme(articles)
 
-    # --- Step 3: Get the top 5 unique themes ---
-    # This replaces our old "return first 3" test logic
+    # --- Step 3: Build RAG pipeline and get synthesized answer ---
+    # This one function now does all the hard work
+    print("[INFO] Building RAG pipeline and querying...")
     
-    unique_themes = {} # We'll use a dict to store one article per theme
-    
-    for article in articles:
-        theme = article.get('theme_id', -1)
-        
-        # We only care about grouped themes (not -1, which is "noise")
-        # And we only want *one* article per theme
-        if theme != -1 and theme not in unique_themes:
-            unique_themes[theme] = article
-            
-    # Get the list of representative articles
-    # We limit to 5 unique themes for now
-    top_themed_articles = list(unique_themes.values())[:5]
+    # We pass the full list of articles (with theme_ids)
+    response_data = build_and_query(query, articles) 
 
-    print(f"[INFO] Selected {len(top_themed_articles)} articles representing unique themes.")
-
-    # --- Step 4: Return the unique articles (Test Mode) ---
-    # We are still in test mode. We are *not* summarizing yet.
-    # We are just returning the *raw data* for the top themed articles
-    # to confirm our clustering logic works.
-    
+    # --- Step 4: Return the final, intelligent answer ---
     total_time = time.time() - start_time
+    print(f"[INFO] Full RAG pipeline complete in {total_time:.2f}s")
     
-    return jsonify({
-        "message": "Clustering successful! (Test mode)",
-        "time_taken": f"{total_time:.2f}s",
-        "total_articles_found": len(articles),
-        "unique_themes_found": len(unique_themes),
-        "articles_showing": len(top_themed_articles),
-        "articles": top_themed_articles # This returns the raw data
-    })
+    # Add metadata to the response
+    response_data['time_taken'] = f"{total_time:.2f}s"
+    response_data['total_articles_found'] = len(articles)
 
-    # --- END: REFACTORED SECTION ---
+    # The 'summary' text from RAG is pure text, not Markdown.
+    # We must convert it to HTML for the browser.
+    if 'summary' in response_data:
+        response_data['summary'] = markdown2.markdown(response_data['summary'])
 
-    # --- NOTE: We will re-add the summarization loop in the NEXT phase. ---
-    # The code below is still "disabled" by the 'return' statement above.
-    
-    print("[INFO] Starting summarization...")
-    # ... (summarization loop will go here) ...
+    return jsonify(response_data)
+
 
 if __name__ == "__main__":
     app.run(debug=True)
