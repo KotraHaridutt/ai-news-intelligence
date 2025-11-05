@@ -7,3 +7,6 @@ python-dotenv
 google-generativeai
 gunicorn
 markdown2
+flask
+httpx
+beautifulsoup4
