@@ -76,23 +76,32 @@
                     return;
                 }
                 
-                // Check if we got any summaries
-                if (data.summaries && data.summaries.length > 0) {
-                    data.summaries.forEach(item => {
-                        summary.innerHTML += `
-                            <div class="prose max-w-none p-4 border rounded-lg bg-gray-50">
-                                ${item.summary}
-                            </div>
-                        `;
-                        sources.innerHTML += `
-                            <li>
-                                <a href="${item.url}" target="_blank" class="text-blue-600 underline">${item.title}</a>
-                            </li>
-                        `;
-                    });
+                // --- ADD THIS NEW BLOCK ---
+                if (data.summary && data.sources) {
+                    // 1. Set the single, synthesized summary
+                    // The HTML is already added by the backend (markdown2)
+                    summary.innerHTML = `
+                        <div class="prose max-w-none p-4 border rounded-lg bg-gray-50">
+                            ${data.summary}
+                        </div>
+                    `;
+
+                    // 2. Loop over the new sources list
+                    if (data.sources.length > 0) {
+                        data.sources.forEach(item => {
+                            sources.innerHTML += `
+                                <li>
+                                    <a href="${item.url}" target="_blank" class="text-blue-600 underline">${item.title}</a>
+                                </li>
+                            `;
+                        });
+                    } else {
+                        sources.innerHTML = "<li>No specific sources were cited for this answer.</li>";
+                    }
                 } else {
-                    summary.innerHTML = "<p>No summaries could be generated for the articles found.</p>";
+                    summary.innerHTML = "<p>No answer could be generated from the articles found.</p>";
                 }
+                // --- END OF NEW BLOCK ---
 
                 resultDiv.classList.remove("hidden");
 
