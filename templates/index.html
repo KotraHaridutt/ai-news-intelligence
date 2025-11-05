@@ -3,30 +3,51 @@
 <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>AI News Fetcher</title>
+    <title>AI News Analyst</title>
     <script src="https://cdn.tailwindcss.com"></script>
+    <style>
+        /* Add simple styles for the summary content */
+        .prose p { margin-bottom: 1rem; }
+        .prose ul { list-style-type: disc; margin-left: 1.5rem; }
+        .prose ol { list-style-type: decimal; margin-left: 1.5rem; }
+    </style>
 </head>
 <body class="bg-gray-50 text-gray-800">
-    <div class="max-w-3xl mx-auto mt-16 p-6 bg-white rounded-2xl shadow-lg">
-        <h1 class="text-3xl font-bold text-center mb-4">AI News Fetcher 🧠</h1>
+    <div class="max-w-4xl mx-auto mt-16 p-6">
+        <h1 class="text-3xl font-bold text-center mb-4">AI News Analyst 🧠</h1>
         <p class="text-center text-gray-600 mb-6">
-            Ask for any topic, and I’ll summarize today’s latest news with verified sources.
+            Ask any topic. I'll analyze today's news, find the key themes, and give you a synthesized report.
         </p>
 
         <div class="flex gap-2">
-            <input id="query" type="text" class="flex-1 border p-3 rounded-lg" placeholder="Enter your topic, e.g. Google Brain">
-            <button onclick="fetchNews()" class="bg-blue-600 text-white px-4 rounded-lg hover:bg-blue-700">Search</button>
+            <input id="query" type="text" class="flex-1 border p-3 rounded-lg" placeholder="Enter your topic, e.g. 'Future of AI in healthcare'">
+            <button onclick="fetchNews()" class="bg-blue-600 text-white px-4 rounded-lg hover:bg-blue-700">Analyze</button>
         </div>
 
-        <div id="loading" class="hidden text-center mt-6 text-blue-600 font-medium">Fetching the latest news...</div>
-
-        <div id="result" class="mt-6 hidden">
-            <h2 class="text-xl font-semibold mb-2">Summary</h2>
-            <p id="summary" class="mb-4 space-y-4"></p>
-
-            <h3 class="font-semibold mb-2">Sources:</h3>
-            <ul id="sources" class="list-disc ml-5 space-y-1"></ul>
+        <div id="loading" class="hidden text-center mt-6 text-blue-600 font-medium">
+            <p>Analyzing... This can take a moment for a new topic.</p>
         </div>
+
+        <div id="result" class="hidden mt-8 grid grid-cols-3 gap-8">
+
+            <div class="col-span-3 md:col-span-2">
+                <h2 class="text-xl font-semibold mb-3">Intelligence Report</h2>
+                <div id="summary" class="mb-6 p-4 border rounded-lg bg-white shadow-sm">
+                    </div>
+                
+                <h3 class="font-semibold mb-2">Cited Sources</h3>
+                <ul id="cited-sources" class="list-disc ml-5 space-y-1 text-sm">
+                    </ul>
+            </div>
+
+            <div class="col-span-3 md:col-span-1">
+                <h2 class="text-xl font-semibold mb-3">Related Links</h2>
+                <div id="related-links" class="space-y-3">
+                    </div>
+            </div>
+
+        </div>
+
     </div>
 
     <script>
@@ -34,41 +55,42 @@
             const query = document.getElementById("query").value.trim();
             const loading = document.getElementById("loading");
             const resultDiv = document.getElementById("result");
-            const summary = document.getElementById("summary");
-            const sources = document.getElementById("sources");
+            
+            // --- NEW: Get all our new element IDs ---
+            const summaryEl = document.getElementById("summary");
+            const citedSourcesEl = document.getElementById("cited-sources");
+            const relatedLinksEl = document.getElementById("related-links");
 
             if (!query) return alert("Please enter a topic first.");
 
             loading.classList.remove("hidden");
             resultDiv.classList.add("hidden");
-            summary.innerHTML = ""; // Clear old results
-            sources.innerHTML = ""; // Clear old results
+            
+            // Clear old results
+            summaryEl.innerHTML = "";
+            citedSourcesEl.innerHTML = "";
+            relatedLinksEl.innerHTML = "";
 
-            // --- THIS IS THE NEW ERROR-HANDLING LOGIC ---
             try {
-                const response = await fetch("/query", {
+                const response = await fetch("/query", { // URL is still /query
                     method: "POST",
                     headers: { "Content-Type": "application/json" },
                     body: JSON.stringify({ query })
                 });
 
-                // This will read the response as text first, so we can see it
                 const responseText = await response.text();
                 let data;
 
                 try {
-                    // Try to parse it as JSON
                     data = JSON.parse(responseText);
-                    console.log(data);
                 } catch (parseError) {
-                    // If parsing fails, it's an HTML error page
                     console.error("Failed to parse JSON:", responseText);
                     alert("The server returned an invalid response (not JSON). Check the console (F12) for the full HTML error log.");
-                    loading.classList.add("hidden"); // Hide loading
+                    loading.classList.add("hidden");
                     return;
                 }
                 
-                // --- This point is only reached if JSON was valid ---
+                console.log("Received data:", data); // Good for debugging
                 loading.classList.add("hidden");
 
                 if (data.error) {
@@ -76,44 +98,56 @@
                     return;
                 }
                 
-                // --- ADD THIS NEW BLOCK ---
-                if (data.summary && data.sources) {
-                    // 1. Set the single, synthesized summary
-                    // The HTML is already added by the backend (markdown2)
-                    summary.innerHTML = `
-                        <div class="prose max-w-none p-4 border rounded-lg bg-gray-50">
-                            ${data.summary}
+                // --- START: NEW RENDER LOGIC ---
+
+                // 1. Render Summary (it's already HTML)
+                if (data.summary_html) {
+                    summaryEl.innerHTML = `
+                        <div class="prose max-w-none">
+                            ${data.summary_html}
                         </div>
                     `;
-
-                    // 2. Loop over the new sources list
-                    if (data.sources.length > 0) {
-                        data.sources.forEach(item => {
-                            sources.innerHTML += `
-                                <li>
-                                    <a href="${item.url}" target="_blank" class="text-blue-600 underline">${item.title}</a>
-                                </li>
-                            `;
-                        });
-                    } else {
-                        sources.innerHTML = "<li>No specific sources were cited for this answer.</li>";
-                    }
                 } else {
-                    summary.innerHTML = "<p>No answer could be generated from the articles found.</p>";
+                    summaryEl.innerHTML = "<p>No answer could be generated.</p>";
                 }
-                // --- END OF NEW BLOCK ---
 
-                resultDiv.classList.remove("hidden");
+                // 2. Render Cited Sources
+                if (data.cited_sources && data.cited_sources.length > 0) {
+                    data.cited_sources.forEach(item => {
+                        citedSourcesEl.innerHTML += `
+                            <li>
+                                <a href="${item.url}" target="_blank" class="text-blue-600 underline">${item.title}</a>
+                            </li>
+                        `;
+                    });
+                } else {
+                    citedSourcesEl.innerHTML = "<li>No specific sources were cited.</li>";
+                }
+
+                // 3. Render Related Links (Our new section)
+                if (data.related_links && data.related_links.length > 0) {
+                    data.related_links.forEach(item => {
+                        relatedLinksEl.innerHTML += `
+                            <div class="p-3 border rounded-lg bg-white text-sm shadow-sm">
+                                <a href="${item.url}" target="_blank" class="font-medium text-blue-700 hover:underline">${item.title}</a>
+                                <p class="text-gray-500 text-xs mt-1">${item.source}</p>
+                            </div>
+                        `;
+                    });
+                } else {
+                    relatedLinksEl.innerHTML = "<p>No related links found.</p>";
+                }
+
+                // --- END: NEW RENDER LOGIC ---
+
+                resultDiv.classList.remove("hidden"); // Show the results
 
             } catch (networkError) {
-                // This catches network errors (e.g., server is down)
                 console.error("Network error:", networkError);
                 loading.classList.add("hidden");
                 alert("A network error occurred: " + networkError.message);
             }
-            // --- END OF NEW LOGIC ---
         }
     </script>
 </body>
 </html>
-
