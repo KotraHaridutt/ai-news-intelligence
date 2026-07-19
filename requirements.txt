@@ -1,5 +1,6 @@
 fastapi
 uvicorn
+jinja2
 requests
 httpx
 newspaper3k
