@@ -1,5 +1,6 @@
+from pathlib import Path
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.responses import HTMLResponse
 from fastapi.templating import Jinja2Templates
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
@@ -11,14 +12,17 @@ from services.news_fetcher import fetch_all_articles
 from services.clustering_service import group_by_theme
 from services.rag_service import build_vector_store, run_rag_query_with_store
 
+BASE_DIR = Path(__file__).resolve().parent
+
 app = FastAPI(title="AI News Intelligence API")
 
 # Setup templates and static files
-templates = Jinja2Templates(directory="templates")
+templates = Jinja2Templates(directory=str(BASE_DIR / "templates"))
 # Ensure static directory exists before mounting
 import os
-if os.path.exists("static"):
-    app.mount("/static", StaticFiles(directory="static"), name="static")
+static_dir = BASE_DIR / "static"
+if static_dir.exists():
+    app.mount("/static", StaticFiles(directory=str(static_dir)), name="static")
 
 # --- Simple In-Memory Cache ---
 # Storing: { "query_string": {"articles": [...], "vector_store": <FAISS>, "related_links": [...], "timestamp": float} }
@@ -166,4 +170,4 @@ async def api_contradictions(req: QueryRequest):
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run("app:app", host="0.0.0.0", port=8000, reload=True)
+    uvicorn.run("server:app", host="0.0.0.0", port=8000, reload=True)
