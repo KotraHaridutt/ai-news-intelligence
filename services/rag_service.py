@@ -16,7 +16,7 @@ if not os.getenv("GEMINI_API_KEY") and not os.getenv("GOOGLE_API_KEY"):
 
 # Initialize Models
 try:
-    llm = ChatGoogleGenerativeAI(model="gemini-2.5-flash", temperature=0.2)
+    llm = ChatGoogleGenerativeAI(model="gemini-3.6-flash", temperature=0.2)
     embeddings_model = GoogleGenerativeAIEmbeddings(model="gemini-embedding-001")
     print("[INFO] RAG models loaded successfully.")
 except Exception as e:
