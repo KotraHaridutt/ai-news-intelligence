@@ -1,6 +1,6 @@
 # AI News Intelligence
 
-Turn a topic's news coverage into one grounded briefing. Enter a topic, and the app fetches recent coverage, scrapes the full text, groups duplicate stories by theme, and uses retrieval-augmented generation (RAG) to produce an **intelligence report**, a **timeline**, and an analysis of **where sources disagree**, with links back to every source used.
+Turn a topic's news coverage into one grounded briefing. Enter a topic, and the app fetches recent coverage, scrapes the full text, groups duplicate stories, keeps one or two articles per story, and uses retrieval-augmented generation (RAG) over what's left to produce an **intelligence report**, a **timeline**, and an analysis of **where sources disagree**, with links back to every source used.
 
 **Live demo:** https://ai-news-intelligence-xdtc.onrender.com
 *(Free-tier hosting: the first request after a period of inactivity can take up to a minute while the server wakes up.)*
@@ -24,7 +24,7 @@ This project automates that work:
 | **Intelligence report** | A multi-paragraph synthesis of the key developments, themes and patterns across all sources |
 | **Timeline** | Key events extracted and ordered by date |
 | **Contradictions** | Conflicting claims and opposing viewpoints between sources |
-| **Related links** | One representative article per distinct theme, so duplicate wire copy doesn't crowd the list |
+| **Related links** | The biggest stories first (with how many articles covered each), then the most relevant unique stories, one link per story |
 | **Source citations** | Every response lists the articles its answer was generated from |
 
 ---
@@ -39,8 +39,9 @@ flowchart TD
     B -- no --> Q[Wait for a build slot<br/>at most 3 builds at once]
     Q --> C[1. Discover articles<br/>GNews API]
     C --> D[2. Scrape full text concurrently<br/>only pages not already cached]
-    D --> E[3. Cluster by theme<br/>Gemini embeddings + DBSCAN]
-    E --> E2[4. Chunk and index<br/>only uncached chunks are embedded]
+    D --> E[3. Group duplicates<br/>Gemini embeddings + DBSCAN]
+    E --> CH[3b. Choose<br/>rank by query relevance<br/>max 2 per story, unique stories kept]
+    CH --> E2[4. Chunk and index the chosen articles<br/>only uncached chunks are embedded]
     E2 --> CACHE[(Upstash Redis<br/>article list, page text, vectors)]
     E2 --> F[5. Retrieve top-15 chunks]
     F --> G[6. Generate with Gemini Flash<br/>report / timeline / contradictions]
@@ -49,8 +50,9 @@ flowchart TD
 
 1. **Discover:** query the GNews API for up to 10 recent English-language articles (title, URL, source, publish date). 10 is the free plan's per-request maximum, and free-plan articles arrive with a 12-hour delay.
 2. **Scrape:** fetch every article page concurrently with `asyncio.gather` on a shared `httpx.AsyncClient` (max 20 connections, 15 s timeout). Trafilatura extracts the article body without navigation, ads or comments, with a BeautifulSoup paragraph fallback. Pages that fail or yield too little text are dropped.
-3. **Cluster:** embed each article with `gemini-embedding-001` and run DBSCAN (cosine distance, `eps=0.35`, `min_samples=2`). Each article gets a `theme_id`, and articles that match nothing else are labeled noise (`-1`). DBSCAN needs no preset number of clusters, which suits news where the number of storylines is unknown.
-4. **Index:** split articles with `RecursiveCharacterTextSplitter` (1500 characters, 300 overlap, paragraph-aware) and attach source URL, title, publish date and theme ID to each chunk. Embed the chunks into an in-memory FAISS index.
+3. **Group duplicates:** embed each article with `gemini-embedding-001` and run DBSCAN (cosine distance, `eps=0.12`, `min_samples=2`). Articles carrying the same story (wire copies, pieces on the same event) share a `theme_id`; every other article is a unique story. `eps` was set from measured data: the same wire story in two outlets is 0.000-0.009 apart, pieces on the same event 0.05-0.10, and different stories on the same topic 0.14 or more.
+   - **Choose:** embed the query and rank articles by similarity. Keep at most 2 articles per group, from different outlets when possible, and never a second copy of near-identical text. Keep every unique story (relevance scores of on-topic and off-topic articles overlap too much to drop any safely). Only the chosen articles are indexed, so duplicate coverage doesn't crowd the context.
+4. **Index:** split the chosen articles with `RecursiveCharacterTextSplitter` (1500 characters, 300 overlap, paragraph-aware) and attach source URL, title, publish date and theme ID to each chunk. Embed the chunks into an in-memory FAISS index.
 5. **Retrieve:** embed the query and fetch the 15 nearest chunks.
 6. **Generate:** place the retrieved chunks in one prompt (LangChain's "stuff" strategy) with one of three templates. Each template instructs the model to use only the provided context and to say so when the context is insufficient.
 
@@ -201,7 +203,8 @@ ai-news-intelligence/
 ## Design decisions
 
 - **Query-time RAG instead of a persistent vector database.** Each query builds its own small index (about 30-40 chunks from up to 10 articles) from fresh articles, so the corpus is always current. An exact flat FAISS index is fast at this size, and an external vector database would add cost without benefit.
-- **DBSCAN instead of K-Means.** The number of storylines per topic is unknown in advance, and DBSCAN can leave off-topic articles unassigned instead of forcing them into a cluster.
+- **DBSCAN instead of K-Means.** The number of storylines per topic is unknown in advance, and DBSCAN leaves one-off stories unassigned instead of forcing them into a cluster. Its `eps` (0.12) comes from measuring 133 real article pairs, not from a default.
+- **Deduplicate before indexing, not after retrieval.** Grouping and choosing happen before chunks are embedded, so skipped copies cost no embedding calls and can't take retrieval slots. In a real query this cut the index from 35 to 21 chunks and Related Links from 1 to 5 distinct stories.
 - **The "stuff" strategy instead of map-reduce.** Finding contradictions requires the model to see all sources at once. Map-reduce processes documents separately and would miss conflicts between them.
 - **Cache the inputs, not the index.** Redis stores page text and embedding vectors, and the FAISS index is rebuilt from them on each request. Storing the FAISS object itself would need `pickle` (unsafe to load, tied to library versions), while rebuilding the index from 30-40 vectors takes milliseconds. Keying text and vectors by URL and content hash lets different queries share the expensive work.
 - **Paragraph-aware chunking.** News articles are plain prose, so splitting at paragraph boundaries keeps each claim together with its context without the extra cost of semantic chunking.
@@ -210,7 +213,7 @@ ai-news-intelligence/
 
 - [ ] Add timeline and contradictions views to the UI (currently available through the API and `/docs`)
 - [ ] Include source and date metadata in the LLM prompt so contradictions and timeline events are attributed to specific outlets
-- [ ] Use theme IDs during retrieval (per-theme quotas or MMR) so duplicate coverage doesn't dominate the context
+- [x] Keep duplicate coverage from dominating the context (choose step: at most 2 articles per story before indexing)
 - [x] Make embedding, indexing and LLM calls fully non-blocking (`ainvoke`, `asyncio.to_thread`)
 - [x] Replace the in-process cache with a shared cache (Redis) that survives restarts
 - [ ] Add inline per-claim citations and an automated faithfulness check

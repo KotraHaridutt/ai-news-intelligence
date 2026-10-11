@@ -5,13 +5,16 @@ import time
 from services import cache_service
 from services.news_fetcher import fetch_news, scrape_pages
 from services.clustering_service import group_by_theme
-from services.rag_service import build_vector_store, get_vectors
+from services.rag_service import build_vector_store, get_vectors, get_query_vector
+from services.selection_service import (
+    cosine_similarities, promote_unique, choose_articles, build_related_links, selection_report,
+)
 
 # Article fields stored in the articles: cache entry. No full_text: page text
 # lives once per URL under page: keys and is re-attached on a cache hit.
-# 'indexed' marks the articles the FAISS index is built from (all of them until
-# gap_1's choose step exists), so a hit rebuilds the same index as the miss did.
-ARTICLE_META_FIELDS = ("url", "title", "source_name", "published_at", "theme_id", "indexed")
+# 'indexed' marks the articles the choose step picked for the FAISS index, so a hit
+# rebuilds the same index as the miss did. 'unique' and 'similarity' record why.
+ARTICLE_META_FIELDS = ("url", "title", "source_name", "published_at", "theme_id", "indexed", "unique", "similarity")
 
 # --- Single-flight ---
 # One build per normalized query at a time in this process. Later identical
@@ -120,28 +123,11 @@ async def _rebuild_from_cache(cached):
     }
 
 
-def _build_related_links(articles):
-    unique_themes = {}
-    for article in articles:
-        theme = article.get('theme_id', -1)
-        if theme != -1 and theme not in unique_themes:
-            unique_themes[theme] = article
-
-    top_themed_articles = list(unique_themes.values())[:5]
-    return [
-        {
-            "title": art.get("title"),
-            "url": art.get("url"),
-            "source": art.get("source_name")
-        }
-        for art in top_themed_articles
-    ]
-
-
 async def _build(key: str, search_query: str):
     """
     Miss path: GNews -> page texts (cache, then scrape) -> article vectors -> group
-    -> related links -> chunk -> chunk vectors -> FAISS. Cached only if it fully succeeded.
+    -> rank + choose -> related links -> chunk -> chunk vectors -> FAISS.
+    Cached only if it fully succeeded.
     """
     # 1. Fetch the article list
     try:
@@ -166,7 +152,7 @@ async def _build(key: str, search_query: str):
         print(f"[INFO] No articles with enough text for '{key}'. Not cached.")
         return {"articles": [], "vector_store": None, "related_links": []}
 
-    # 3. Group (group -> index; gap_1's choose step will go between the two)
+    # 3. Group duplicates
     try:
         article_vectors = await get_vectors([article['full_text'] for article in articles])
     except Exception as e:
@@ -175,23 +161,40 @@ async def _build(key: str, search_query: str):
     # DBSCAN is CPU work: run it in a thread so the event loop stays free
     clustering_ok = await asyncio.to_thread(group_by_theme, articles, article_vectors)
 
-    # 4. Related Links
-    related_links = _build_related_links(articles)
+    # 4. Rank + choose (gap_1): which articles reach the index and the Related Links
+    similarities, ranking_ok = None, False
+    if clustering_ok:
+        try:
+            query_vector = await get_query_vector(key)
+            similarities = cosine_similarities(article_vectors, query_vector)
+            ranking_ok = True
+        except Exception as e:
+            print(f"[ERROR] Failed to embed the query for ranking: {e}. Ranking by GNews order.")
+        promote_unique(articles, similarities)
+        choose_articles(articles, article_vectors, similarities)
+        related_links = build_related_links(articles, similarities)
+        print(f"[INFO] Selection for '{key}': " + "\n".join(selection_report(articles, similarities)))
+    else:
+        # Grouping failed, so duplicates can't be told apart: index everything, no Related Links
+        for article in articles:
+            article['indexed'], article['unique'] = True, False
+        related_links = []
+    for i, article in enumerate(articles):
+        article['similarity'] = round(similarities[i], 4) if similarities else None
 
-    # 5. Index
-    for article in articles:
-        article['indexed'] = True
+    # 5. Index only the chosen articles
     vector_store = await build_vector_store([article for article in articles if article['indexed']])
 
     # 6. Cache only a complete, successful build. Page and vector keys written
     #    above stay either way: that content is valid and the next build reuses it.
-    if vector_store is not None and clustering_ok:
+    if vector_store is not None and clustering_ok and ranking_ok:
         await cache_service.set_articles(key, {
             "articles": [{field: article.get(field) for field in ARTICLE_META_FIELDS} for article in articles],
             "related_links": related_links,
         })
     else:
-        print(f"[WARN] Build for '{key}' not cached (index built: {vector_store is not None}, clustering ok: {clustering_ok}).")
+        print(f"[WARN] Build for '{key}' not cached (index built: {vector_store is not None}, "
+              f"clustering ok: {clustering_ok}, ranking ok: {ranking_ok}).")
 
     return {
         "articles": articles,

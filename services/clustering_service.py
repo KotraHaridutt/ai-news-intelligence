@@ -2,6 +2,16 @@ import numpy as np
 from sklearn.cluster import DBSCAN
 import time
 
+# DBSCAN cosine-distance radius. Measured on 133 article pairs from 6 real queries
+# (gemini-embedding-001, whole-article vectors):
+#   same wire story in two outlets ........ 0.000-0.009
+#   different pieces on the same event .... 0.053-0.103
+#   different stories on the same topic ... 0.142 and up (median ~0.27)
+# 0.35 chained every query into one group; 0.10-0.15 grouped exactly the duplicates.
+# 0.12 sits between the furthest near-duplicate (0.103) and the closest different story (0.142).
+DBSCAN_EPS = 0.12
+DBSCAN_MIN_SAMPLES = 2
+
 def group_by_theme(articles, vectors):
     """
     Adds a 'theme_id' to each article (in place) from its precomputed article vector.
@@ -23,10 +33,8 @@ def group_by_theme(articles, vectors):
     start_time = time.time()
 
     # --- Run Clustering (DBSCAN) ---
-    # Cosine distance tuning for API embeddings might be slightly different
-    # Adjust eps if clusters are too loose/strict
     try:
-        dbscan = DBSCAN(eps=0.35, min_samples=2, metric='cosine')
+        dbscan = DBSCAN(eps=DBSCAN_EPS, min_samples=DBSCAN_MIN_SAMPLES, metric='cosine')
         dbscan.fit(np.array(vectors))
     except Exception as e:
         print(f"[ERROR] Clustering failed: {e}")

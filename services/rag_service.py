@@ -27,6 +27,9 @@ EMBEDDING_MODEL = "gemini-embedding-001"
 # which give different vectors for the same text, so the task type is part of the cache key.
 DOCUMENT_TASK_TYPE = "RETRIEVAL_DOCUMENT"
 EMB_CACHE_MODEL = f"{EMBEDDING_MODEL}:{DOCUMENT_TASK_TYPE}"
+# The query is embedded as RETRIEVAL_QUERY (the side of the pair that is compared against documents)
+QUERY_TASK_TYPE = "RETRIEVAL_QUERY"
+EMB_QUERY_CACHE_MODEL = f"{EMBEDDING_MODEL}:{QUERY_TASK_TYPE}"
 
 # Chat model for the report / timeline / contradictions answers.
 # gemini-3.8-flash is Google's current Flash model (2.5 Flash is two generations old).
@@ -224,6 +227,24 @@ async def get_vectors(texts):
     duplicates = len(texts) - cache_hits - len(missing_texts)
     print(f"[INFO] Vectors: {len(texts)} texts, {cache_hits} from cache, {len(missing_texts)} embedded, {duplicates} duplicates.")
     return vectors
+
+async def get_query_vector(text):
+    """
+    Returns the query's RETRIEVAL_QUERY vector, used to rank articles by relevance.
+    Cached under its own task type, so it can never be mixed up with a document vector.
+    Raises if the embedding API fails.
+    """
+    if not embeddings_model:
+        raise RuntimeError("Embeddings model not loaded.")
+
+    [cached] = await cache_service.get_cached_vectors(EMB_QUERY_CACHE_MODEL, [text])
+    if cached is not None:
+        return cached
+
+    vector = await call_with_retry("Query embedding", embeddings_model.aembed_query, text, task_type=QUERY_TASK_TYPE)
+    vector = np.asarray(vector, dtype=np.float32)
+    await cache_service.set_cached_vectors(EMB_QUERY_CACHE_MODEL, [text], [vector])
+    return vector
 
 async def build_vector_store(articles):
     """
