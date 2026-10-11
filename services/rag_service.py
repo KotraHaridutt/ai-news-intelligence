@@ -144,7 +144,9 @@ text_splitter = RecursiveCharacterTextSplitter(chunk_size=1500, chunk_overlap=30
 
 def chunk_articles(articles):
     """
-    Splits each article with enough text into chunks, tagged with its metadata.
+    Splits each article with enough text into chunks, tagged with its metadata and
+    chunk_index (its position in the article: 0, 1, 2...), so a retrieved chunk can be
+    traced back to the part of the article it came from.
     """
     all_chunks = []
     for article in articles:
@@ -159,8 +161,9 @@ def chunk_articles(articles):
             "published_at": article.get('published_at', '')
         }
 
-        for chunk_text in text_splitter.split_text(text):
-            all_chunks.append(Document(page_content=chunk_text, metadata=metadata))
+        for chunk_index, chunk_text in enumerate(text_splitter.split_text(text)):
+            # A copy per chunk: the chunks of one article must not share one metadata dict
+            all_chunks.append(Document(page_content=chunk_text, metadata={**metadata, "chunk_index": chunk_index}))
     return all_chunks
 
 # --- Retry for Gemini embedding calls ---
@@ -287,6 +290,25 @@ async def build_vector_store(articles):
     print(f"[INFO] RAG: Built vector store from {len(all_chunks)} chunks.")
     return vector_store
 
+def _retrieval_summary(documents, limit=60):
+    """
+    One line naming the retrieved chunks, grouped by article in retrieval order:
+    '15 chunks from 6 articles: "Tesla renames FSD..." [0, 2, 1] | "Tesla China sales..." [0] | ...'
+    """
+    # Keyed by URL: two outlets can carry the same headline
+    by_article = {}
+    for doc in documents:
+        url = doc.metadata.get('source', '')
+        title = doc.metadata.get('title') or url or "?"
+        by_article.setdefault(url, (title, []))[1].append(doc.metadata.get('chunk_index', '?'))
+    parts = []
+    for title, indexes in by_article.values():
+        short = title if len(title) <= limit else title[:limit - 3] + "..."
+        parts.append(f'"{short}" {indexes}')
+    chunks = "1 chunk" if len(documents) == 1 else f"{len(documents)} chunks"
+    articles = "1 article" if len(by_article) == 1 else f"{len(by_article)} articles"
+    return f"{chunks} from {articles}: " + " | ".join(parts)
+
 def _format_response(response):
     answer = response.get('answer') or ''
     source_documents = response.get('context', [])
@@ -338,6 +360,7 @@ async def run_rag_query_with_store(query, vector_store, prompt_type):
     except Exception as e:   # a missed deadline is a TimeoutError -> "took too long" (504)
         raise errors.report_failed(e, prompt_type) from e
 
+    print(f"[INFO] RAG: Retrieved {_retrieval_summary(response.get('context', []))}")
     result = _format_response(response)
     if not result["answer"]:
         raise errors.empty_report(prompt_type)
