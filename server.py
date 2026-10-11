@@ -1,6 +1,7 @@
 from pathlib import Path
-from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import HTMLResponse
+from fastapi import FastAPI, Request
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.templating import Jinja2Templates
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
@@ -8,6 +9,8 @@ import time
 import markdown2
 
 # --- Our Services ---
+from services import errors
+from services.errors import AppError
 from services.pipeline_service import get_pipeline_data
 from services.rag_service import run_rag_query_with_store
 
@@ -28,6 +31,31 @@ if static_dir.exists():
 class QueryRequest(BaseModel):
     query: str
 
+# --- Errors ---
+# Every failure reaches the page as {"detail": "<message for the user>"} with a real error
+# status, never as 200 with error text. The page shows `detail` in its error box.
+
+@app.exception_handler(AppError)
+async def app_error_handler(request: Request, exc: AppError):
+    print(f"[WARN] {request.url.path} -> {exc.status}: {exc.log}")
+    return JSONResponse(status_code=exc.status, content={"detail": exc.message})
+
+@app.exception_handler(RequestValidationError)
+async def validation_error_handler(request: Request, exc: RequestValidationError):
+    return await app_error_handler(request, errors.invalid_request(str(exc.errors())[:300]))
+
+@app.exception_handler(Exception)
+async def unexpected_error_handler(request: Request, exc: Exception):
+    # A bug. Starlette re-raises the exception after this response is sent,
+    # so uvicorn still logs the full traceback.
+    print(f"[ERROR] {request.url.path} -> 500: unexpected {type(exc).__name__}: {exc}")
+    return JSONResponse(status_code=500, content={"detail": errors.UNEXPECTED_MESSAGE})
+
+def require_query(query: str) -> str:
+    if not query or not query.strip():
+        raise errors.empty_query()
+    return query
+
 def render_markdown(text) -> str:
     """
     Markdown -> HTML for the LLM's answer. safe_mode="escape" turns any raw HTML in the
@@ -45,23 +73,15 @@ async def home(request: Request):
 @app.post("/query")
 async def query_endpoint(req: QueryRequest):
     start_time = time.time()
-    query = req.query
-    if not query:
-        raise HTTPException(status_code=400, detail="No query provided")
+    query = require_query(req.query)
 
+    # Both raise AppError on failure; the handler above turns it into the error response
     data = await get_pipeline_data(query)
-    
-    if data is None:
-        raise HTTPException(status_code=500, detail="Failed to fetch articles")
-    if not data["articles"] or data["vector_store"] is None:
-        raise HTTPException(status_code=404, detail="No articles with sufficient content found")
-
-    # Run RAG for main summary
     rag_data = await run_rag_query_with_store(query, data["vector_store"], "report")
 
     final_response = {
-        "summary_html": render_markdown(rag_data.get("answer", "No answer generated.")),
-        "cited_sources": rag_data.get("sources", []),
+        "summary_html": render_markdown(rag_data["answer"]),
+        "cited_sources": rag_data["sources"],
         "related_links": data["related_links"],
         "total_articles_found": len(data["articles"]),
         "time_taken": f"{time.time() - start_time:.2f}s"
@@ -72,44 +92,30 @@ async def query_endpoint(req: QueryRequest):
 @app.post("/api/timeline")
 async def api_timeline(req: QueryRequest):
     start_time = time.time()
-    query = req.query
-    if not query:
-        raise HTTPException(status_code=400, detail="No query provided")
+    query = require_query(req.query)
 
     data = await get_pipeline_data(query)
-    
-    if data is None or not data["articles"] or data["vector_store"] is None:
-        raise HTTPException(status_code=404, detail="No articles found")
-
-    # Run RAG for timeline
     rag_data = await run_rag_query_with_store(query, data["vector_store"], "timeline")
-    
+
     return {
         "query": query,
-        "timeline_html": render_markdown(rag_data.get("answer")),
-        "cited_sources": rag_data.get("sources"),
+        "timeline_html": render_markdown(rag_data["answer"]),
+        "cited_sources": rag_data["sources"],
         "time_taken": f"{time.time() - start_time:.2f}s"
     }
 
 @app.post("/api/contradictions")
 async def api_contradictions(req: QueryRequest):
     start_time = time.time()
-    query = req.query
-    if not query:
-        raise HTTPException(status_code=400, detail="No query provided")
+    query = require_query(req.query)
 
     data = await get_pipeline_data(query)
-    
-    if data is None or not data["articles"] or data["vector_store"] is None:
-        raise HTTPException(status_code=404, detail="No articles found")
-
-    # Run RAG for contradictions
     rag_data = await run_rag_query_with_store(query, data["vector_store"], "contradictions")
-    
+
     return {
         "query": query,
-        "analysis_html": render_markdown(rag_data.get("answer")),
-        "cited_sources": rag_data.get("sources"),
+        "analysis_html": render_markdown(rag_data["answer"]),
+        "cited_sources": rag_data["sources"],
         "time_taken": f"{time.time() - start_time:.2f}s"
     }
 

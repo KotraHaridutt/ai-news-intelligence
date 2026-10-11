@@ -9,6 +9,8 @@ from dotenv import load_dotenv
 import trafilatura
 from bs4 import BeautifulSoup
 
+from services import errors
+
 # Building a TLS context loads the CA bundle, which blocks for ~0.5 s. Build it once
 # at import and share it, instead of once per AsyncClient (i.e. per request).
 SSL_CONTEXT = ssl.create_default_context(cafile=certifi.where())
@@ -57,9 +59,11 @@ async def fetch_news(query: str) -> list[dict]:
     """
     Fetches the article list for a query from GNews: the best matches
     published in the last NEWS_WINDOW_HOURS, best match first.
+    Returns [] only when GNews answered with no articles. Raises AppError when the
+    request fails, so an outage isn't shown to the user as "no news found".
     """
     if not GNEWS_API_KEY:
-        return []
+        raise errors.news_not_configured("GNEWS_API_KEY is not set")
 
     api_url = "https://gnews.io/api/v4/search"
     params = {
@@ -73,31 +77,33 @@ async def fetch_news(query: str) -> list[dict]:
         "token": GNEWS_API_KEY,
     }
 
+    print(f"[INFO] Fetching real news from GNews for: {query}")
     try:
         async with httpx.AsyncClient(verify=SSL_CONTEXT) as client:
-            print(f"[INFO] Fetching real news from GNews for: {query}")
             response = await client.get(api_url, params=params, timeout=10.0)
-            response.raise_for_status()
+    except httpx.TransportError as e:   # timeouts, DNS, refused connections
+        raise errors.news_unreachable(f"GNews request failed: {type(e).__name__}: {e}") from e
+    except httpx.HTTPError as e:        # other request errors (e.g. a broken response)
+        raise errors.news_failed(f"GNews request failed: {type(e).__name__}: {e}") from e
 
-            data = response.json()
-            articles = []
-            for item in data.get("articles", []):
-                articles.append({
-                    "title": item.get("title"),
-                    "url": item.get("url"),
-                    "snippet": item.get("description"),
-                    "source_name": item.get("source", {}).get("name"),
-                    "published_at": item.get("publishedAt"),
-                })
+    if response.status_code != 200:
+        raise errors.news_http_error(response.status_code, response.text)
 
-            return articles
+    try:
+        data = response.json()
+    except ValueError as e:
+        raise errors.news_failed(f"GNews sent invalid JSON: {response.text[:200]!r}") from e
 
-    except httpx.HTTPStatusError as e:
-        print(f"[ERROR] GNews HTTP Error: {e.response.status_code} - {e.response.text}")
-        return []
-    except Exception as e:
-        print(f"[ERROR] Failed to fetch news: {e}")
-        return []
+    articles = []
+    for item in data.get("articles", []):
+        articles.append({
+            "title": item.get("title"),
+            "url": item.get("url"),
+            "snippet": item.get("description"),
+            "source_name": item.get("source", {}).get("name"),
+            "published_at": item.get("publishedAt"),
+        })
+    return articles
 
 def extract_text(html: str):
     """

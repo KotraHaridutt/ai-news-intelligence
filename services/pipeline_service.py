@@ -2,7 +2,7 @@ import os
 import asyncio
 import time
 
-from services import cache_service
+from services import cache_service, errors
 from services.news_fetcher import fetch_news, scrape_pages
 from services.clustering_service import group_by_theme
 from services.rag_service import build_vector_store, get_vectors, get_query_vector
@@ -31,8 +31,10 @@ _build_slots = asyncio.Semaphore(MAX_CONCURRENT_BUILDS)
 
 async def get_pipeline_data(query: str):
     """
-    Returns {"articles", "vector_store", "related_links"} for a query,
-    {"articles": [], ...} when nothing usable was found, or None if fetching failed.
+    Returns {"articles", "vector_store", "related_links"} for a query, with a built index.
+    Raises AppError (with the status and message the user sees) when no index can be
+    built: GNews failed, no news in the window, no readable page, or Gemini failed.
+    Every request waiting on the same build gets the same error.
     """
     key = cache_service.normalize_query(query)
     # GNews gets the query as the user typed it (whitespace tidied), so search operators
@@ -105,7 +107,8 @@ async def _attach_pages(articles):
 async def _rebuild_from_cache(cached):
     """
     Hit path: cached article list -> page texts -> chunk -> cached vectors -> FAISS.
-    Returns None if no index can be built, so the caller falls back to a full build.
+    Returns None if none of the cached articles has text any more, so the caller falls
+    back to a full build. Raises AppError if Gemini fails.
     """
     articles = cached.get("articles", [])
     indexed = [article for article in articles if article.get("indexed", True)]
@@ -114,6 +117,8 @@ async def _rebuild_from_cache(cached):
     if len(with_text) < len(indexed):
         print(f"[WARN] {len(indexed) - len(with_text)} cached article(s) couldn't be re-scraped and are left out of the index.")
 
+    # If Gemini fails this raises AppError and there is no fallback: a full build would
+    # need Gemini too, and would spend a GNews request (free plan: 1/s, 100/day) on the way.
     vector_store = await build_vector_store(with_text)
     if vector_store is None:
         return None
@@ -129,18 +134,13 @@ async def _build(key: str, search_query: str):
     """
     Miss path: GNews -> page texts (cache, then scrape) -> article vectors -> group
     -> rank + choose -> related links -> chunk -> chunk vectors -> FAISS.
-    Cached only if it fully succeeded.
+    Cached only if it fully succeeded. Raises AppError for every failure the user
+    should see; raising also skips the cache write.
     """
-    # 1. Fetch the article list
-    try:
-        found = await fetch_news(search_query)
-    except Exception as e:
-        print(f"[ERROR] Async fetch failed: {e}")
-        return None
-
+    # 1. Fetch the article list (fetch_news raises AppError if GNews fails)
+    found = await fetch_news(search_query)
     if not found:
-        print(f"[INFO] No articles found for '{key}'.")
-        return {"articles": [], "vector_store": None, "related_links": []}
+        raise errors.no_recent_news(search_query)
 
     # GNews can list the same URL twice; keep the first
     unique = {}
@@ -151,8 +151,7 @@ async def _build(key: str, search_query: str):
     # 2. Page texts: cached ones first, scrape only the rest
     articles = await _attach_pages(found)
     if not articles:
-        print(f"[INFO] No articles with enough text for '{key}'. Not cached.")
-        return {"articles": [], "vector_store": None, "related_links": []}
+        raise errors.no_readable_pages(search_query, len(found))
 
     # 3. Group duplicates
     try:
@@ -184,19 +183,21 @@ async def _build(key: str, search_query: str):
     for i, article in enumerate(articles):
         article['similarity'] = round(similarities[i], 4) if similarities else None
 
-    # 5. Index only the chosen articles
+    # 5. Index only the chosen articles (raises AppError if Gemini fails)
     vector_store = await build_vector_store([article for article in articles if article['indexed']])
+    if vector_store is None:
+        # Only when no chosen article yields a chunk, i.e. no usable text
+        raise errors.no_readable_pages(search_query, len(found))
 
     # 6. Cache only a complete, successful build. Page and vector keys written
     #    above stay either way: that content is valid and the next build reuses it.
-    if vector_store is not None and clustering_ok and ranking_ok:
+    if clustering_ok and ranking_ok:
         await cache_service.set_articles(key, {
             "articles": [{field: article.get(field) for field in ARTICLE_META_FIELDS} for article in articles],
             "related_links": related_links,
         })
     else:
-        print(f"[WARN] Build for '{key}' not cached (index built: {vector_store is not None}, "
-              f"clustering ok: {clustering_ok}, ranking ok: {ranking_ok}).")
+        print(f"[WARN] Build for '{key}' not cached (clustering ok: {clustering_ok}, ranking ok: {ranking_ok}).")
 
     return {
         "articles": articles,

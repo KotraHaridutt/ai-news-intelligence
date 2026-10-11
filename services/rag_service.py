@@ -5,7 +5,7 @@ import numpy as np
 from dotenv import load_dotenv
 from google.genai import errors as genai_errors
 
-from services import cache_service
+from services import cache_service, errors
 from services.news_fetcher import has_enough_text
 
 # --- LangChain Imports ---
@@ -125,6 +125,12 @@ QUERY:
 
 ANALYSIS OF CONFLICTING INFORMATION:
 """
+
+PROMPT_TEMPLATES = {
+    "report": REPORT_PROMPT_TEMPLATE,
+    "timeline": TIMELINE_PROMPT_TEMPLATE,
+    "contradictions": CONTRADICTIONS_PROMPT_TEMPLATE,
+}
 
 # Optimized chunking with better overlap for context preservation.
 # Created once so every run splits the same text into the same chunks,
@@ -249,33 +255,35 @@ async def get_query_vector(text):
 async def build_vector_store(articles):
     """
     Builds and returns a FAISS vector store from cached or newly embedded chunk vectors.
+    Returns None if no article has enough text to chunk. Raises AppError if Gemini
+    isn't set up or the embedding call fails, so the user sees why.
     """
     if not embeddings_model:
-        return None
+        raise errors.ai_not_configured("embeddings model not loaded")
 
     # Splitting and the FAISS build are CPU work: run them in a thread so the event loop stays free
     all_chunks = await asyncio.to_thread(chunk_articles, articles)
     if not all_chunks:
         return None
 
+    texts = [chunk.page_content for chunk in all_chunks]
     try:
-        texts = [chunk.page_content for chunk in all_chunks]
         vectors = await get_vectors(texts)
-        # Vectors are precomputed, so FAISS only uses the embeddings client to embed the query at search time
-        vector_store = await asyncio.to_thread(
-            FAISS.from_embeddings,
-            text_embeddings=list(zip(texts, vectors)),
-            embedding=_QueryEmbeddingsWithRetry(embeddings_model),
-            metadatas=[chunk.metadata for chunk in all_chunks],
-        )
-        print(f"[INFO] RAG: Built vector store from {len(all_chunks)} chunks.")
-        return vector_store
     except Exception as e:
-        print(f"[ERROR] RAG: Failed to create FAISS vector store: {e}")
-        return None
+        raise errors.analysis_failed(e) from e
+
+    # Vectors are precomputed, so FAISS only uses the embeddings client to embed the query at search time
+    vector_store = await asyncio.to_thread(
+        FAISS.from_embeddings,
+        text_embeddings=list(zip(texts, vectors)),
+        embedding=_QueryEmbeddingsWithRetry(embeddings_model),
+        metadatas=[chunk.metadata for chunk in all_chunks],
+    )
+    print(f"[INFO] RAG: Built vector store from {len(all_chunks)} chunks.")
+    return vector_store
 
 def _format_response(response):
-    answer = response.get('answer', 'No answer could be generated.')
+    answer = response.get('answer') or ''
     source_documents = response.get('context', [])
     
     sources = []
@@ -300,18 +308,17 @@ async def run_rag_query_with_store(query, vector_store, prompt_type):
     """
     Executes a RAG query using a pre-built vector store.
     Async end to end: query embedding, FAISS search (in a thread) and the Gemini call.
+    Raises AppError if the model isn't set up, the call fails or the answer is empty;
+    an error is never returned as if it were the answer.
     """
-    if not llm or not vector_store:
-        return {"answer": "Error: RAG models or Vector Store missing.", "sources": []}
-    
-    if prompt_type == "report":
-        prompt_template = REPORT_PROMPT_TEMPLATE
-    elif prompt_type == "timeline":
-        prompt_template = TIMELINE_PROMPT_TEMPLATE
-    elif prompt_type == "contradictions":
-        prompt_template = CONTRADICTIONS_PROMPT_TEMPLATE
-    else:
-        return {"answer": "Invalid prompt type.", "sources": []}
+    if not llm:
+        raise errors.ai_not_configured("chat model not loaded")
+    # Both of these are programming errors, not something the user can fix (-> 500)
+    if vector_store is None:
+        raise ValueError("run_rag_query_with_store called without a vector store")
+    prompt_template = PROMPT_TEMPLATES.get(prompt_type)
+    if prompt_template is None:
+        raise ValueError(f"Unknown prompt type: {prompt_type!r}")
 
     # Increased 'k' to 15 to give the LLM more context without dumping everything
     retriever = vector_store.as_retriever(search_kwargs={"k": 15})
@@ -323,7 +330,10 @@ async def run_rag_query_with_store(query, vector_store, prompt_type):
     print(f"[INFO] RAG: Invoking chain with query: '{query}' for type: '{prompt_type}'")
     try:
         response = await retrieval_chain.ainvoke({"input": query})
-        return _format_response(response)
     except Exception as e:
-        print(f"[ERROR] RAG: Pipeline query failed: {e}")
-        return {"answer": "Error: The AI query failed.", "sources": []}
+        raise errors.report_failed(e, prompt_type) from e
+
+    result = _format_response(response)
+    if not result["answer"]:
+        raise errors.empty_report(prompt_type)
+    return result

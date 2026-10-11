@@ -79,6 +79,20 @@
             return el;
         }
 
+        // A full build takes ~30 s; after this long the request is given up
+        const REQUEST_TIMEOUT_MS = 120000;
+
+        // The message to show for an error response. The server sends a user-friendly
+        // message as {"detail": "..."} for every failure it knows about; a response without
+        // one comes from somewhere else (e.g. Render's proxy while the server is starting).
+        function friendlyError(status, detail) {
+            if (typeof detail === "string" && detail.trim()) return detail;
+            if (status === 502 || status === 503 || status === 504) {
+                return "The server is starting up or busy. Please wait a few seconds and try again.";
+            }
+            return "Something went wrong on our side. Please try again.";
+        }
+
         function showError(message) {
             const errorEl = document.getElementById("error");
             // textContent, not innerHTML: server text is shown as text, never parsed as HTML
@@ -114,11 +128,16 @@
             citedSourcesEl.innerHTML = "";
             relatedLinksEl.innerHTML = "";
 
+            // Gives up on a request that hangs (e.g. a dropped connection) instead of waiting forever
+            const controller = new AbortController();
+            const timer = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
+
             try {
                 const response = await fetch("/query", { // URL is still /query
                     method: "POST",
                     headers: { "Content-Type": "application/json" },
-                    body: JSON.stringify({ query })
+                    body: JSON.stringify({ query }),
+                    signal: controller.signal
                 });
 
                 const responseText = await response.text();
@@ -131,14 +150,14 @@
                 }
 
                 if (!response.ok) {
-                    // FastAPI errors look like {"detail": "No articles with sufficient content found"}
-                    const detail = data && typeof data.detail === "string" ? data.detail : null;
-                    showError(detail || `The server returned an error (${response.status}). Please try again.`);
+                    // Our errors look like {"detail": "No news from the last 2 days was found for ..."}
+                    showError(friendlyError(response.status, data && data.detail));
                     return;
                 }
 
                 if (data === null) {
-                    showError("The server returned an invalid response (not JSON). Check the console (F12) for the full error log.");
+                    // The raw response is in the console (logged above) for debugging
+                    showError("The server sent an unexpected response. Please try again.");
                     return;
                 }
 
@@ -152,15 +171,16 @@
                 // --- START: NEW RENDER LOGIC ---
 
                 // 1. Render Summary (HTML from the server; markdown2 safe_mode has already escaped any raw HTML)
-                if (data.summary_html) {
-                    summaryEl.innerHTML = `
-                        <div class="prose max-w-none">
-                            ${data.summary_html}
-                        </div>
-                    `;
-                } else {
-                    summaryEl.innerHTML = "<p>No answer could be generated.</p>";
+                if (!data.summary_html) {
+                    // The server reports an empty answer as an error, so this shouldn't happen
+                    showError("The AI couldn't write the report. Please try again.");
+                    return;
                 }
+                summaryEl.innerHTML = `
+                    <div class="prose max-w-none">
+                        ${data.summary_html}
+                    </div>
+                `;
 
                 // 2. Render Cited Sources
                 if (data.cited_sources && data.cited_sources.length > 0) {
@@ -195,8 +215,13 @@
 
             } catch (networkError) {
                 console.error("Network error:", networkError);
-                showError("A network error occurred: " + networkError.message);
+                if (networkError.name === "AbortError") {
+                    showError("The request took too long. Please try again.");
+                } else {
+                    showError("Couldn't reach the server. Check your internet connection and try again.");
+                }
             } finally {
+                clearTimeout(timer);
                 // Runs on every path (success, error, network failure), so the button always comes back
                 loading.classList.add("hidden");
                 button.disabled = false;
