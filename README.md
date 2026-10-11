@@ -21,11 +21,13 @@ This project automates that work:
 
 | Feature | Description |
 |---|---|
-| **Intelligence report** | A multi-paragraph synthesis of the key developments, themes and patterns across all sources |
-| **Timeline** | Key events extracted and ordered by date |
-| **Contradictions** | Conflicting claims and opposing viewpoints between sources |
+| **Intelligence report** | A multi-paragraph synthesis of the key developments, themes and patterns across all sources, naming the outlet when a claim comes from one source or sources disagree |
+| **Timeline** | Key events ordered by date, each with its outlet; relative dates ("on Tuesday") are resolved against the article's publish date |
+| **Contradictions** | Conflicting claims and opposing viewpoints, attributed to the outlets (or quoted people) that make them |
 | **Related links** | The biggest stories first (with how many articles covered each), then the most relevant unique stories, one link per story |
 | **Source citations** | Every response lists the articles its answer was generated from |
+
+In the page, the report, timeline and contradictions are three tabs over the same topic. Timeline and Contradictions load on their first click and are kept until the next search, so switching between views costs nothing.
 
 ---
 
@@ -43,8 +45,8 @@ flowchart TD
     E --> CH[3b. Choose<br/>rank by query relevance<br/>max 2 per story, unique stories kept]
     CH --> E2[4. Chunk and index the chosen articles<br/>only uncached chunks are embedded]
     E2 --> CACHE[(Upstash Redis<br/>article list, page text, vectors)]
-    E2 --> F[5. Retrieve top-15 chunks]
-    F --> G[6. Generate with Gemini Flash<br/>report / timeline / contradictions]
+    E2 --> F[5. Retrieve 10 chunks per view<br/>report: similarity, timeline: date-expanded query,<br/>contradictions: MMR; max 3 per story]
+    F --> G[6. Generate with Gemini Flash<br/>each chunk with title, outlet and date,<br/>in a block marked as untrusted data]
     G --> H[JSON response with citations]
 ```
 
@@ -52,9 +54,9 @@ flowchart TD
 2. **Scrape:** fetch every article page concurrently with `asyncio.gather` on a shared `httpx.AsyncClient` (max 20 connections, 15 s timeout) that sends a browser `User-Agent`, `Accept` and `Accept-Language`, since many news sites answer a script's default User-Agent with 403. A page whose final status (after redirects) isn't 200, or that isn't HTML, is rejected before parsing, so an "Access Denied" page can never become a source. Trafilatura extracts the article body without navigation, ads or comments, with a BeautifulSoup paragraph fallback. Pages that fail or yield too little text are dropped, and each scrape logs its success rate with failures grouped by reason. Measured on the same 40 real pages: usable articles went from 25 (63%) to 34 (85%), bot blocks (403/400) from 11 to 2, and error pages used as articles from 6 to 0.
 3. **Group duplicates:** embed each article with `gemini-embedding-001` and run DBSCAN (cosine distance, `eps=0.12`, `min_samples=2`). Articles carrying the same story (wire copies, pieces on the same event) share a `theme_id`; every other article is a unique story. `eps` was set from measured data: the same wire story in two outlets is 0.000-0.009 apart, pieces on the same event 0.05-0.10, and different stories on the same topic 0.14 or more.
    - **Choose:** embed the query and rank articles by similarity. Keep at most 2 articles per group, from different outlets when possible, and never a second copy of near-identical text. Keep every unique story (relevance scores of on-topic and off-topic articles overlap too much to drop any safely). Only the chosen articles are indexed, so duplicate coverage doesn't crowd the context.
-4. **Index:** split the chosen articles with `RecursiveCharacterTextSplitter` (1500 characters, 300 overlap, paragraph-aware) and attach source URL, title, publish date, theme ID and the chunk's position in its article (`chunk_index`) to each chunk. Embed the chunks into an in-memory FAISS index.
-5. **Retrieve:** embed the query and fetch the 15 nearest chunks. Each answer logs which chunks were used, by article and position (`Retrieved 10 chunks from 4 articles: "title" [0, 1] | ...`).
-6. **Generate:** place the retrieved chunks in one prompt (LangChain's "stuff" strategy) with one of three templates. Each template instructs the model to use only the provided context and to say so when the context is insufficient. The whole answer step has a 75 s deadline, so a slow model gets a clear "took too long" message before the page gives up.
+4. **Index:** split the chosen articles with `RecursiveCharacterTextSplitter` (1500 characters, 300 overlap, paragraph-aware) and attach source URL, outlet name (`source_name`), title, publish date, theme ID and the chunk's position in its article (`chunk_index`) to each chunk. Embed the chunks into an in-memory FAISS index.
+5. **Retrieve:** each view picks its own 10 chunks. The **report** takes the chunks nearest the query; the **timeline** searches with "what happened and when: dates, days, announcements" added to the query (chosen from 5 measured options: the most date words in the retrieved chunks); **contradictions** uses maximal marginal relevance (MMR, λ 0.5), so a chunk must also differ from those already picked and repeated wire copy gives way to other viewpoints. In every view a story gets at most 3 of the 10 slots, unless the other stories can't fill them. Measured on 8 topics, indexes hold 7-60 chunks, and without that cap one story (two long articles) took 14 of 15 slots ("artificial intelligence"); with it, that topic's contradictions context spans 8 outlets instead of 2. Each answer logs what was used: `RAG [contradictions, mmr]: Retrieved 10 of 22 chunks (k=10, max 3 per story) from 6 articles: "title" [0, 1] | ...`.
+6. **Generate:** place the retrieved chunks in one prompt (LangChain's "stuff" strategy) with one of three templates. Each chunk starts with a `[Source: <title> | <outlet> | Published: 2026-10-09 14:30 UTC]` line, so the model can say which outlet reported what and turn "on Tuesday" into a date; in a live comparison the report went from naming 0 to all 5 outlets, and the timeline from 3 to 6 exact dates. The chunks sit in an `<articles>` block that the prompt marks as untrusted data whose instructions must never be followed, and scraped text can't close that block or fake a `[Source: ...]` line (both patterns are rewritten before the prompt is built). Each template instructs the model to use only the provided context and to say so when the context is insufficient. The whole answer step (retrieval and generation) has a 75 s deadline, so a slow model gets a clear "took too long" message before the page gives up.
 
 ### Caching
 
@@ -117,11 +119,11 @@ All endpoints accept a JSON body `{"query": "<topic>"}`. Interactive documentati
 
 ### `POST /api/timeline`: chronological events
 
-Returns `query`, `timeline_html`, `cited_sources` and `time_taken`.
+Returns `query`, `timeline_html`, `cited_sources` and `time_taken`. The page's Timeline tab.
 
 ### `POST /api/contradictions`: conflicting claims across sources
 
-Returns `query`, `analysis_html`, `cited_sources` and `time_taken`.
+Returns `query`, `analysis_html`, `cited_sources` and `time_taken`. The page's Contradictions tab.
 
 **Errors:** every failure returns a real error status and `{"detail": "<message for the user>"}`, never `200` with error text. The page shows `detail` as it is.
 
@@ -203,8 +205,8 @@ ai-news-intelligence/
 │   ├── news_fetcher.py          # Article discovery (GNews) and concurrent scraping
 │   ├── errors.py                # AppError: one status + user-facing message per failure point
 │   ├── clustering_service.py    # DBSCAN theme clustering
-│   └── rag_service.py           # Chunking, cached embeddings, FAISS index, prompts, retrieval chain
-├── templates/index.html         # Web UI
+│   └── rag_service.py           # Chunking, cached embeddings, FAISS index, prompts, retrieval per view
+├── templates/index.html         # Web UI: report, timeline and contradictions tabs
 ├── static/style.css
 ├── render.yaml                  # Render deployment blueprint
 ├── Procfile
@@ -215,18 +217,22 @@ ai-news-intelligence/
 
 ## Design decisions
 
-- **Query-time RAG instead of a persistent vector database.** Each query builds its own small index (about 10-25 chunks from the chosen articles: 21 on the query measured for gap_1, 10 on a live "Tesla" query) from fresh articles, so the corpus is always current. An exact flat FAISS index is fast at this size, and an external vector database would add cost without benefit.
+- **Query-time RAG instead of a persistent vector database.** Each query builds its own small index (7-60 chunks from the chosen articles, median 22.5, measured on 8 topics) from fresh articles, so the corpus is always current. An exact flat FAISS index is fast at this size, and an external vector database would add cost without benefit.
 - **DBSCAN instead of K-Means.** The number of storylines per topic is unknown in advance, and DBSCAN leaves one-off stories unassigned instead of forcing them into a cluster. Its `eps` (0.12) comes from measuring 133 real article pairs, not from a default.
 - **Deduplicate before indexing, not after retrieval.** Grouping and choosing happen before chunks are embedded, so skipped copies cost no embedding calls and can't take retrieval slots. In a real query this cut the index from 35 to 21 chunks and Related Links from 1 to 5 distinct stories.
+- **Cap chunks per story, not only articles.** Keeping at most 2 articles per story still let one long article fill most of the context, so retrieval also limits each story to 3 of the 10 chunks an answer gets. The cap is soft: a topic with only one or two stories still gets 10 chunks.
+- **Each view retrieves for its own question.** A report wants the most relevant chunks, a timeline wants chunks that date events, and a contradictions analysis wants different viewpoints, so the three use different searches over the same index instead of sharing one result.
+- **Scraped text is data, never instructions.** Article text goes into the prompt inside a marked block, after a rule not to follow anything written inside it. The model has no tools or secrets and the answer is HTML-escaped, so the risk is a misleading answer; the block and the rewriting of fake delimiters and headers make that harder.
 - **The "stuff" strategy instead of map-reduce.** Finding contradictions requires the model to see all sources at once. Map-reduce processes documents separately and would miss conflicts between them.
-- **Cache the inputs, not the index.** Redis stores page text and embedding vectors, and the FAISS index is rebuilt from them on each request. Storing the FAISS object itself would need `pickle` (unsafe to load, tied to library versions), while rebuilding the index from 10-40 vectors takes milliseconds. Keying text and vectors by URL and content hash lets different queries share the expensive work.
+- **Cache the inputs, not the index.** Redis stores page text and embedding vectors, and the FAISS index is rebuilt from them on each request. Storing the FAISS object itself would need `pickle` (unsafe to load, tied to library versions), while rebuilding the index from 7-60 vectors takes milliseconds. Keying text and vectors by URL and content hash lets different queries share the expensive work.
 - **Errors are raised, not returned.** Each failure point raises one error type carrying its HTTP status and a user-facing message, and one handler turns it into the response. Before, `None` and `[]` were passed up through three layers that each had to guess what they meant, and five different failures reached the user as the same "no articles" 404.
 - **Paragraph-aware chunking.** News articles are plain prose, so splitting at paragraph boundaries keeps each claim together with its context without the extra cost of semantic chunking.
 
 ## Limitations and roadmap
 
-- [ ] Add timeline and contradictions views to the UI (currently available through the API and `/docs`)
-- [ ] Include source and date metadata in the LLM prompt so contradictions and timeline events are attributed to specific outlets
+- [x] Add timeline and contradictions views to the UI (tabs over the same topic)
+- [x] Include source and date metadata in the LLM prompt so contradictions and timeline events are attributed to specific outlets
+- [x] Give each view its own retrieval (similarity, date-expanded query, MMR) and cap chunks per story
 - [x] Keep duplicate coverage from dominating the context (choose step: at most 2 articles per story before indexing)
 - [x] Make embedding, indexing and LLM calls fully non-blocking (`ainvoke`, `asyncio.to_thread`)
 - [x] Replace the in-process cache with a shared cache (Redis) that survives restarts
