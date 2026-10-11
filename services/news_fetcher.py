@@ -1,5 +1,6 @@
 import asyncio
 import os
+from collections import Counter
 import ssl
 import certifi
 import httpx
@@ -85,32 +86,89 @@ def extract_text(html: str):
         full_text = " ".join([p.get_text(strip=True) for p in paragraphs])
     return full_text
 
+class ScrapeFailed(Exception):
+    """A page was fetched but can't be used. The message is the failure reason shown in the logs."""
+
+def _failure_reason(e: Exception) -> str:
+    """
+    Groups a scrape failure so the logs show which fix would pay off:
+    HTTP errors point to blocking, too little text to paywalls or empty pages.
+    """
+    if isinstance(e, ScrapeFailed):
+        return str(e)
+    if isinstance(e, httpx.TimeoutException):
+        return "timeout"
+    if isinstance(e, httpx.TransportError):
+        return "connection error"
+    return f"other: {type(e).__name__}"
+
 async def fetch_one_article(client: httpx.AsyncClient, url: str) -> dict:
     """
     Asynchronously fetches and scrapes a single article using Trafilatura for clean text.
+    Returns status "success" or "failed"; a failed page carries the reason it failed.
     """
+    http_status = None
     try:
         response = await client.get(url, timeout=15.0, follow_redirects=True)
+        http_status = response.status_code
 
         # Parsing runs in a thread so the event loop keeps serving other requests
         full_text = await asyncio.to_thread(extract_text, response.text)
 
         if not has_enough_text(full_text):
-            raise ValueError("Insufficient text extracted")
-            
+            # Name the status when it wasn't 200: an error page that is too short also lands here
+            raise ScrapeFailed("too little text" if http_status == 200 else f"too little text (HTTP {http_status})")
+
         return {
             "url": url,
             "full_text": full_text,
-            "status": "success"
+            "status": "success",
+            "http_status": http_status,
+            "reason": None,
         }
-        
+
     except Exception as e:
-        print(f"[WARN] Error fetching/parsing {url}: {e}")
+        reason = _failure_reason(e)
+        print(f"[WARN] Scrape failed ({reason}): {url}")
         return {
             "url": url,
             "full_text": None,
-            "status": "failed"
+            "status": "failed",
+            "http_status": http_status,
+            "reason": reason,
         }
+
+def _scrape_summary(results: list[dict]) -> str:
+    """'Scrape: 7 tried, 5 succeeded (71%). Failed: timeout x1, too little text x1.'"""
+    tried = len(results)
+    succeeded = sum(res['status'] == 'success' for res in results)
+    summary = f"Scrape: {tried} tried, {succeeded} succeeded ({succeeded / tried:.0%})."
+
+    reasons = Counter(res['reason'] for res in results if res['status'] == 'failed')
+    if reasons:
+        summary += " Failed: " + ", ".join(f"{reason} x{n}" for reason, n in reasons.most_common()) + "."
+
+    # A page that succeeded with a non-200 status is an error page used as an article
+    accepted_errors = Counter(res['http_status'] for res in results
+                              if res['status'] == 'success' and res['http_status'] != 200)
+    if accepted_errors:
+        summary += " Used as articles despite an error status: " + ", ".join(
+            f"HTTP {code} x{n}" for code, n in accepted_errors.most_common()) + "."
+    return summary
+
+async def scrape_results(urls: list[str]) -> list[dict]:
+    """
+    Scrapes the given URLs in parallel and returns one result per URL, failures included.
+    """
+    if not urls:
+        return []
+
+    async with httpx.AsyncClient(verify=SSL_CONTEXT, limits=httpx.Limits(max_connections=20)) as client:
+        print(f"[INFO] Starting parallel scrape for {len(urls)} articles...")
+        results = await asyncio.gather(*(fetch_one_article(client, url) for url in urls))
+
+    print(f"[INFO] {_scrape_summary(results)}")
+    return results
 
 async def scrape_pages(urls: list[str]) -> dict[str, str]:
     """
@@ -118,12 +176,5 @@ async def scrape_pages(urls: list[str]) -> dict[str, str]:
     Returns {url: full_text} for the pages that yielded enough text; failed pages are left out.
     The pipeline calls this only for URLs whose text isn't already cached.
     """
-    if not urls:
-        return {}
-
-    async with httpx.AsyncClient(verify=SSL_CONTEXT, limits=httpx.Limits(max_connections=20)) as client:
-        print(f"[INFO] Starting parallel scrape for {len(urls)} articles...")
-        scraped_results = await asyncio.gather(*(fetch_one_article(client, url) for url in urls))
-        print("[INFO] Parallel scrape complete.")
-
-    return {res['url']: res['full_text'] for res in scraped_results if res['status'] == 'success'}
+    results = await scrape_results(urls)
+    return {res['url']: res['full_text'] for res in results if res['status'] == 'success'}

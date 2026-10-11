@@ -91,11 +91,13 @@ async def _attach_pages(articles):
     pages = await cache_service.get_pages(urls)
 
     to_scrape = [url for url in urls if url not in pages]
+    scraped = {}
     if to_scrape:
         scraped = await scrape_pages(to_scrape)
         await cache_service.set_pages(scraped)
         pages.update(scraped)
-    print(f"[INFO] Pages: {len(urls)} URLs, {len(urls) - len(to_scrape)} from cache, {len(to_scrape)} scraped.")
+    print(f"[INFO] Pages: {len(urls)} URLs, {len(urls) - len(to_scrape)} from cache, "
+          f"{len(to_scrape)} to scrape, {len(scraped)} succeeded.")
 
     return [{**article, 'full_text': pages[article['url']]} for article in articles if article['url'] in pages]
 
