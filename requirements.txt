@@ -3,6 +3,7 @@ uvicorn
 jinja2
 requests
 httpx
+certifi
 newspaper3k
 trafilatura
 python-dotenv

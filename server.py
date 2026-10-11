@@ -49,7 +49,7 @@ async def query_endpoint(req: QueryRequest):
         raise HTTPException(status_code=404, detail="No articles with sufficient content found")
 
     # Run RAG for main summary
-    rag_data = run_rag_query_with_store(query, data["vector_store"], "report")
+    rag_data = await run_rag_query_with_store(query, data["vector_store"], "report")
 
     final_response = {
         "summary_html": markdown2.markdown(rag_data.get("answer", "No answer generated.")),
@@ -74,7 +74,7 @@ async def api_timeline(req: QueryRequest):
         raise HTTPException(status_code=404, detail="No articles found")
 
     # Run RAG for timeline
-    rag_data = run_rag_query_with_store(query, data["vector_store"], "timeline")
+    rag_data = await run_rag_query_with_store(query, data["vector_store"], "timeline")
     
     return {
         "query": query,
@@ -96,7 +96,7 @@ async def api_contradictions(req: QueryRequest):
         raise HTTPException(status_code=404, detail="No articles found")
 
     # Run RAG for contradictions
-    rag_data = run_rag_query_with_store(query, data["vector_store"], "contradictions")
+    rag_data = await run_rag_query_with_store(query, data["vector_store"], "contradictions")
     
     return {
         "query": query,

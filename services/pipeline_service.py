@@ -1,3 +1,4 @@
+import os
 import asyncio
 import time
 
@@ -16,6 +17,13 @@ ARTICLE_META_FIELDS = ("url", "title", "source_name", "published_at", "theme_id"
 # One build per normalized query at a time in this process. Later identical
 # requests await the same task instead of starting their own build.
 _inflight: dict[str, asyncio.Task] = {}
+
+# --- Build limit ---
+# At most this many full builds (GNews + scrape + embed + index) run at once.
+# Different queries beyond the limit wait in line, which bounds memory on a
+# 512 MB instance and the burst of Gemini embedding calls. Cache hits don't wait.
+MAX_CONCURRENT_BUILDS = max(1, int(os.getenv("MAX_CONCURRENT_BUILDS", "3")))
+_build_slots = asyncio.Semaphore(MAX_CONCURRENT_BUILDS)
 
 
 async def get_pipeline_data(query: str):
@@ -61,8 +69,13 @@ async def _load_or_build(key: str, search_query: str):
     else:
         print(f"[INFO] Cache MISS for '{key}'. Running the full pipeline.")
 
-    data = await _build(key, search_query)
-    print(f"[INFO] Pipeline for '{key}' finished in {time.time() - start_time:.2f}s")
+    if _build_slots.locked():
+        print(f"[INFO] All {MAX_CONCURRENT_BUILDS} build slots busy. '{key}' is waiting.")
+    wait_start = time.time()
+    async with _build_slots:
+        waited = time.time() - wait_start
+        data = await _build(key, search_query)
+    print(f"[INFO] Pipeline for '{key}' finished in {time.time() - start_time:.2f}s (waited {waited:.2f}s for a build slot)")
     return data
 
 
@@ -159,7 +172,8 @@ async def _build(key: str, search_query: str):
     except Exception as e:
         print(f"[ERROR] Failed to embed articles for clustering: {e}")
         article_vectors = None
-    clustering_ok = group_by_theme(articles, article_vectors)
+    # DBSCAN is CPU work: run it in a thread so the event loop stays free
+    clustering_ok = await asyncio.to_thread(group_by_theme, articles, article_vectors)
 
     # 4. Related Links
     related_links = _build_related_links(articles)
