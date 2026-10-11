@@ -1,14 +1,10 @@
 fastapi
 uvicorn
 jinja2
-requests
 httpx
 certifi
-newspaper3k
 trafilatura
 python-dotenv
-google-generativeai
-gunicorn
 markdown2
 beautifulsoup4
 scikit-learn
