@@ -17,9 +17,7 @@ from langchain_google_genai import ChatGoogleGenerativeAI, GoogleGenerativeAIEmb
 from langchain_community.vectorstores import FAISS
 from langchain_core.documents import Document
 from langchain_core.prompts import PromptTemplate
-from langchain_core.runnables import RunnableLambda
 from langchain_classic.chains.combine_documents import create_stuff_documents_chain
-from langchain_classic.chains import create_retrieval_chain
 
 load_dotenv()
 if not os.getenv("GEMINI_API_KEY") and not os.getenv("GOOGLE_API_KEY"):
@@ -57,9 +55,26 @@ CHAT_ATTEMPTS = 2             # per model, including the first try
 # 429 still falls back within seconds; a model that hangs uses up the deadline.
 CHAT_DEADLINE_SECONDS = 75
 
-# Number of chunks retrieved for the answer. The log line after each answer shows it
-# against the index size ("10 of 10 chunks (k=15, whole index)").
-RETRIEVAL_K = 15
+# --- Retrieval (gap_4 Section D) ---
+# Measured on 8 topics: indexes hold 7-60 chunks, and with k=15 a third of them were sent whole.
+# A lower k alone let one long article fill every slot (20 of 60 chunks were one article), so
+# each story gets at most STORY_CAP chunks (soft: see _cap_per_story). The log line after each
+# answer shows k against the index size ("10 of 22 chunks (k=10, max 3 per story)").
+RETRIEVAL_K = 10
+STORY_CAP = 3
+
+# How each prompt type picks its chunks. All three show the model the user's own query.
+RETRIEVAL_SETTINGS = {
+    # The chunks closest to the query
+    "report": {"search": "similarity"},
+    # Searched with date and event words added, so chunks that date events rank higher.
+    # Suffix chosen from 5 measured on 3 topics: most date words in the chunks (56 vs 43 for the
+    # plain query and 47 for "dates events announced timeline"; .local/tests/timeline_suffix_gap4.py)
+    "timeline": {"search": "similarity", "query_suffix": " what happened and when: dates, days, announcements"},
+    # MMR: each next chunk must also differ from the ones already picked, so repeated wire
+    # copy gives way to other viewpoints (lambda_mult 0.5: relevance and difference count equally)
+    "contradictions": {"search": "mmr", "lambda_mult": 0.5},
+}
 
 def _chat_model(model_name):
     return ChatGoogleGenerativeAI(
@@ -323,13 +338,13 @@ async def build_vector_store(articles):
     print(f"[INFO] RAG: Built vector store from {len(all_chunks)} chunks.")
     return vector_store
 
-def _retrieval_summary(documents, index_size=None, k=None, limit=60):
+def _retrieval_summary(documents, index_size=None, k=None, cap=None, limit=60):
     """
     One line naming the retrieved chunks, grouped by article in retrieval order:
     '15 chunks from 6 articles: "Tesla renames FSD..." [0, 2, 1] | "Tesla China sales..." [0] | ...'
-    With index_size and k it also shows how much of the index was retrieved:
-    '10 of 10 chunks (k=15, whole index) from 4 articles: ...'. When every chunk is
-    retrieved, retrieval only decided their order, not which ones the LLM sees.
+    With index_size, k and cap it also shows how much of the index was retrieved:
+    '10 of 22 chunks (k=10, max 3 per story) from 6 articles: ...', or '(..., whole index)'
+    when every chunk is retrieved: then retrieval only decided their order, not which ones the LLM sees.
     """
     # Keyed by URL: two outlets can carry the same headline
     by_article = {}
@@ -345,6 +360,8 @@ def _retrieval_summary(documents, index_size=None, k=None, limit=60):
     if index_size is not None:
         chunks = f"{len(documents)} of {index_size} " + ("chunk" if index_size == 1 else "chunks")
         notes = [f"k={k}"] if k is not None else []
+        if cap is not None:
+            notes.append(f"max {cap} per story")
         if len(documents) >= index_size:
             notes.append("whole index")
         if notes:
@@ -403,6 +420,46 @@ def _with_source_headers(documents):
         for doc in documents
     ]
 
+def _story(metadata):
+    # A theme_id group is one story; an article that isn't in a group is its own story
+    theme_id = metadata.get("theme_id", -1)
+    return ("theme", theme_id) if theme_id != -1 else ("article", metadata.get("source", ""))
+
+def _cap_per_story(documents, k, cap):
+    """
+    The best k documents, at most `cap` from one story, in their original order.
+    Soft cap: if the other stories can't fill k (a topic with one or two stories), the best
+    of the skipped documents fill the rest, so the LLM still gets k chunks.
+    """
+    taken, skipped, per_story = [], [], {}
+    for i, doc in enumerate(documents):
+        if len(taken) == k:
+            break
+        story = _story(doc.metadata)
+        if per_story.get(story, 0) < cap:
+            per_story[story] = per_story.get(story, 0) + 1
+            taken.append(i)
+        else:
+            skipped.append(i)
+    chosen = sorted(taken + skipped[:k - len(taken)])
+    return [documents[i] for i in chosen]
+
+async def _retrieve(vector_store, query, prompt_type):
+    """
+    The chunks for one answer, picked with the prompt type's RETRIEVAL_SETTINGS, then capped
+    per story. Ranks the whole index (small: 7-60 chunks measured), because the cap may need
+    chunks from beyond the first k. Query embedding is async; the FAISS search runs in a thread.
+    """
+    settings = RETRIEVAL_SETTINGS[prompt_type]
+    search_query = query + settings.get("query_suffix", "")
+    index_size = vector_store.index.ntotal
+    if settings["search"] == "mmr":
+        ranked = await vector_store.amax_marginal_relevance_search(
+            search_query, k=index_size, fetch_k=index_size, lambda_mult=settings["lambda_mult"])
+    else:
+        ranked = await vector_store.asimilarity_search(search_query, k=index_size)
+    return _cap_per_story(ranked, RETRIEVAL_K, STORY_CAP)
+
 def _format_response(response):
     answer = response.get('answer') or ''
     source_documents = response.get('context', [])
@@ -438,26 +495,29 @@ async def run_rag_query_with_store(query, vector_store, prompt_type):
     if vector_store is None:
         raise ValueError("run_rag_query_with_store called without a vector store")
     prompt_template = PROMPT_TEMPLATES.get(prompt_type)
-    if prompt_template is None:
+    if prompt_template is None or prompt_type not in RETRIEVAL_SETTINGS:
         raise ValueError(f"Unknown prompt type: {prompt_type!r}")
 
-    # Increased 'k' to 15 to give the LLM more context without dumping everything
-    retriever = vector_store.as_retriever(search_kwargs={"k": RETRIEVAL_K})
     prompt = PromptTemplate(template=prompt_template, input_variables=["context", "input"])
-    
     qa_chain = create_stuff_documents_chain(llm, prompt, document_prompt=DOCUMENT_PROMPT)
-    # The retrieved chunks get their header values on the way to the prompt
-    retrieve = RunnableLambda(lambda x: x["input"]) | retriever | RunnableLambda(_with_source_headers)
-    retrieval_chain = create_retrieval_chain(retrieve, qa_chain)
-    
-    print(f"[INFO] RAG: Invoking chain with query: '{query}' for type: '{prompt_type}'")
+
+    async def retrieve_and_answer():
+        documents = await _retrieve(vector_store, query, prompt_type)
+        # The prompt gets copies with header values; the answer's sources come from the originals
+        answer = await qa_chain.ainvoke({"input": query, "context": _with_source_headers(documents)})
+        return documents, answer
+
+    search = RETRIEVAL_SETTINGS[prompt_type]["search"]
+    print(f"[INFO] RAG: Invoking chain with query: '{query}' for type: '{prompt_type}' ({search} search)")
     try:
-        response = await asyncio.wait_for(retrieval_chain.ainvoke({"input": query}), CHAT_DEADLINE_SECONDS)
+        # One deadline for retrieval and the answer, as before
+        documents, answer = await asyncio.wait_for(retrieve_and_answer(), CHAT_DEADLINE_SECONDS)
     except Exception as e:   # a missed deadline is a TimeoutError -> "took too long" (504)
         raise errors.report_failed(e, prompt_type) from e
 
-    print(f"[INFO] RAG: Retrieved {_retrieval_summary(response.get('context', []), vector_store.index.ntotal, RETRIEVAL_K)}")
-    result = _format_response(response)
+    summary = _retrieval_summary(documents, vector_store.index.ntotal, RETRIEVAL_K, STORY_CAP)
+    print(f"[INFO] RAG [{prompt_type}, {search}]: Retrieved {summary}")
+    result = _format_response({"answer": answer, "context": documents})
     if not result["answer"]:
         raise errors.empty_report(prompt_type)
     return result
