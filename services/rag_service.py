@@ -1,5 +1,9 @@
 import os
+import numpy as np
 from dotenv import load_dotenv
+
+from services import cache_service
+from services.news_fetcher import has_enough_text
 
 # --- LangChain Imports ---
 from langchain_text_splitters import RecursiveCharacterTextSplitter
@@ -14,10 +18,16 @@ load_dotenv()
 if not os.getenv("GEMINI_API_KEY") and not os.getenv("GOOGLE_API_KEY"):
     print("[ERROR] GEMINI_API_KEY/GOOGLE_API_KEY not found. Please set it in your .env file.")
 
-# Initialize Models
+EMBEDDING_MODEL = "gemini-embedding-001"
+# LangChain embeds documents as RETRIEVAL_DOCUMENT and queries as RETRIEVAL_QUERY,
+# which give different vectors for the same text, so the task type is part of the cache key.
+DOCUMENT_TASK_TYPE = "RETRIEVAL_DOCUMENT"
+EMB_CACHE_MODEL = f"{EMBEDDING_MODEL}:{DOCUMENT_TASK_TYPE}"
+
+# Initialize Models (the one embeddings client used by clustering and indexing)
 try:
     llm = ChatGoogleGenerativeAI(model="gemini-2.5-flash", temperature=0.2)
-    embeddings_model = GoogleGenerativeAIEmbeddings(model="gemini-embedding-001")
+    embeddings_model = GoogleGenerativeAIEmbeddings(model=EMBEDDING_MODEL)
     print("[INFO] RAG models loaded successfully.")
 except Exception as e:
     print(f"[ERROR] Failed to load RAG models: {e}")
@@ -81,39 +91,76 @@ QUERY:
 ANALYSIS OF CONFLICTING INFORMATION:
 """
 
-# NEW CACHEABLE VECTOR STORE FUNCTION
-def build_vector_store(articles):
+# Optimized chunking with better overlap for context preservation.
+# Created once so every run splits the same text into the same chunks,
+# which keeps the chunk hashes (and their cached vectors) stable.
+text_splitter = RecursiveCharacterTextSplitter(chunk_size=1500, chunk_overlap=300)
+
+def chunk_articles(articles):
     """
-    Builds and returns a FAISS vector store. This should be called once per query and cached.
+    Splits each article with enough text into chunks, tagged with its metadata.
     """
-    if not embeddings_model:
-        return None
-        
-    # Optimized chunking with better overlap for context preservation
-    text_splitter = RecursiveCharacterTextSplitter(chunk_size=1500, chunk_overlap=300)
     all_chunks = []
-    
     for article in articles:
         text = article.get('full_text')
-        if not text or len(text) < 100:
+        if not has_enough_text(text):
             continue
-            
+
         metadata = {
             "source": article.get('url', ''),
             "title": article.get('title', 'No Title'),
             "theme_id": article.get('theme_id', -1),
             "published_at": article.get('published_at', '')
         }
-        
-        chunks = text_splitter.split_text(text)
-        for chunk_text in chunks:
-            all_chunks.append(Document(page_content=chunk_text, metadata=metadata))
 
+        for chunk_text in text_splitter.split_text(text):
+            all_chunks.append(Document(page_content=chunk_text, metadata=metadata))
+    return all_chunks
+
+async def get_vectors(texts):
+    """
+    Returns one document vector per text, in order. Reads cached vectors first and
+    embeds only the misses (each distinct text once), then caches the new ones.
+    Raises if the embedding API fails.
+    """
+    if not embeddings_model:
+        raise RuntimeError("Embeddings model not loaded.")
+
+    vectors = await cache_service.get_cached_vectors(EMB_CACHE_MODEL, texts)
+
+    # Wire copies often have identical text, so embed each distinct missing text once
+    missing_texts = list(dict.fromkeys(t for t, v in zip(texts, vectors) if v is None))
+    if missing_texts:
+        new_vectors = embeddings_model.embed_documents(missing_texts, task_type=DOCUMENT_TASK_TYPE)
+        new_vectors = [np.asarray(v, dtype=np.float32) for v in new_vectors]
+        await cache_service.set_cached_vectors(EMB_CACHE_MODEL, missing_texts, new_vectors)
+
+        embedded = dict(zip(missing_texts, new_vectors))
+        vectors = [v if v is not None else embedded[t] for t, v in zip(texts, vectors)]
+
+    print(f"[INFO] Vectors: {len(texts)} texts, {len(texts) - len(missing_texts)} from cache, {len(missing_texts)} embedded.")
+    return vectors
+
+async def build_vector_store(articles):
+    """
+    Builds and returns a FAISS vector store from cached or newly embedded chunk vectors.
+    """
+    if not embeddings_model:
+        return None
+
+    all_chunks = chunk_articles(articles)
     if not all_chunks:
         return None
 
     try:
-        vector_store = FAISS.from_documents(all_chunks, embeddings_model)
+        texts = [chunk.page_content for chunk in all_chunks]
+        vectors = await get_vectors(texts)
+        # Vectors are precomputed, so FAISS only uses embeddings_model to embed the query at search time
+        vector_store = FAISS.from_embeddings(
+            text_embeddings=list(zip(texts, vectors)),
+            embedding=embeddings_model,
+            metadatas=[chunk.metadata for chunk in all_chunks],
+        )
         print(f"[INFO] RAG: Built vector store from {len(all_chunks)} chunks.")
         return vector_store
     except Exception as e:

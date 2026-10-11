@@ -10,7 +10,7 @@ import markdown2
 # --- Our Services ---
 from services.news_fetcher import fetch_all_articles
 from services.clustering_service import group_by_theme
-from services.rag_service import build_vector_store, run_rag_query_with_store
+from services.rag_service import build_vector_store, run_rag_query_with_store, get_vectors
 
 BASE_DIR = Path(__file__).resolve().parent
 
@@ -57,9 +57,14 @@ async def get_or_create_pipeline_data(query: str):
     if not articles:
         return {"articles": [], "vector_store": None, "related_links": []}
 
-    # 2. Cluster
-    articles = group_by_theme(articles)
-    
+    # 2. Cluster (group -> index; gap_1's choose step will go between the two)
+    try:
+        article_vectors = await get_vectors([article['full_text'] for article in articles])
+    except Exception as e:
+        print(f"[ERROR] Failed to embed articles for clustering: {e}")
+        article_vectors = None
+    clustering_ok = group_by_theme(articles, article_vectors)
+
     # 3. Build "Related Links"
     unique_themes = {}
     for article in articles:
@@ -78,13 +83,14 @@ async def get_or_create_pipeline_data(query: str):
     ]
     
     # 4. Build Vector Store (Once per query)
-    vector_store = build_vector_store(articles)
-    
+    vector_store = await build_vector_store(articles)
+
     # Save to Cache
     pipeline_data = {
         "articles": articles,
         "vector_store": vector_store,
         "related_links": related_links,
+        "clustering_ok": clustering_ok,
         "timestamp": now
     }
     CACHE[query] = pipeline_data

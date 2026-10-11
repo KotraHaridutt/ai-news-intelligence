@@ -13,6 +13,13 @@ NEWS_API_KEY = os.getenv("NEWS_API_KEY")
 if not GNEWS_API_KEY and not NEWS_API_KEY:
     print("ERROR: GNEWS_API_KEY/NEWS_API_KEY not found in .env file. Please add it.")
 
+# Shared minimum article length: scraping, clustering and indexing all use this
+# so an article is either usable everywhere or nowhere.
+MIN_TEXT_LEN = 100
+
+def has_enough_text(text) -> bool:
+    return bool(text) and len(text) >= MIN_TEXT_LEN
+
 async def fetch_news(query: str) -> list[dict]:
     """
     Fetches news articles using the configured provider.
@@ -83,7 +90,7 @@ async def fetch_one_article(client: httpx.AsyncClient, url: str) -> dict:
             paragraphs = soup.find_all('p')
             full_text = " ".join([p.get_text(strip=True) for p in paragraphs])
             
-        if not full_text or len(full_text) < 100:
+        if not has_enough_text(full_text):
             raise ValueError("Insufficient text extracted")
             
         return {

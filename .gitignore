@@ -6,3 +6,5 @@ __pycache__/
 docs/
 gaps/
 implemented/
+# Local test environment
+.local/

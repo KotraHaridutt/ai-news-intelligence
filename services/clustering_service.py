@@ -1,82 +1,48 @@
 import numpy as np
 from sklearn.cluster import DBSCAN
 import time
-from langchain_google_genai import GoogleGenerativeAIEmbeddings
-import os
-from dotenv import load_dotenv
 
-# Load env variables
-load_dotenv()
-
-# --- Initialize Google Embeddings ---
-# This uses Google's API, eliminating the need for heavy local PyTorch models
-try:
-    print("[INFO] Initializing Google Generative AI Embeddings...")
-    embeddings_model = GoogleGenerativeAIEmbeddings(model="gemini-embedding-001")
-    print("[INFO] Embeddings model initialized.")
-except Exception as e:
-    print(f"[ERROR] Failed to initialize embeddings model: {e}")
-    embeddings_model = None
-
-def group_by_theme(articles):
+def group_by_theme(articles, vectors):
     """
-    Takes a list of article objects and adds a 'theme_id' to each.
+    Adds a 'theme_id' to each article (in place) from its precomputed article vector.
+    vectors[i] belongs to articles[i]; the caller keeps them for later steps.
+    Returns True on success. On failure every article is left at -1 and it returns False,
+    so the caller can tell "no themes found" apart from "grouping failed".
     """
-    if embeddings_model is None:
-        print("[ERROR] Embeddings model not loaded. Skipping clustering.")
-        for i, article in enumerate(articles):
-            article['theme_id'] = i 
-        return articles
+    for article in articles:
+        article['theme_id'] = -1
 
     if not articles:
-        return []
+        return True
+
+    if vectors is None or len(vectors) != len(articles):
+        print("[ERROR] Clustering skipped: article vectors missing or misaligned.")
+        return False
 
     print(f"[INFO] Clustering {len(articles)} articles...")
     start_time = time.time()
 
-    articles_to_cluster = [] 
-
-    for i, article in enumerate(articles):
-        article['theme_id'] = -1
-        content = article.get('full_text') 
-        if content and len(content) > 100:
-            articles_to_cluster.append((i, content))
-
-    if not articles_to_cluster:
-        print("[WARN] No articles with sufficient content to cluster.")
-        return articles 
-
-    original_indices, texts = zip(*articles_to_cluster)
-
-    # --- 2. Create Embeddings via API ---
-    print("[INFO] Creating embeddings via Google API...")
-    try:
-        # We process in small batches if necessary, but 30 articles is very small
-        embeddings = embeddings_model.embed_documents(list(texts))
-    except Exception as e:
-        print(f"[ERROR] Failed to encode text via API: {e}")
-        return articles
-
-    # --- 3. Run Clustering (DBSCAN) ---
-    print("[INFO] Running DBSCAN clustering...")
+    # --- Run Clustering (DBSCAN) ---
     # Cosine distance tuning for API embeddings might be slightly different
     # Adjust eps if clusters are too loose/strict
-    dbscan = DBSCAN(eps=0.35, min_samples=2, metric='cosine')
-    
-    # DBSCAN expects numpy arrays
-    dbscan.fit(np.array(embeddings))
+    try:
+        dbscan = DBSCAN(eps=0.35, min_samples=2, metric='cosine')
+        dbscan.fit(np.array(vectors))
+    except Exception as e:
+        print(f"[ERROR] Clustering failed: {e}")
+        return False
 
     labels = dbscan.labels_
 
-    # --- 4. Assign Theme IDs ---
+    # --- Assign Theme IDs ---
+    # -1 now only means DBSCAN found no similar article (noise)
     num_clusters = len(set(labels)) - (1 if -1 in labels else 0)
     print(f"[INFO] Found {num_clusters} unique themes.")
 
-    for i, label in enumerate(labels):
-        original_article_index = original_indices[i]
-        articles[original_article_index]['theme_id'] = int(label)
+    for article, label in zip(articles, labels):
+        article['theme_id'] = int(label)
 
     end_time = time.time()
     print(f"[INFO] Clustering complete in {end_time - start_time:.2f}s")
 
-    return articles
+    return True
