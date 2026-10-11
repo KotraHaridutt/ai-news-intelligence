@@ -28,6 +28,14 @@ if static_dir.exists():
 class QueryRequest(BaseModel):
     query: str
 
+def render_markdown(text) -> str:
+    """
+    Markdown -> HTML for the LLM's answer. safe_mode="escape" turns any raw HTML in the
+    answer into plain text and replaces javascript: links with "#". The answer is built from
+    scraped web pages, so a page could steer the model into echoing HTML/script (XSS).
+    """
+    return markdown2.markdown(text or "", safe_mode="escape")
+
 
 @app.get("/", response_class=HTMLResponse)
 async def home(request: Request):
@@ -52,7 +60,7 @@ async def query_endpoint(req: QueryRequest):
     rag_data = await run_rag_query_with_store(query, data["vector_store"], "report")
 
     final_response = {
-        "summary_html": markdown2.markdown(rag_data.get("answer", "No answer generated.")),
+        "summary_html": render_markdown(rag_data.get("answer", "No answer generated.")),
         "cited_sources": rag_data.get("sources", []),
         "related_links": data["related_links"],
         "total_articles_found": len(data["articles"]),
@@ -78,7 +86,7 @@ async def api_timeline(req: QueryRequest):
     
     return {
         "query": query,
-        "timeline_html": markdown2.markdown(rag_data.get("answer")),
+        "timeline_html": render_markdown(rag_data.get("answer")),
         "cited_sources": rag_data.get("sources"),
         "time_taken": f"{time.time() - start_time:.2f}s"
     }
@@ -100,7 +108,7 @@ async def api_contradictions(req: QueryRequest):
     
     return {
         "query": query,
-        "analysis_html": markdown2.markdown(rag_data.get("answer")),
+        "analysis_html": render_markdown(rag_data.get("answer")),
         "cited_sources": rag_data.get("sources"),
         "time_taken": f"{time.time() - start_time:.2f}s"
     }

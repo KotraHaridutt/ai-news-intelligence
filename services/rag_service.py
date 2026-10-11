@@ -28,11 +28,37 @@ EMBEDDING_MODEL = "gemini-embedding-001"
 DOCUMENT_TASK_TYPE = "RETRIEVAL_DOCUMENT"
 EMB_CACHE_MODEL = f"{EMBEDDING_MODEL}:{DOCUMENT_TASK_TYPE}"
 
+# Chat model for the report / timeline / contradictions answers.
+# gemini-3.8-flash is Google's current Flash model (2.5 Flash is two generations old).
+# - No temperature: Google recommends the default (1.0) for Gemini 3+ models; lower values
+#   can cause looping. LangChain sends no temperature for Gemini 3+ when it isn't set.
+# - thinking_level="low": the task is writing from the retrieved context, not multi-step
+#   reasoning, and the default ("high") adds reasoning tokens and latency.
+# - Timeout + fallback: a new model can be overloaded (measured: 503 "high demand", one call
+#   took 89 s, another 190 s). Each attempt is cut off after CHAT_TIMEOUT_SECONDS; the Google SDK
+#   retries 429/5xx and timeouts (CHAT_ATTEMPTS attempts per model), and if the primary model
+#   still fails, the request falls back to a stable older Flash model.
+# GEMINI_CHAT_MODEL / GEMINI_FALLBACK_MODEL override the models without a code change
+# (thinking_level needs Gemini 3+).
+CHAT_MODEL = os.getenv("GEMINI_CHAT_MODEL", "gemini-3.8-flash")
+FALLBACK_CHAT_MODEL = os.getenv("GEMINI_FALLBACK_MODEL", "gemini-3.6-flash")
+THINKING_LEVEL = "low"
+CHAT_TIMEOUT_SECONDS = 45     # per attempt (normal answers take ~10-30 s)
+CHAT_ATTEMPTS = 2             # per model, including the first try
+
+def _chat_model(model_name):
+    return ChatGoogleGenerativeAI(
+        model=model_name,
+        thinking_level=THINKING_LEVEL,
+        timeout=CHAT_TIMEOUT_SECONDS,
+        max_retries=CHAT_ATTEMPTS,
+    )
+
 # Initialize Models (the one embeddings client used by clustering and indexing)
-# The chat model retries 429/5xx itself (max_retries=6 -> Google SDK retry with backoff).
+# The chat models retry through the Google SDK (see above).
 # The embeddings client has no retries, so embedding calls go through call_with_retry below.
 try:
-    llm = ChatGoogleGenerativeAI(model="gemini-2.5-flash", temperature=0.2)
+    llm = _chat_model(CHAT_MODEL).with_fallbacks([_chat_model(FALLBACK_CHAT_MODEL)])
     embeddings_model = GoogleGenerativeAIEmbeddings(model=EMBEDDING_MODEL)
     print("[INFO] RAG models loaded successfully.")
 except Exception as e:

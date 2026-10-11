@@ -53,6 +53,32 @@
     </div>
 
     <script>
+        // Only absolute http(s) URLs become links; javascript:, data: and anything unparseable don't
+        function safeUrl(url) {
+            try {
+                const parsed = new URL(url);
+                return (parsed.protocol === "http:" || parsed.protocol === "https:") ? parsed.href : null;
+            } catch (e) {
+                return null;
+            }
+        }
+
+        // Builds a link with DOM methods. Titles come from news sites, so they are set with
+        // textContent and can never be parsed as HTML. Unsafe URLs are shown as plain text.
+        function makeLink(url, text, className) {
+            const href = safeUrl(url);
+            const el = document.createElement(href ? "a" : "span");
+            el.className = className;
+            el.textContent = text || href || "Untitled";
+            if (href) {
+                el.setAttribute("href", href);
+                el.setAttribute("target", "_blank");
+                // noopener: the opened page can't control this tab through window.opener
+                el.setAttribute("rel", "noopener noreferrer");
+            }
+            return el;
+        }
+
         function showError(message) {
             const errorEl = document.getElementById("error");
             // textContent, not innerHTML: server text is shown as text, never parsed as HTML
@@ -125,7 +151,7 @@
                 
                 // --- START: NEW RENDER LOGIC ---
 
-                // 1. Render Summary (it's already HTML)
+                // 1. Render Summary (HTML from the server; markdown2 safe_mode has already escaped any raw HTML)
                 if (data.summary_html) {
                     summaryEl.innerHTML = `
                         <div class="prose max-w-none">
@@ -139,11 +165,9 @@
                 // 2. Render Cited Sources
                 if (data.cited_sources && data.cited_sources.length > 0) {
                     data.cited_sources.forEach(item => {
-                        citedSourcesEl.innerHTML += `
-                            <li>
-                                <a href="${item.url}" target="_blank" class="text-blue-600 underline">${item.title}</a>
-                            </li>
-                        `;
+                        const li = document.createElement("li");
+                        li.appendChild(makeLink(item.url, item.title, "text-blue-600 underline"));
+                        citedSourcesEl.appendChild(li);
                     });
                 } else {
                     citedSourcesEl.innerHTML = "<li>No specific sources were cited.</li>";
@@ -152,12 +176,14 @@
                 // 3. Render Related Links (Our new section)
                 if (data.related_links && data.related_links.length > 0) {
                     data.related_links.forEach(item => {
-                        relatedLinksEl.innerHTML += `
-                            <div class="p-3 border rounded-lg bg-white text-sm shadow-sm">
-                                <a href="${item.url}" target="_blank" class="font-medium text-blue-700 hover:underline">${item.title}</a>
-                                <p class="text-gray-500 text-xs mt-1">${item.source}</p>
-                            </div>
-                        `;
+                        const card = document.createElement("div");
+                        card.className = "p-3 border rounded-lg bg-white text-sm shadow-sm";
+                        card.appendChild(makeLink(item.url, item.title, "font-medium text-blue-700 hover:underline"));
+                        const source = document.createElement("p");
+                        source.className = "text-gray-500 text-xs mt-1";
+                        source.textContent = item.source || "";
+                        card.appendChild(source);
+                        relatedLinksEl.appendChild(card);
                     });
                 } else {
                     relatedLinksEl.innerHTML = "<p>No related links found.</p>";

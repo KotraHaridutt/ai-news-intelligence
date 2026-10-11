@@ -1,6 +1,6 @@
 # AI News Intelligence
 
-Turn 30 news articles into one grounded briefing. Enter a topic, and the app fetches recent coverage, scrapes the full text, groups duplicate stories by theme, and uses retrieval-augmented generation (RAG) to produce an **intelligence report**, a **timeline**, and an analysis of **where sources disagree**, with links back to every source used.
+Turn a topic's news coverage into one grounded briefing. Enter a topic, and the app fetches recent coverage, scrapes the full text, groups duplicate stories by theme, and uses retrieval-augmented generation (RAG) to produce an **intelligence report**, a **timeline**, and an analysis of **where sources disagree**, with links back to every source used.
 
 **Live demo:** https://ai-news-intelligence-xdtc.onrender.com
 *(Free-tier hosting: the first request after a period of inactivity can take up to a minute while the server wakes up.)*
@@ -47,7 +47,7 @@ flowchart TD
     G --> H[JSON response with citations]
 ```
 
-1. **Discover:** query the GNews API for up to 30 recent English-language articles (title, URL, source, publish date).
+1. **Discover:** query the GNews API for up to 10 recent English-language articles (title, URL, source, publish date). 10 is the free plan's per-request maximum, and free-plan articles arrive with a 12-hour delay.
 2. **Scrape:** fetch every article page concurrently with `asyncio.gather` on a shared `httpx.AsyncClient` (max 20 connections, 15 s timeout). Trafilatura extracts the article body without navigation, ads or comments, with a BeautifulSoup paragraph fallback. Pages that fail or yield too little text are dropped.
 3. **Cluster:** embed each article with `gemini-embedding-001` and run DBSCAN (cosine distance, `eps=0.35`, `min_samples=2`). Each article gets a `theme_id`, and articles that match nothing else are labeled noise (`-1`). DBSCAN needs no preset number of clusters, which suits news where the number of storylines is unknown.
 4. **Index:** split articles with `RecursiveCharacterTextSplitter` (1500 characters, 300 overlap, paragraph-aware) and attach source URL, title, publish date and theme ID to each chunk. Embed the chunks into an in-memory FAISS index.
@@ -81,13 +81,13 @@ All three endpoints share the cache, so switching from the report to the timelin
 | Layer | Technology |
 |---|---|
 | Backend | Python 3.12, FastAPI, Uvicorn, Pydantic |
-| News source | GNews API (NewsAPI also supported) |
+| News source | GNews API |
 | Scraping | httpx (async), asyncio, Trafilatura, BeautifulSoup |
 | Embeddings | Google `gemini-embedding-001` |
 | Clustering | scikit-learn DBSCAN, NumPy |
 | RAG | LangChain (text splitter, retrieval and stuff-documents chains), FAISS (`faiss-cpu`) |
 | Caching | Upstash Redis (`redis` asyncio client) |
-| LLM | Google Gemini Flash (`gemini-2.5-flash`), temperature 0.2 |
+| LLM | Google Gemini Flash (`gemini-3.8-flash`, falling back to `gemini-3.6-flash`), thinking level `low`, default temperature, 45 s timeout per attempt |
 | Frontend | Jinja2 template, Tailwind CSS, vanilla JavaScript |
 | Deployment | Render (free tier) |
 
@@ -154,7 +154,7 @@ REDIS_URL=rediss://default:your_password@your-db.upstash.io:6379
 
 `REDIS_URL` is optional. Without it the app runs with caching disabled, so every request runs the full pipeline. Upstash shows the URL as `redis://...`; use `rediss://` (TLS), which Upstash requires.
 
-Optional: `MAX_CONCURRENT_BUILDS` (default `3`) limits how many new queries are built at the same time.
+Optional: `MAX_CONCURRENT_BUILDS` (default `3`) limits how many new queries are built at the same time, and `GEMINI_CHAT_MODEL` (default `gemini-3.8-flash`) and `GEMINI_FALLBACK_MODEL` (default `gemini-3.6-flash`) switch the answer models without a code change (Gemini 3+ models are required). The fallback is used only when the main model is overloaded or times out.
 
 ### Run
 
@@ -200,10 +200,10 @@ ai-news-intelligence/
 
 ## Design decisions
 
-- **Query-time RAG instead of a persistent vector database.** Each query builds its own small index (about 150 chunks) from fresh articles, so the corpus is always current. An exact flat FAISS index is fast at this size, and an external vector database would add cost without benefit.
+- **Query-time RAG instead of a persistent vector database.** Each query builds its own small index (about 30-40 chunks from up to 10 articles) from fresh articles, so the corpus is always current. An exact flat FAISS index is fast at this size, and an external vector database would add cost without benefit.
 - **DBSCAN instead of K-Means.** The number of storylines per topic is unknown in advance, and DBSCAN can leave off-topic articles unassigned instead of forcing them into a cluster.
 - **The "stuff" strategy instead of map-reduce.** Finding contradictions requires the model to see all sources at once. Map-reduce processes documents separately and would miss conflicts between them.
-- **Cache the inputs, not the index.** Redis stores page text and embedding vectors, and the FAISS index is rebuilt from them on each request. Storing the FAISS object itself would need `pickle` (unsafe to load, tied to library versions), while rebuilding about 150 vectors takes milliseconds. Keying text and vectors by URL and content hash lets different queries share the expensive work.
+- **Cache the inputs, not the index.** Redis stores page text and embedding vectors, and the FAISS index is rebuilt from them on each request. Storing the FAISS object itself would need `pickle` (unsafe to load, tied to library versions), while rebuilding the index from 30-40 vectors takes milliseconds. Keying text and vectors by URL and content hash lets different queries share the expensive work.
 - **Paragraph-aware chunking.** News articles are plain prose, so splitting at paragraph boundaries keeps each claim together with its context without the extra cost of semantic chunking.
 
 ## Limitations and roadmap

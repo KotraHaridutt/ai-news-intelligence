@@ -13,11 +13,14 @@ SSL_CONTEXT = ssl.create_default_context(cafile=certifi.where())
 
 # Load your .env file to get the API key
 load_dotenv()
-GNEWS_API_KEY = os.getenv("GNEWS_API_KEY") or os.getenv("NEWS_API_KEY")
-NEWS_API_KEY = os.getenv("NEWS_API_KEY")
+GNEWS_API_KEY = os.getenv("GNEWS_API_KEY")
 
-if not GNEWS_API_KEY and not NEWS_API_KEY:
-    print("ERROR: GNEWS_API_KEY/NEWS_API_KEY not found in .env file. Please add it.")
+if not GNEWS_API_KEY:
+    print("ERROR: GNEWS_API_KEY not found in .env file. Please add it.")
+
+# GNews free plan: at most 10 articles per request (and a 12-hour delay).
+# Asking for more doesn't return more, so ask for exactly what the plan gives.
+GNEWS_MAX_ARTICLES = 10
 
 # Shared minimum article length: scraping, clustering and indexing all use this
 # so an article is either usable everywhere or nowhere.
@@ -28,34 +31,22 @@ def has_enough_text(text) -> bool:
 
 async def fetch_news(query: str) -> list[dict]:
     """
-    Fetches news articles using the configured provider.
+    Fetches the article list for a query from GNews.
     """
-    if not GNEWS_API_KEY and not NEWS_API_KEY:
+    if not GNEWS_API_KEY:
         return []
 
-    if GNEWS_API_KEY:
-        api_url = "https://gnews.io/api/v4/search"
-        params = {
-            "q": query,
-            "lang": "en",
-            "max": 30,
-            "token": GNEWS_API_KEY,
-        }
-        provider_name = "GNews"
-    else:
-        api_url = "https://newsapi.org/v2/everything"
-        params = {
-            "q": query,
-            "apiKey": NEWS_API_KEY,
-            "pageSize": 30,
-            "language": "en",
-            "sortBy": "relevancy",
-        }
-        provider_name = "NewsAPI"
+    api_url = "https://gnews.io/api/v4/search"
+    params = {
+        "q": query,
+        "lang": "en",
+        "max": GNEWS_MAX_ARTICLES,
+        "token": GNEWS_API_KEY,
+    }
 
     try:
         async with httpx.AsyncClient(verify=SSL_CONTEXT) as client:
-            print(f"[INFO] Fetching real news from {provider_name} for: {query}")
+            print(f"[INFO] Fetching real news from GNews for: {query}")
             response = await client.get(api_url, params=params, timeout=10.0)
             response.raise_for_status()
 
@@ -73,7 +64,7 @@ async def fetch_news(query: str) -> list[dict]:
             return articles
 
     except httpx.HTTPStatusError as e:
-        print(f"[ERROR] {provider_name} HTTP Error: {e.response.status_code} - {e.response.text}")
+        print(f"[ERROR] GNews HTTP Error: {e.response.status_code} - {e.response.text}")
         return []
     except Exception as e:
         print(f"[ERROR] Failed to fetch news: {e}")
