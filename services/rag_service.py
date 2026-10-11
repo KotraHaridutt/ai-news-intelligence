@@ -127,6 +127,7 @@ async def get_vectors(texts):
         raise RuntimeError("Embeddings model not loaded.")
 
     vectors = await cache_service.get_cached_vectors(EMB_CACHE_MODEL, texts)
+    cache_hits = sum(v is not None for v in vectors)
 
     # Wire copies often have identical text, so embed each distinct missing text once
     missing_texts = list(dict.fromkeys(t for t, v in zip(texts, vectors) if v is None))
@@ -138,7 +139,8 @@ async def get_vectors(texts):
         embedded = dict(zip(missing_texts, new_vectors))
         vectors = [v if v is not None else embedded[t] for t, v in zip(texts, vectors)]
 
-    print(f"[INFO] Vectors: {len(texts)} texts, {len(texts) - len(missing_texts)} from cache, {len(missing_texts)} embedded.")
+    duplicates = len(texts) - cache_hits - len(missing_texts)
+    print(f"[INFO] Vectors: {len(texts)} texts, {cache_hits} from cache, {len(missing_texts)} embedded, {duplicates} duplicates.")
     return vectors
 
 async def build_vector_store(articles):

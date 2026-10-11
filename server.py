@@ -8,9 +8,8 @@ import time
 import markdown2
 
 # --- Our Services ---
-from services.news_fetcher import fetch_all_articles
-from services.clustering_service import group_by_theme
-from services.rag_service import build_vector_store, run_rag_query_with_store, get_vectors
+from services.pipeline_service import get_pipeline_data
+from services.rag_service import run_rag_query_with_store
 
 BASE_DIR = Path(__file__).resolve().parent
 
@@ -24,78 +23,10 @@ static_dir = BASE_DIR / "static"
 if static_dir.exists():
     app.mount("/static", StaticFiles(directory=str(static_dir)), name="static")
 
-# --- Simple In-Memory Cache ---
-# Storing: { "query_string": {"articles": [...], "vector_store": <FAISS>, "related_links": [...], "timestamp": float} }
-CACHE = {}
-CACHE_TTL = 600 # 10 minutes cache duration
+# Caching lives in services/pipeline_service.py (Redis). The process keeps nothing between requests.
 
 class QueryRequest(BaseModel):
     query: str
-
-async def get_or_create_pipeline_data(query: str):
-    """
-    Fetches, clusters, and builds the FAISS index. Caches the result.
-    """
-    now = time.time()
-    
-    # Check Cache
-    if query in CACHE:
-        cached_data = CACHE[query]
-        if now - cached_data["timestamp"] < CACHE_TTL:
-            print(f"[INFO] Cache HIT for query: '{query}'")
-            return cached_data
-            
-    print(f"[INFO] Cache MISS. Running full pipeline for: '{query}'")
-    
-    # 1. Fetch
-    try:
-        articles = await fetch_all_articles(query)
-    except Exception as e:
-        print(f"[ERROR] Async fetch failed: {e}")
-        return None
-        
-    if not articles:
-        return {"articles": [], "vector_store": None, "related_links": []}
-
-    # 2. Cluster (group -> index; gap_1's choose step will go between the two)
-    try:
-        article_vectors = await get_vectors([article['full_text'] for article in articles])
-    except Exception as e:
-        print(f"[ERROR] Failed to embed articles for clustering: {e}")
-        article_vectors = None
-    clustering_ok = group_by_theme(articles, article_vectors)
-
-    # 3. Build "Related Links"
-    unique_themes = {}
-    for article in articles:
-        theme = article.get('theme_id', -1)
-        if theme != -1 and theme not in unique_themes:
-            unique_themes[theme] = article
-            
-    top_themed_articles = list(unique_themes.values())[:5]
-    related_links = [
-        {
-            "title": art.get("title"), 
-            "url": art.get("url"), 
-            "source": art.get("source_name")
-        }
-        for art in top_themed_articles
-    ]
-    
-    # 4. Build Vector Store (Once per query)
-    vector_store = await build_vector_store(articles)
-
-    # Save to Cache
-    pipeline_data = {
-        "articles": articles,
-        "vector_store": vector_store,
-        "related_links": related_links,
-        "clustering_ok": clustering_ok,
-        "timestamp": now
-    }
-    CACHE[query] = pipeline_data
-    
-    return pipeline_data
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -110,7 +41,7 @@ async def query_endpoint(req: QueryRequest):
     if not query:
         raise HTTPException(status_code=400, detail="No query provided")
 
-    data = await get_or_create_pipeline_data(query)
+    data = await get_pipeline_data(query)
     
     if data is None:
         raise HTTPException(status_code=500, detail="Failed to fetch articles")
@@ -137,7 +68,7 @@ async def api_timeline(req: QueryRequest):
     if not query:
         raise HTTPException(status_code=400, detail="No query provided")
 
-    data = await get_or_create_pipeline_data(query)
+    data = await get_pipeline_data(query)
     
     if data is None or not data["articles"] or data["vector_store"] is None:
         raise HTTPException(status_code=404, detail="No articles found")
@@ -159,7 +90,7 @@ async def api_contradictions(req: QueryRequest):
     if not query:
         raise HTTPException(status_code=400, detail="No query provided")
 
-    data = await get_or_create_pipeline_data(query)
+    data = await get_pipeline_data(query)
     
     if data is None or not data["articles"] or data["vector_store"] is None:
         raise HTTPException(status_code=404, detail="No articles found")

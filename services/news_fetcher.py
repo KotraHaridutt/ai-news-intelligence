@@ -107,37 +107,18 @@ async def fetch_one_article(client: httpx.AsyncClient, url: str) -> dict:
             "status": "failed"
         }
 
-async def fetch_all_articles(query: str) -> list[dict]:
+async def scrape_pages(urls: list[str]) -> dict[str, str]:
     """
-    Orchestrates the entire process:
-    1. Fetches article list from NewsAPI.
-    2. Scrapes full text for each article in parallel.
-    3. Merges the data.
+    Scrapes the given URLs in parallel.
+    Returns {url: full_text} for the pages that yielded enough text; failed pages are left out.
+    The pipeline calls this only for URLs whose text isn't already cached.
     """
-    articles_from_api = await fetch_news(query)
-    
-    if not articles_from_api:
-        print("[INFO] No articles found by NewsAPI.")
-        return []
+    if not urls:
+        return {}
 
     async with httpx.AsyncClient(limits=httpx.Limits(max_connections=20)) as client:
-        tasks = []
-        for article in articles_from_api:
-            tasks.append(fetch_one_article(client, article['url']))
-            
-        print(f"[INFO] Starting parallel scrape for {len(tasks)} articles...")
-        scraped_results = await asyncio.gather(*tasks)
+        print(f"[INFO] Starting parallel scrape for {len(urls)} articles...")
+        scraped_results = await asyncio.gather(*(fetch_one_article(client, url) for url in urls))
         print("[INFO] Parallel scrape complete.")
-        
-    # Merge the API data with the scraped full_text
-    scraped_map = {res['url']: res['full_text'] for res in scraped_results if res['status'] == 'success'}
-    
-    final_articles = []
-    for api_article in articles_from_api:
-        url = api_article['url']
-        if url in scraped_map:
-            api_article['full_text'] = scraped_map[url]
-            # Use real published_at, no hardcoded date
-            final_articles.append(api_article)
 
-    return final_articles
+    return {res['url']: res['full_text'] for res in scraped_results if res['status'] == 'success'}
