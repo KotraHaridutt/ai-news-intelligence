@@ -37,7 +37,7 @@ flowchart TD
     B -- yes --> R[Rebuild the FAISS index from<br/>cached page text + vectors]
     R --> F
     B -- no --> Q[Wait for a build slot<br/>at most 3 builds at once]
-    Q --> C[1. Discover articles<br/>GNews API]
+    Q --> C[1. Discover articles<br/>GNews: best match, last 48 h]
     C --> D[2. Scrape full text concurrently<br/>only pages not already cached]
     D --> E[3. Group duplicates<br/>Gemini embeddings + DBSCAN]
     E --> CH[3b. Choose<br/>rank by query relevance<br/>max 2 per story, unique stories kept]
@@ -48,13 +48,13 @@ flowchart TD
     G --> H[JSON response with citations]
 ```
 
-1. **Discover:** query the GNews API for up to 10 recent English-language articles (title, URL, source, publish date). 10 is the free plan's per-request maximum, and free-plan articles arrive with a 12-hour delay.
-2. **Scrape:** fetch every article page concurrently with `asyncio.gather` on a shared `httpx.AsyncClient` (max 20 connections, 15 s timeout). Trafilatura extracts the article body without navigation, ads or comments, with a BeautifulSoup paragraph fallback. Pages that fail or yield too little text are dropped.
+1. **Discover:** ask the GNews API for the 10 English-language articles that **best match** the query (`sortby=relevance`) among those **published in the last 48 hours** (`from`), with title, URL, source and publish date. GNews's default order is newest first, which filled the 10 slots with articles that only mention the topic in passing; in a live comparison, titles naming the topic went from 3/10 to 10/10 ("Tesla") and from 7/10 to 9/10 ("artificial intelligence"). 10 is the free plan's per-request maximum, and free-plan articles arrive with a 12-hour delay. The free plan also allows 1 request per second, so GNews requests go one at a time, each 1.1 s after the previous one finished.
+2. **Scrape:** fetch every article page concurrently with `asyncio.gather` on a shared `httpx.AsyncClient` (max 20 connections, 15 s timeout) that sends a browser `User-Agent`, `Accept` and `Accept-Language`, since many news sites answer a script's default User-Agent with 403. A page whose final status (after redirects) isn't 200, or that isn't HTML, is rejected before parsing, so an "Access Denied" page can never become a source. Trafilatura extracts the article body without navigation, ads or comments, with a BeautifulSoup paragraph fallback. Pages that fail or yield too little text are dropped, and each scrape logs its success rate with failures grouped by reason. Measured on the same 40 real pages: usable articles went from 25 (63%) to 34 (85%), bot blocks (403/400) from 11 to 2, and error pages used as articles from 6 to 0.
 3. **Group duplicates:** embed each article with `gemini-embedding-001` and run DBSCAN (cosine distance, `eps=0.12`, `min_samples=2`). Articles carrying the same story (wire copies, pieces on the same event) share a `theme_id`; every other article is a unique story. `eps` was set from measured data: the same wire story in two outlets is 0.000-0.009 apart, pieces on the same event 0.05-0.10, and different stories on the same topic 0.14 or more.
    - **Choose:** embed the query and rank articles by similarity. Keep at most 2 articles per group, from different outlets when possible, and never a second copy of near-identical text. Keep every unique story (relevance scores of on-topic and off-topic articles overlap too much to drop any safely). Only the chosen articles are indexed, so duplicate coverage doesn't crowd the context.
-4. **Index:** split the chosen articles with `RecursiveCharacterTextSplitter` (1500 characters, 300 overlap, paragraph-aware) and attach source URL, title, publish date and theme ID to each chunk. Embed the chunks into an in-memory FAISS index.
-5. **Retrieve:** embed the query and fetch the 15 nearest chunks.
-6. **Generate:** place the retrieved chunks in one prompt (LangChain's "stuff" strategy) with one of three templates. Each template instructs the model to use only the provided context and to say so when the context is insufficient.
+4. **Index:** split the chosen articles with `RecursiveCharacterTextSplitter` (1500 characters, 300 overlap, paragraph-aware) and attach source URL, title, publish date, theme ID and the chunk's position in its article (`chunk_index`) to each chunk. Embed the chunks into an in-memory FAISS index.
+5. **Retrieve:** embed the query and fetch the 15 nearest chunks. Each answer logs which chunks were used, by article and position (`Retrieved 10 chunks from 4 articles: "title" [0, 1] | ...`).
+6. **Generate:** place the retrieved chunks in one prompt (LangChain's "stuff" strategy) with one of three templates. Each template instructs the model to use only the provided context and to say so when the context is insufficient. The whole answer step has a 75 s deadline, so a slow model gets a clear "took too long" message before the page gives up.
 
 ### Caching
 
@@ -69,7 +69,7 @@ Steps 1–4 are cached in Redis ([Upstash](https://upstash.com/)), outside the a
 - **A cache hit** rebuilds the FAISS index from cached page text and vectors, with no GNews call, scraping or embedding (about 1.5 s in testing, against about 28 s for a full build).
 - **Page text and vectors are shared across queries**, keyed by URL and by text hash, so a new query that returns articles seen before only scrapes and embeds what's new. Identical wire copies are embedded once.
 - **Queries are normalized** (`"  Tesla   Layoffs "` → `tesla layoffs`) and every TTL varies ±10% so entries don't expire together.
-- **Failed builds are never cached** (Gemini errors, all-paywall results), so a temporary failure isn't remembered as "no articles".
+- **Failed builds are never cached** (Gemini errors, all-paywall results), so a temporary failure isn't remembered as "no articles". If only the answer step fails, the finished build stays cached and a retry repeats just the LLM call.
 - **Identical concurrent requests share one build**, and at most 3 different builds run at once (`MAX_CONCURRENT_BUILDS`); cache hits don't wait.
 - **The server stays responsive during a build:** Gemini calls are async, and parsing, DBSCAN and the FAISS build run in threads. Gemini embedding calls retry rate-limit (429) and server errors with exponential back-off.
 - **Redis is optional.** Without `REDIS_URL`, or while Redis is unreachable, every request runs the full pipeline.
@@ -89,7 +89,7 @@ All three endpoints share the cache, so switching from the report to the timelin
 | Clustering | scikit-learn DBSCAN, NumPy |
 | RAG | LangChain (text splitter, retrieval and stuff-documents chains), FAISS (`faiss-cpu`) |
 | Caching | Upstash Redis (`redis` asyncio client) |
-| LLM | Google Gemini Flash (`gemini-3.8-flash`, falling back to `gemini-3.6-flash`), thinking level `low`, default temperature, 45 s timeout per attempt |
+| LLM | Google Gemini Flash (`gemini-3.8-flash`, falling back to `gemini-3.6-flash`), thinking level `low`, default temperature, 45 s timeout per attempt, 75 s deadline for the whole answer step |
 | Frontend | Jinja2 template, Tailwind CSS, vanilla JavaScript |
 | Deployment | Render (free tier) |
 
@@ -123,7 +123,19 @@ Returns `query`, `timeline_html`, `cited_sources` and `time_taken`.
 
 Returns `query`, `analysis_html`, `cited_sources` and `time_taken`.
 
-**Errors:** `400` for an empty query, `404` when no articles with usable text are found, `500` when fetching fails.
+**Errors:** every failure returns a real error status and `{"detail": "<message for the user>"}`, never `200` with error text. The page shows `detail` as it is.
+
+| Status | When | Example `detail` |
+|---|---|---|
+| `400` | Empty topic, or a search GNews can't parse (e.g. an unbalanced quote) | Please enter a topic first. |
+| `404` | No news in the last 48 hours, or none of the found pages could be read | No news from the last 2 days was found for "Tesla". Try a broader or different topic. |
+| `422` | Malformed request body | The request was invalid. Please enter a topic and try again. |
+| `500` | A missing or invalid GNews/Gemini key, or a bug | The news service isn't set up correctly on the server. Please contact the site owner. |
+| `502` | GNews or Gemini answered with an error, or the AI returned an empty answer | The AI couldn't write the report. Please try again. |
+| `503` | Temporary: GNews daily quota, rate limit or maintenance; Gemini busy or rate-limited | Today's news search limit has been reached. It resets at midnight UTC, so please try again later. |
+| `504` | Gemini took too long (embedding, or the 75 s answer deadline) | The AI took too long to write the report. Please try again. |
+
+All messages live in [`services/errors.py`](services/errors.py). The page has its own messages for what the server can't answer: no connection, a proxy error while the server wakes up, and no answer after 120 s.
 
 ---
 
@@ -189,6 +201,7 @@ ai-news-intelligence/
 │   ├── pipeline_service.py      # Pipeline: cache hit/miss, single-flight, build limit
 │   ├── cache_service.py         # Redis keys, TTLs, batched reads/writes
 │   ├── news_fetcher.py          # Article discovery (GNews) and concurrent scraping
+│   ├── errors.py                # AppError: one status + user-facing message per failure point
 │   ├── clustering_service.py    # DBSCAN theme clustering
 │   └── rag_service.py           # Chunking, cached embeddings, FAISS index, prompts, retrieval chain
 ├── templates/index.html         # Web UI
@@ -202,11 +215,12 @@ ai-news-intelligence/
 
 ## Design decisions
 
-- **Query-time RAG instead of a persistent vector database.** Each query builds its own small index (about 30-40 chunks from up to 10 articles) from fresh articles, so the corpus is always current. An exact flat FAISS index is fast at this size, and an external vector database would add cost without benefit.
+- **Query-time RAG instead of a persistent vector database.** Each query builds its own small index (about 10-25 chunks from the chosen articles: 21 on the query measured for gap_1, 10 on a live "Tesla" query) from fresh articles, so the corpus is always current. An exact flat FAISS index is fast at this size, and an external vector database would add cost without benefit.
 - **DBSCAN instead of K-Means.** The number of storylines per topic is unknown in advance, and DBSCAN leaves one-off stories unassigned instead of forcing them into a cluster. Its `eps` (0.12) comes from measuring 133 real article pairs, not from a default.
 - **Deduplicate before indexing, not after retrieval.** Grouping and choosing happen before chunks are embedded, so skipped copies cost no embedding calls and can't take retrieval slots. In a real query this cut the index from 35 to 21 chunks and Related Links from 1 to 5 distinct stories.
 - **The "stuff" strategy instead of map-reduce.** Finding contradictions requires the model to see all sources at once. Map-reduce processes documents separately and would miss conflicts between them.
-- **Cache the inputs, not the index.** Redis stores page text and embedding vectors, and the FAISS index is rebuilt from them on each request. Storing the FAISS object itself would need `pickle` (unsafe to load, tied to library versions), while rebuilding the index from 30-40 vectors takes milliseconds. Keying text and vectors by URL and content hash lets different queries share the expensive work.
+- **Cache the inputs, not the index.** Redis stores page text and embedding vectors, and the FAISS index is rebuilt from them on each request. Storing the FAISS object itself would need `pickle` (unsafe to load, tied to library versions), while rebuilding the index from 10-40 vectors takes milliseconds. Keying text and vectors by URL and content hash lets different queries share the expensive work.
+- **Errors are raised, not returned.** Each failure point raises one error type carrying its HTTP status and a user-facing message, and one handler turns it into the response. Before, `None` and `[]` were passed up through three layers that each had to guess what they meant, and five different failures reached the user as the same "no articles" 404.
 - **Paragraph-aware chunking.** News articles are plain prose, so splitting at paragraph boundaries keeps each claim together with its context without the extra cost of semantic chunking.
 
 ## Limitations and roadmap
