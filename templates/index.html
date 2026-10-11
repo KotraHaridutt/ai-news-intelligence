@@ -79,7 +79,8 @@
             return el;
         }
 
-        // A full build takes ~30 s; after this long the request is given up
+        // A full build takes ~30 s and the server gives the AI step at most 75 s, so a slow
+        // request still gets the server's own message first. After this long it is given up.
         const REQUEST_TIMEOUT_MS = 120000;
 
         // The message to show for an error response. The server sends a user-friendly

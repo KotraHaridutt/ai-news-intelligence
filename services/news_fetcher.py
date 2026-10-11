@@ -1,5 +1,7 @@
 import asyncio
+import contextlib
 import os
+import time
 from collections import Counter
 from datetime import datetime, timedelta, timezone
 import ssl
@@ -26,6 +28,16 @@ if not GNEWS_API_KEY:
 # Asking for more doesn't return more, so ask for exactly what the plan gives.
 GNEWS_MAX_ARTICLES = 10
 
+# GNews free plan: at most 1 request per second, or it answers 429. Up to
+# MAX_CONCURRENT_BUILDS builds can start together, so GNews requests go one at a time,
+# each starting GNEWS_MIN_INTERVAL after the previous one *finished*. Spacing the start
+# times wasn't enough (measured: sent 1.1 s apart, still 429), because each request opens
+# a new connection and the handshake time varies, so requests can arrive closer together.
+# A second or third user waits a second or two instead of getting an error.
+GNEWS_MIN_INTERVAL = 1.1      # seconds from the end of one GNews request to the start of the next
+_gnews_lock = asyncio.Lock()
+_gnews_last_done = 0.0
+
 # Only articles published in the last 48 hours: the app reports on the latest news.
 # The free plan's 12-hour delay is not added on top.
 NEWS_WINDOW_HOURS = 48
@@ -49,6 +61,20 @@ HTML_CONTENT_TYPES = ("text/html", "application/xhtml+xml")
 
 def has_enough_text(text) -> bool:
     return bool(text) and len(text) >= MIN_TEXT_LEN
+
+@contextlib.asynccontextmanager
+async def _gnews_turn():
+    """One GNews request at a time, starting GNEWS_MIN_INTERVAL after the previous one ended."""
+    global _gnews_last_done
+    async with _gnews_lock:
+        wait = _gnews_last_done + GNEWS_MIN_INTERVAL - time.monotonic()
+        if wait > 0:
+            print(f"[INFO] Waiting {wait:.1f}s for GNews (free plan: 1 request per second).")
+            await asyncio.sleep(wait)
+        try:
+            yield
+        finally:
+            _gnews_last_done = time.monotonic()   # also after a failed request
 
 def _window_start() -> str:
     """Start of the news window in the UTC format GNews expects, e.g. '2026-10-09T10:00:00Z'."""
@@ -77,9 +103,9 @@ async def fetch_news(query: str) -> list[dict]:
         "token": GNEWS_API_KEY,
     }
 
-    print(f"[INFO] Fetching real news from GNews for: {query}")
     try:
-        async with httpx.AsyncClient(verify=SSL_CONTEXT) as client:
+        async with _gnews_turn(), httpx.AsyncClient(verify=SSL_CONTEXT) as client:
+            print(f"[INFO] Fetching real news from GNews for: {query}")
             response = await client.get(api_url, params=params, timeout=10.0)
     except httpx.TransportError as e:   # timeouts, DNS, refused connections
         raise errors.news_unreachable(f"GNews request failed: {type(e).__name__}: {e}") from e

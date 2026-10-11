@@ -48,6 +48,11 @@ FALLBACK_CHAT_MODEL = os.getenv("GEMINI_FALLBACK_MODEL", "gemini-3.6-flash")
 THINKING_LEVEL = "low"
 CHAT_TIMEOUT_SECONDS = 45     # per attempt (normal answers take ~10-30 s)
 CHAT_ATTEMPTS = 2             # per model, including the first try
+# Deadline for the whole answer step (retrieval + every attempt on both models). Without it
+# the worst case is ~2 models x 2 attempts x 45 s = 3 min, longer than the page waits (120 s),
+# so the user would see "took too long" instead of the real reason. A fast failure such as a
+# 429 still falls back within seconds; a model that hangs uses up the deadline.
+CHAT_DEADLINE_SECONDS = 75
 
 def _chat_model(model_name):
     return ChatGoogleGenerativeAI(
@@ -329,8 +334,8 @@ async def run_rag_query_with_store(query, vector_store, prompt_type):
     
     print(f"[INFO] RAG: Invoking chain with query: '{query}' for type: '{prompt_type}'")
     try:
-        response = await retrieval_chain.ainvoke({"input": query})
-    except Exception as e:
+        response = await asyncio.wait_for(retrieval_chain.ainvoke({"input": query}), CHAT_DEADLINE_SECONDS)
+    except Exception as e:   # a missed deadline is a TimeoutError -> "took too long" (504)
         raise errors.report_failed(e, prompt_type) from e
 
     result = _format_response(response)
