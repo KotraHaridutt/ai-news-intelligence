@@ -33,14 +33,16 @@ This project automates that work:
 
 ```mermaid
 flowchart TD
-    A[User query] --> B{Cached in the last 10 min?}
-    B -- yes --> F
-    B -- no --> C[1. Discover articles<br/>GNews API]
-    C --> D[2. Scrape full text concurrently<br/>asyncio.gather + httpx + Trafilatura]
+    A[User query] --> B{Article list for this query<br/>in Redis? 2 h TTL}
+    B -- yes --> R[Rebuild the FAISS index from<br/>cached page text + vectors]
+    R --> F
+    B -- no --> Q[Wait for a build slot<br/>at most 3 builds at once]
+    Q --> C[1. Discover articles<br/>GNews API]
+    C --> D[2. Scrape full text concurrently<br/>only pages not already cached]
     D --> E[3. Cluster by theme<br/>Gemini embeddings + DBSCAN]
-    E --> E2[4. Chunk and index<br/>LangChain splitter + FAISS]
-    E2 --> CACHE[(In-memory cache<br/>articles + index + related links)]
-    CACHE --> F[5. Retrieve top-15 chunks]
+    E --> E2[4. Chunk and index<br/>only uncached chunks are embedded]
+    E2 --> CACHE[(Upstash Redis<br/>article list, page text, vectors)]
+    E2 --> F[5. Retrieve top-15 chunks]
     F --> G[6. Generate with Gemini Flash<br/>report / timeline / contradictions]
     G --> H[JSON response with citations]
 ```
@@ -52,7 +54,25 @@ flowchart TD
 5. **Retrieve:** embed the query and fetch the 15 nearest chunks.
 6. **Generate:** place the retrieved chunks in one prompt (LangChain's "stuff" strategy) with one of three templates. Each template instructs the model to use only the provided context and to say so when the context is insufficient.
 
-Steps 1–4 run **once per query** and are cached for 10 minutes. All three endpoints share the cached index, so switching from the report to the timeline or contradictions view only costs one LLM call.
+### Caching
+
+Steps 1–4 are cached in Redis ([Upstash](https://upstash.com/)), outside the app process, so cached work survives restarts and deploys:
+
+| Key | Holds | TTL |
+|---|---|---|
+| `v1:articles:<query>` | Article list (metadata and theme IDs) and related links, without page text | 2 h |
+| `v1:page:<url>` | Scraped article text | 36 h |
+| `v1:emb:<model>:<task type>:<sha256 of text>` | Embedding vector (`float32` bytes) | 7 days |
+
+- **A cache hit** rebuilds the FAISS index from cached page text and vectors, with no GNews call, scraping or embedding (about 1.5 s in testing, against about 28 s for a full build).
+- **Page text and vectors are shared across queries**, keyed by URL and by text hash, so a new query that returns articles seen before only scrapes and embeds what's new. Identical wire copies are embedded once.
+- **Queries are normalized** (`"  Tesla   Layoffs "` → `tesla layoffs`) and every TTL varies ±10% so entries don't expire together.
+- **Failed builds are never cached** (Gemini errors, all-paywall results), so a temporary failure isn't remembered as "no articles".
+- **Identical concurrent requests share one build**, and at most 3 different builds run at once (`MAX_CONCURRENT_BUILDS`); cache hits don't wait.
+- **The server stays responsive during a build:** Gemini calls are async, and parsing, DBSCAN and the FAISS build run in threads. Gemini embedding calls retry rate-limit (429) and server errors with exponential back-off.
+- **Redis is optional.** Without `REDIS_URL`, or while Redis is unreachable, every request runs the full pipeline.
+
+All three endpoints share the cache, so switching from the report to the timeline or contradictions view only costs one LLM call.
 
 ---
 
@@ -66,6 +86,7 @@ Steps 1–4 run **once per query** and are cached for 10 minutes. All three endp
 | Embeddings | Google `gemini-embedding-001` |
 | Clustering | scikit-learn DBSCAN, NumPy |
 | RAG | LangChain (text splitter, retrieval and stuff-documents chains), FAISS (`faiss-cpu`) |
+| Caching | Upstash Redis (`redis` asyncio client) |
 | LLM | Google Gemini Flash (`gemini-2.5-flash`), temperature 0.2 |
 | Frontend | Jinja2 template, Tailwind CSS, vanilla JavaScript |
 | Deployment | Render (free tier) |
@@ -131,7 +152,9 @@ GNEWS_API_KEY=your_gnews_api_key
 REDIS_URL=rediss://default:your_password@your-db.upstash.io:6379
 ```
 
-`REDIS_URL` is optional. Without it the app runs with caching disabled, so every request runs the full pipeline.
+`REDIS_URL` is optional. Without it the app runs with caching disabled, so every request runs the full pipeline. Upstash shows the URL as `redis://...`; use `rediss://` (TLS), which Upstash requires.
+
+Optional: `MAX_CONCURRENT_BUILDS` (default `3`) limits how many new queries are built at the same time.
 
 ### Run
 
@@ -159,11 +182,13 @@ The free tier has 512 MB of RAM, so embeddings come from the Gemini API instead 
 
 ```
 ai-news-intelligence/
-├── server.py                    # FastAPI app, endpoints, pipeline orchestration, cache
+├── server.py                    # FastAPI app and endpoints
 ├── services/
+│   ├── pipeline_service.py      # Pipeline: cache hit/miss, single-flight, build limit
+│   ├── cache_service.py         # Redis keys, TTLs, batched reads/writes
 │   ├── news_fetcher.py          # Article discovery (GNews) and concurrent scraping
-│   ├── clustering_service.py    # Gemini embeddings + DBSCAN theme clustering
-│   └── rag_service.py           # Chunking, FAISS index, prompts, retrieval chain
+│   ├── clustering_service.py    # DBSCAN theme clustering
+│   └── rag_service.py           # Chunking, cached embeddings, FAISS index, prompts, retrieval chain
 ├── templates/index.html         # Web UI
 ├── static/style.css
 ├── render.yaml                  # Render deployment blueprint
@@ -178,6 +203,7 @@ ai-news-intelligence/
 - **Query-time RAG instead of a persistent vector database.** Each query builds its own small index (about 150 chunks) from fresh articles, so the corpus is always current. An exact flat FAISS index is fast at this size, and an external vector database would add cost without benefit.
 - **DBSCAN instead of K-Means.** The number of storylines per topic is unknown in advance, and DBSCAN can leave off-topic articles unassigned instead of forcing them into a cluster.
 - **The "stuff" strategy instead of map-reduce.** Finding contradictions requires the model to see all sources at once. Map-reduce processes documents separately and would miss conflicts between them.
+- **Cache the inputs, not the index.** Redis stores page text and embedding vectors, and the FAISS index is rebuilt from them on each request. Storing the FAISS object itself would need `pickle` (unsafe to load, tied to library versions), while rebuilding about 150 vectors takes milliseconds. Keying text and vectors by URL and content hash lets different queries share the expensive work.
 - **Paragraph-aware chunking.** News articles are plain prose, so splitting at paragraph boundaries keeps each claim together with its context without the extra cost of semantic chunking.
 
 ## Limitations and roadmap
@@ -185,8 +211,8 @@ ai-news-intelligence/
 - [ ] Add timeline and contradictions views to the UI (currently available through the API and `/docs`)
 - [ ] Include source and date metadata in the LLM prompt so contradictions and timeline events are attributed to specific outlets
 - [ ] Use theme IDs during retrieval (per-theme quotas or MMR) so duplicate coverage doesn't dominate the context
-- [ ] Make embedding, indexing and LLM calls fully non-blocking (`ainvoke`, `asyncio.to_thread`)
-- [ ] Replace the in-process cache with a bounded or shared cache (for example Redis) to support multiple instances
+- [x] Make embedding, indexing and LLM calls fully non-blocking (`ainvoke`, `asyncio.to_thread`)
+- [x] Replace the in-process cache with a shared cache (Redis) that survives restarts
 - [ ] Add inline per-claim citations and an automated faithfulness check
 
 ## License
