@@ -21,12 +21,14 @@
 
         <div class="flex gap-2">
             <input id="query" type="text" class="flex-1 border p-3 rounded-lg" placeholder="Enter your topic, e.g. 'Future of AI in healthcare'">
-            <button onclick="fetchNews()" class="bg-blue-600 text-white px-4 rounded-lg hover:bg-blue-700">Analyze</button>
+            <button id="analyze-btn" onclick="fetchNews()" class="bg-blue-600 text-white px-4 rounded-lg hover:bg-blue-700 disabled:opacity-50 disabled:cursor-not-allowed disabled:hover:bg-blue-600">Analyze</button>
         </div>
 
         <div id="loading" class="hidden text-center mt-6 text-blue-600 font-medium">
             <p>Analyzing... This can take a moment for a new topic.</p>
         </div>
+
+        <div id="error" role="alert" class="hidden mt-6 p-4 border border-red-300 rounded-lg bg-red-50 text-red-700"></div>
 
         <div id="result" class="hidden mt-8 grid grid-cols-4 gap-8">
 
@@ -51,21 +53,36 @@
     </div>
 
     <script>
+        function showError(message) {
+            const errorEl = document.getElementById("error");
+            // textContent, not innerHTML: server text is shown as text, never parsed as HTML
+            errorEl.textContent = message;
+            errorEl.classList.remove("hidden");
+        }
+
         async function fetchNews() {
             const query = document.getElementById("query").value.trim();
+            const button = document.getElementById("analyze-btn");
             const loading = document.getElementById("loading");
+            const errorEl = document.getElementById("error");
             const resultDiv = document.getElementById("result");
-            
+
             // --- NEW: Get all our new element IDs ---
             const summaryEl = document.getElementById("summary");
             const citedSourcesEl = document.getElementById("cited-sources");
             const relatedLinksEl = document.getElementById("related-links");
 
-            if (!query) return alert("Please enter a topic first.");
+            // A request is already running (the button is disabled until it finishes)
+            if (button.disabled) return;
 
+            errorEl.classList.add("hidden");
+            if (!query) return showError("Please enter a topic first.");
+
+            button.disabled = true;
+            button.textContent = "Analyzing...";
             loading.classList.remove("hidden");
             resultDiv.classList.add("hidden");
-            
+
             // Clear old results
             summaryEl.innerHTML = "";
             citedSourcesEl.innerHTML = "";
@@ -79,22 +96,30 @@
                 });
 
                 const responseText = await response.text();
-                let data;
+                let data = null;
 
                 try {
                     data = JSON.parse(responseText);
                 } catch (parseError) {
                     console.error("Failed to parse JSON:", responseText);
-                    alert("The server returned an invalid response (not JSON). Check the console (F12) for the full HTML error log.");
-                    loading.classList.add("hidden");
+                }
+
+                if (!response.ok) {
+                    // FastAPI errors look like {"detail": "No articles with sufficient content found"}
+                    const detail = data && typeof data.detail === "string" ? data.detail : null;
+                    showError(detail || `The server returned an error (${response.status}). Please try again.`);
                     return;
                 }
-                
+
+                if (data === null) {
+                    showError("The server returned an invalid response (not JSON). Check the console (F12) for the full error log.");
+                    return;
+                }
+
                 console.log("Received data:", data); // Good for debugging
-                loading.classList.add("hidden");
 
                 if (data.error) {
-                    alert(data.error);
+                    showError(data.error);
                     return;
                 }
                 
@@ -144,8 +169,12 @@
 
             } catch (networkError) {
                 console.error("Network error:", networkError);
+                showError("A network error occurred: " + networkError.message);
+            } finally {
+                // Runs on every path (success, error, network failure), so the button always comes back
                 loading.classList.add("hidden");
-                alert("A network error occurred: " + networkError.message);
+                button.disabled = false;
+                button.textContent = "Analyze";
             }
         }
     </script>
