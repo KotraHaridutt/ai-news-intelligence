@@ -1,6 +1,7 @@
 import os
 import asyncio
 import random
+from datetime import date, datetime, timezone
 import numpy as np
 from dotenv import load_dotenv
 from google.genai import errors as genai_errors
@@ -13,8 +14,9 @@ from langchain_core.embeddings import Embeddings
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_google_genai import ChatGoogleGenerativeAI, GoogleGenerativeAIEmbeddings
 from langchain_community.vectorstores import FAISS
-from langchain_community.docstore.document import Document
+from langchain_core.documents import Document
 from langchain_core.prompts import PromptTemplate
+from langchain_core.runnables import RunnableLambda
 from langchain_classic.chains.combine_documents import create_stuff_documents_chain
 from langchain_classic.chains import create_retrieval_chain
 
@@ -82,10 +84,13 @@ except Exception as e:
 REPORT_PROMPT_TEMPLATE = """
 You are a world-class intelligence analyst. Your task is to provide a comprehensive intelligence report on the user's query, based *only* on the provided context.
 
+Each article excerpt in the context starts with a line "[Source: <title> | <outlet> | Published: <date>]".
+
 Your report should be detailed and well-structured, synthesizing all relevant information into a multi-paragraph, flowing narrative.
 - Start with a high-level summary of the most critical findings.
 - Then, elaborate on the key themes, developments, or viewpoints found in the context.
 - Conclude with any underlying patterns or significant details.
+- When a claim comes from a single outlet, or outlets disagree, name the outlet in the sentence (e.g. "according to Reuters"). Facts that several outlets report need no attribution.
 - Do NOT use bullet points in the final output.
 
 If the context is insufficient, state that a detailed report cannot be provided.
@@ -103,11 +108,14 @@ COMPREHENSIVE REPORT:
 TIMELINE_PROMPT_TEMPLATE = """
 You are a historian and intelligence analyst. Based *only* on the provided context, extract key events and dates to build a chronological timeline.
 
+Each article excerpt in the context starts with a line "[Source: <title> | <outlet> | Published: <date>]".
+
 - List events in order, from latest to earliest.
-- Format each event as: "YYYY-MM-DD: [Event description]"
-- If a full date is not available, use "YYYY-MM" or "YYYY".
+- Format each event as: "YYYY-MM-DD: [Event description] (<outlet>)"
+- Resolve relative dates ("on Tuesday", "yesterday", "last week") against the Published date of the article they appear in. For example, "on Tuesday" in an article published on Thursday 2026-10-08 means 2026-10-06.
+- If a full date can't be worked out, use "YYYY-MM" or "YYYY". Never guess a day or a year that neither the text nor the Published date gives.
 - Only include events mentioned in the context. Do not make up information.
-- The output should be a clear, ordered list.
+- The output should be a clear, ordered list. Start directly with the first event, without an introduction.
 
 CONTEXT:
 {context}
@@ -121,10 +129,13 @@ CHRONOLOGICAL TIMELINE:
 CONTRADICTIONS_PROMPT_TEMPLATE = """
 You are a senior investigative analyst. Your task is to identify conflicting information, opposing viewpoints, or direct contradictions *within the provided context*.
 
-- Clearly state the opposing points.
-- Example: "Source A claims [X], while Source B suggests [Y]."
+Each article excerpt in the context starts with a line "[Source: <title> | <outlet> | Published: <date>]".
+
+- Clearly state the opposing points, and name the outlet behind each one (from its [Source: ...] line). When both points come from the same outlet, name the article titles instead. When a claim comes from a person quoted in an article, name the person and the outlet.
+- Example: "<Outlet> reports [X], while <Outlet> says [Y]."
 - If no significant contradictions are found, state that the information is largely consistent.
 - Be objective and base your findings *only* on the provided context.
+- Start directly with the findings, without an introduction.
 
 CONTEXT:
 {context}
@@ -134,6 +145,13 @@ QUERY:
 
 ANALYSIS OF CONFLICTING INFORMATION:
 """
+
+# How each retrieved chunk appears in {context}: a header naming its article, outlet and publish
+# date, then its text. Without it the model only sees the chunk text, so it can't say which
+# outlet said what, or resolve "on Tuesday" to a date. The header_* values are prepared by
+# _with_source_headers, so the stored metadata (and the API's sources) don't change.
+DOCUMENT_PROMPT = PromptTemplate.from_template(
+    "[Source: {header_title} | {header_outlet} | Published: {header_published}]\n{page_content}")
 
 PROMPT_TEMPLATES = {
     "report": REPORT_PROMPT_TEMPLATE,
@@ -161,6 +179,7 @@ def chunk_articles(articles):
         metadata = {
             "source": article.get('url', ''),
             "title": article.get('title', 'No Title'),
+            "source_name": article.get('source_name') or '',   # the outlet; "source" is the URL
             "theme_id": article.get('theme_id', -1),
             "published_at": article.get('published_at', '')
         }
@@ -323,6 +342,44 @@ def _retrieval_summary(documents, index_size=None, k=None, limit=60):
     articles = "1 article" if len(by_article) == 1 else f"{len(by_article)} articles"
     return f"{chunks} from {articles}: " + " | ".join(parts)
 
+def _header_text(value):
+    # One line: a title with a line break would split the [Source: ...] header
+    return " ".join(str(value or "").split())
+
+def _published_text(value):
+    """
+    GNews's '2026-10-09T14:30:00Z' -> '2026-10-09 14:30 UTC', so the model reads the date
+    easily. A date without a time stays as it is; anything that can't be parsed is shown as it came.
+    """
+    text = _header_text(value)
+    if not text:
+        return "unknown date"
+    try:
+        if len(text) == 10:
+            return date.fromisoformat(text).isoformat()
+        parsed = datetime.fromisoformat(text)
+    except ValueError:
+        return text
+    if parsed.tzinfo is None:
+        return parsed.strftime("%Y-%m-%d %H:%M")
+    return parsed.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+
+def _with_source_headers(documents):
+    """
+    Copies of the retrieved chunks with the values DOCUMENT_PROMPT shows in each chunk's header.
+    Every chunk gets all three, so a blank or missing value (e.g. no outlet name) reads
+    'unknown outlet' instead of breaking the prompt. The original metadata is kept unchanged.
+    """
+    return [
+        Document(page_content=doc.page_content, metadata={
+            **doc.metadata,
+            "header_title": _header_text(doc.metadata.get("title")) or "untitled",
+            "header_outlet": _header_text(doc.metadata.get("source_name")) or "unknown outlet",
+            "header_published": _published_text(doc.metadata.get("published_at")),
+        })
+        for doc in documents
+    ]
+
 def _format_response(response):
     answer = response.get('answer') or ''
     source_documents = response.get('context', [])
@@ -365,8 +422,10 @@ async def run_rag_query_with_store(query, vector_store, prompt_type):
     retriever = vector_store.as_retriever(search_kwargs={"k": RETRIEVAL_K})
     prompt = PromptTemplate(template=prompt_template, input_variables=["context", "input"])
     
-    qa_chain = create_stuff_documents_chain(llm, prompt)
-    retrieval_chain = create_retrieval_chain(retriever, qa_chain)
+    qa_chain = create_stuff_documents_chain(llm, prompt, document_prompt=DOCUMENT_PROMPT)
+    # The retrieved chunks get their header values on the way to the prompt
+    retrieve = RunnableLambda(lambda x: x["input"]) | retriever | RunnableLambda(_with_source_headers)
+    retrieval_chain = create_retrieval_chain(retrieve, qa_chain)
     
     print(f"[INFO] RAG: Invoking chain with query: '{query}' for type: '{prompt_type}'")
     try:
