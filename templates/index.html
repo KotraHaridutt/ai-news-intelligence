@@ -25,7 +25,7 @@
         </div>
 
         <div id="loading" class="hidden text-center mt-6 text-blue-600 font-medium">
-            <p>Analyzing... This can take a moment for a new topic.</p>
+            <p id="loading-text">Analyzing... This can take a moment for a new topic.</p>
         </div>
 
         <div id="error" role="alert" class="hidden mt-6 p-4 border border-red-300 rounded-lg bg-red-50 text-red-700"></div>
@@ -33,7 +33,13 @@
         <div id="result" class="hidden mt-8 grid grid-cols-4 gap-8">
 
             <div class="col-span-4 md:col-span-3">
-                <h2 class="text-xl font-semibold mb-3">Intelligence Report</h2>
+                <!-- Three views of the same topic. Timeline and Contradictions are loaded on first click -->
+                <div role="tablist" aria-label="Views" class="flex gap-1 mb-4 border-b">
+                    <button id="tab-report" role="tab" aria-selected="true" onclick="showView('report')" class="px-4 py-2 -mb-px">Report</button>
+                    <button id="tab-timeline" role="tab" aria-selected="false" onclick="showView('timeline')" class="px-4 py-2 -mb-px">Timeline</button>
+                    <button id="tab-contradictions" role="tab" aria-selected="false" onclick="showView('contradictions')" class="px-4 py-2 -mb-px">Contradictions</button>
+                </div>
+                <h2 id="view-title" class="text-xl font-semibold mb-3">Intelligence Report</h2>
                 <div id="summary" class="mb-6 p-4 border rounded-lg bg-white shadow-sm">
                     </div>
                 
@@ -101,132 +107,223 @@
             errorEl.classList.remove("hidden");
         }
 
-        async function fetchNews() {
-            const query = document.getElementById("query").value.trim();
-            const button = document.getElementById("analyze-btn");
-            const loading = document.getElementById("loading");
-            const errorEl = document.getElementById("error");
-            const resultDiv = document.getElementById("result");
+        function hideError() {
+            document.getElementById("error").classList.add("hidden");
+        }
 
-            // --- NEW: Get all our new element IDs ---
-            const summaryEl = document.getElementById("summary");
-            const citedSourcesEl = document.getElementById("cited-sources");
-            const relatedLinksEl = document.getElementById("related-links");
+        // The three views of a topic: where each one's answer comes from and how it is shown
+        const VIEWS = {
+            report: {
+                endpoint: "/query", field: "summary_html", title: "Intelligence Report",
+                loading: "Analyzing... This can take a moment for a new topic.",
+                empty: "The AI couldn't write the report. Please try again.",
+            },
+            timeline: {
+                endpoint: "/api/timeline", field: "timeline_html", title: "Timeline",
+                loading: "Writing the timeline...",
+                empty: "The AI couldn't write the timeline. Please try again.",
+            },
+            contradictions: {
+                endpoint: "/api/contradictions", field: "analysis_html", title: "Conflicting Reports",
+                loading: "Looking for conflicting reports...",
+                empty: "The AI couldn't write the analysis of conflicting reports. Please try again.",
+            },
+        };
 
-            // A request is already running (the button is disabled until it finishes)
-            if (button.disabled) return;
+        let busy = false;          // a request is running: Analyze and the tabs wait for it
+        let shownQuery = null;     // the topic of the report on screen; the tabs ask about this one
+        let answers = {};          // view -> {html, sources}, kept until the next Analyze
+        let activeView = "report";
 
-            errorEl.classList.add("hidden");
-            if (!query) return showError("Please enter a topic first.");
+        // An error whose message is meant for the user. Any other error is a bug in this page.
+        class ShownError extends Error {}
 
-            button.disabled = true;
-            button.textContent = "Analyzing...";
-            loading.classList.remove("hidden");
-            resultDiv.classList.add("hidden");
+        function messageFor(error) {
+            if (error instanceof ShownError) return error.message;
+            console.error(error);
+            return "Something went wrong on our side. Please try again.";
+        }
 
-            // Clear old results
-            summaryEl.innerHTML = "";
-            citedSourcesEl.innerHTML = "";
-            relatedLinksEl.innerHTML = "";
-
+        // One request to our API, shared by all three views: the 120 s timeout, network errors,
+        // the server's own error messages and invalid JSON are handled here once.
+        // Returns the parsed response, or throws a ShownError with the message to show.
+        async function postQuery(endpoint, query) {
             // Gives up on a request that hangs (e.g. a dropped connection) instead of waiting forever
             const controller = new AbortController();
             const timer = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
-
+            let response, responseText;
             try {
-                const response = await fetch("/query", { // URL is still /query
+                response = await fetch(endpoint, {
                     method: "POST",
                     headers: { "Content-Type": "application/json" },
                     body: JSON.stringify({ query }),
                     signal: controller.signal
                 });
-
-                const responseText = await response.text();
-                let data = null;
-
-                try {
-                    data = JSON.parse(responseText);
-                } catch (parseError) {
-                    console.error("Failed to parse JSON:", responseText);
-                }
-
-                if (!response.ok) {
-                    // Our errors look like {"detail": "No news from the last 2 days was found for ..."}
-                    showError(friendlyError(response.status, data && data.detail));
-                    return;
-                }
-
-                if (data === null) {
-                    // The raw response is in the console (logged above) for debugging
-                    showError("The server sent an unexpected response. Please try again.");
-                    return;
-                }
-
-                console.log("Received data:", data); // Good for debugging
-
-                if (data.error) {
-                    showError(data.error);
-                    return;
-                }
-                
-                // --- START: NEW RENDER LOGIC ---
-
-                // 1. Render Summary (HTML from the server; markdown2 safe_mode has already escaped any raw HTML)
-                if (!data.summary_html) {
-                    // The server reports an empty answer as an error, so this shouldn't happen
-                    showError("The AI couldn't write the report. Please try again.");
-                    return;
-                }
-                summaryEl.innerHTML = `
-                    <div class="prose max-w-none">
-                        ${data.summary_html}
-                    </div>
-                `;
-
-                // 2. Render Cited Sources
-                if (data.cited_sources && data.cited_sources.length > 0) {
-                    data.cited_sources.forEach(item => {
-                        const li = document.createElement("li");
-                        li.appendChild(makeLink(item.url, item.title, "text-blue-600 underline"));
-                        citedSourcesEl.appendChild(li);
-                    });
-                } else {
-                    citedSourcesEl.innerHTML = "<li>No specific sources were cited.</li>";
-                }
-
-                // 3. Render Related Links (Our new section)
-                if (data.related_links && data.related_links.length > 0) {
-                    data.related_links.forEach(item => {
-                        const card = document.createElement("div");
-                        card.className = "p-3 border rounded-lg bg-white text-sm shadow-sm";
-                        card.appendChild(makeLink(item.url, item.title, "font-medium text-blue-700 hover:underline"));
-                        const source = document.createElement("p");
-                        source.className = "text-gray-500 text-xs mt-1";
-                        source.textContent = item.source || "";
-                        card.appendChild(source);
-                        relatedLinksEl.appendChild(card);
-                    });
-                } else {
-                    relatedLinksEl.innerHTML = "<p>No related links found.</p>";
-                }
-
-                // --- END: NEW RENDER LOGIC ---
-
-                resultDiv.classList.remove("hidden"); // Show the results
-
+                responseText = await response.text();
             } catch (networkError) {
                 console.error("Network error:", networkError);
-                if (networkError.name === "AbortError") {
-                    showError("The request took too long. Please try again.");
-                } else {
-                    showError("Couldn't reach the server. Check your internet connection and try again.");
-                }
+                throw new ShownError(networkError.name === "AbortError"
+                    ? "The request took too long. Please try again."
+                    : "Couldn't reach the server. Check your internet connection and try again.");
             } finally {
                 clearTimeout(timer);
-                // Runs on every path (success, error, network failure), so the button always comes back
+            }
+
+            let data = null;
+            try {
+                data = JSON.parse(responseText);
+            } catch (parseError) {
+                console.error("Failed to parse JSON:", responseText);
+            }
+            if (!response.ok) {
+                // Our errors look like {"detail": "No news from the last 2 days was found for ..."}
+                throw new ShownError(friendlyError(response.status, data && data.detail));
+            }
+            if (data === null) {
+                // The raw response is in the console (logged above) for debugging
+                throw new ShownError("The server sent an unexpected response. Please try again.");
+            }
+            if (data.error) throw new ShownError(data.error);
+            return data;
+        }
+
+        function setBusy(on, loadingText) {
+            busy = on;
+            document.getElementById("analyze-btn").disabled = on;
+            for (const view of Object.keys(VIEWS)) document.getElementById(`tab-${view}`).disabled = on;
+            const loading = document.getElementById("loading");
+            if (on) {
+                document.getElementById("loading-text").textContent = loadingText;
+                loading.classList.remove("hidden");
+            } else {
                 loading.classList.add("hidden");
-                button.disabled = false;
+            }
+        }
+
+        function markTabs(active) {
+            for (const view of Object.keys(VIEWS)) {
+                const tab = document.getElementById(`tab-${view}`);
+                const selected = view === active;
+                tab.setAttribute("aria-selected", selected ? "true" : "false");
+                tab.className = "px-4 py-2 -mb-px border-b-2 disabled:opacity-50 disabled:cursor-not-allowed " + (selected
+                    ? "border-blue-600 text-blue-700 font-semibold"
+                    : "border-transparent text-gray-600 hover:text-blue-700");
+            }
+        }
+
+        // Shows a loaded answer: its text (HTML from the server; markdown2 safe_mode has
+        // already escaped any raw HTML) and its own cited sources
+        function renderView(view) {
+            const { html, sources } = answers[view];
+            activeView = view;
+            markTabs(view);
+            document.getElementById("view-title").textContent = VIEWS[view].title;
+            document.getElementById("summary").innerHTML = `
+                <div class="prose max-w-none">
+                    ${html}
+                </div>
+            `;
+            const citedSourcesEl = document.getElementById("cited-sources");
+            citedSourcesEl.innerHTML = "";
+            if (sources && sources.length > 0) {
+                sources.forEach(item => {
+                    const li = document.createElement("li");
+                    li.appendChild(makeLink(item.url, item.title, "text-blue-600 underline"));
+                    citedSourcesEl.appendChild(li);
+                });
+            } else {
+                citedSourcesEl.innerHTML = "<li>No specific sources were cited.</li>";
+            }
+        }
+
+        // Related Links come with the report and stay the same in every view
+        function renderRelatedLinks(links) {
+            const relatedLinksEl = document.getElementById("related-links");
+            relatedLinksEl.innerHTML = "";
+            if (links && links.length > 0) {
+                links.forEach(item => {
+                    const card = document.createElement("div");
+                    card.className = "p-3 border rounded-lg bg-white text-sm shadow-sm";
+                    card.appendChild(makeLink(item.url, item.title, "font-medium text-blue-700 hover:underline"));
+                    const source = document.createElement("p");
+                    source.className = "text-gray-500 text-xs mt-1";
+                    source.textContent = item.source || "";
+                    card.appendChild(source);
+                    relatedLinksEl.appendChild(card);
+                });
+            } else {
+                relatedLinksEl.innerHTML = "<p>No related links found.</p>";
+            }
+        }
+
+        // Analyze: a new topic. Shows its report and resets the Timeline and Contradictions tabs.
+        async function fetchNews() {
+            const query = document.getElementById("query").value.trim();
+            const button = document.getElementById("analyze-btn");
+            const resultDiv = document.getElementById("result");
+
+            // A request is already running (Analyze and the tabs are disabled until it finishes)
+            if (busy) return;
+
+            hideError();
+            if (!query) return showError("Please enter a topic first.");
+
+            setBusy(true, VIEWS.report.loading);
+            button.textContent = "Analyzing...";
+            resultDiv.classList.add("hidden");
+
+            // Clear the old topic: its answers, report and links
+            answers = {};
+            shownQuery = null;
+            document.getElementById("summary").innerHTML = "";
+            document.getElementById("cited-sources").innerHTML = "";
+            document.getElementById("related-links").innerHTML = "";
+
+            try {
+                const data = await postQuery(VIEWS.report.endpoint, query);
+                console.log("Received data:", data); // Good for debugging
+                // The server reports an empty answer as an error, so this shouldn't happen
+                if (!data.summary_html) throw new ShownError(VIEWS.report.empty);
+
+                answers.report = { html: data.summary_html, sources: data.cited_sources };
+                renderView("report");
+                renderRelatedLinks(data.related_links);
+                // Only a fully drawn report makes this the topic the tabs ask about
+                shownQuery = query;
+                resultDiv.classList.remove("hidden");
+            } catch (error) {
+                answers = {};
+                showError(messageFor(error));
+            } finally {
+                // Runs on every path (success, error, network failure), so the button always comes back
+                setBusy(false);
                 button.textContent = "Analyze";
+            }
+        }
+
+        // A tab: shows that view of the topic on screen. The first click asks the server;
+        // after that the kept answer is shown without a new request.
+        async function showView(view) {
+            if (busy || shownQuery === null || !VIEWS[view]) return;
+            hideError();
+            if (answers[view]) return renderView(view);
+
+            const previous = activeView;
+            setBusy(true, VIEWS[view].loading);
+            try {
+                const data = await postQuery(VIEWS[view].endpoint, shownQuery);
+                const html = data[VIEWS[view].field];
+                if (!html) throw new ShownError(VIEWS[view].empty);
+                answers[view] = { html, sources: data.cited_sources };
+                renderView(view);
+            } catch (error) {
+                // The view that was on screen stays (or is drawn again, if this one failed halfway
+                // through drawing). Nothing is kept, so clicking the tab again retries.
+                delete answers[view];
+                if (activeView !== previous) renderView(previous);
+                showError(messageFor(error));
+            } finally {
+                setBusy(false);
             }
         }
     </script>
