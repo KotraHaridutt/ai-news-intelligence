@@ -13,6 +13,8 @@ beautifulsoup4
 scikit-learn
 langchain-google-genai
 langchain
+langchain-classic
 langchain_community
 langchain_text_splitters
 faiss-cpu
+redis
