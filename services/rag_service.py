@@ -54,6 +54,10 @@ CHAT_ATTEMPTS = 2             # per model, including the first try
 # 429 still falls back within seconds; a model that hangs uses up the deadline.
 CHAT_DEADLINE_SECONDS = 75
 
+# Number of chunks retrieved for the answer. The log line after each answer shows it
+# against the index size ("10 of 10 chunks (k=15, whole index)").
+RETRIEVAL_K = 15
+
 def _chat_model(model_name):
     return ChatGoogleGenerativeAI(
         model=model_name,
@@ -290,10 +294,13 @@ async def build_vector_store(articles):
     print(f"[INFO] RAG: Built vector store from {len(all_chunks)} chunks.")
     return vector_store
 
-def _retrieval_summary(documents, limit=60):
+def _retrieval_summary(documents, index_size=None, k=None, limit=60):
     """
     One line naming the retrieved chunks, grouped by article in retrieval order:
     '15 chunks from 6 articles: "Tesla renames FSD..." [0, 2, 1] | "Tesla China sales..." [0] | ...'
+    With index_size and k it also shows how much of the index was retrieved:
+    '10 of 10 chunks (k=15, whole index) from 4 articles: ...'. When every chunk is
+    retrieved, retrieval only decided their order, not which ones the LLM sees.
     """
     # Keyed by URL: two outlets can carry the same headline
     by_article = {}
@@ -306,6 +313,13 @@ def _retrieval_summary(documents, limit=60):
         short = title if len(title) <= limit else title[:limit - 3] + "..."
         parts.append(f'"{short}" {indexes}')
     chunks = "1 chunk" if len(documents) == 1 else f"{len(documents)} chunks"
+    if index_size is not None:
+        chunks = f"{len(documents)} of {index_size} " + ("chunk" if index_size == 1 else "chunks")
+        notes = [f"k={k}"] if k is not None else []
+        if len(documents) >= index_size:
+            notes.append("whole index")
+        if notes:
+            chunks += f" ({', '.join(notes)})"
     articles = "1 article" if len(by_article) == 1 else f"{len(by_article)} articles"
     return f"{chunks} from {articles}: " + " | ".join(parts)
 
@@ -348,7 +362,7 @@ async def run_rag_query_with_store(query, vector_store, prompt_type):
         raise ValueError(f"Unknown prompt type: {prompt_type!r}")
 
     # Increased 'k' to 15 to give the LLM more context without dumping everything
-    retriever = vector_store.as_retriever(search_kwargs={"k": 15})
+    retriever = vector_store.as_retriever(search_kwargs={"k": RETRIEVAL_K})
     prompt = PromptTemplate(template=prompt_template, input_variables=["context", "input"])
     
     qa_chain = create_stuff_documents_chain(llm, prompt)
@@ -360,7 +374,7 @@ async def run_rag_query_with_store(query, vector_store, prompt_type):
     except Exception as e:   # a missed deadline is a TimeoutError -> "took too long" (504)
         raise errors.report_failed(e, prompt_type) from e
 
-    print(f"[INFO] RAG: Retrieved {_retrieval_summary(response.get('context', []))}")
+    print(f"[INFO] RAG: Retrieved {_retrieval_summary(response.get('context', []), vector_store.index.ntotal, RETRIEVAL_K)}")
     result = _format_response(response)
     if not result["answer"]:
         raise errors.empty_report(prompt_type)
