@@ -171,7 +171,7 @@ async def _build(key: str, search_query: str):
             similarities = cosine_similarities(article_vectors, query_vector)
             ranking_ok = True
         except Exception as e:
-            print(f"[ERROR] Failed to embed the query for ranking: {e}. Ranking by GNews order.")
+            print(f"[ERROR] Failed to embed the query for ranking: {e}. Ranking by GNews relevance order.")
         promote_unique(articles, similarities)
         choose_articles(articles, article_vectors, similarities)
         related_links = build_related_links(articles, similarities)

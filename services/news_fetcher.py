@@ -1,6 +1,7 @@
 import asyncio
 import os
 from collections import Counter
+from datetime import datetime, timedelta, timezone
 import ssl
 import certifi
 import httpx
@@ -23,6 +24,10 @@ if not GNEWS_API_KEY:
 # Asking for more doesn't return more, so ask for exactly what the plan gives.
 GNEWS_MAX_ARTICLES = 10
 
+# Only articles published in the last 48 hours: the app reports on the latest news.
+# The free plan's 12-hour delay is not added on top.
+NEWS_WINDOW_HOURS = 48
+
 # Shared minimum article length: scraping, clustering and indexing all use this
 # so an article is either usable everywhere or nowhere.
 MIN_TEXT_LEN = 100
@@ -43,9 +48,15 @@ HTML_CONTENT_TYPES = ("text/html", "application/xhtml+xml")
 def has_enough_text(text) -> bool:
     return bool(text) and len(text) >= MIN_TEXT_LEN
 
+def _window_start() -> str:
+    """Start of the news window in the UTC format GNews expects, e.g. '2026-10-09T10:00:00Z'."""
+    start = datetime.now(timezone.utc) - timedelta(hours=NEWS_WINDOW_HOURS)
+    return start.strftime("%Y-%m-%dT%H:%M:%SZ")
+
 async def fetch_news(query: str) -> list[dict]:
     """
-    Fetches the article list for a query from GNews.
+    Fetches the article list for a query from GNews: the best matches
+    published in the last NEWS_WINDOW_HOURS, best match first.
     """
     if not GNEWS_API_KEY:
         return []
@@ -55,6 +66,10 @@ async def fetch_news(query: str) -> list[dict]:
         "q": query,
         "lang": "en",
         "max": GNEWS_MAX_ARTICLES,
+        # GNews's default is "publishedAt" (newest first). We can only re-rank the
+        # 10 articles it returns, so ask for the 10 that match the query best.
+        "sortby": "relevance",
+        "from": _window_start(),
         "token": GNEWS_API_KEY,
     }
 

@@ -23,7 +23,7 @@ def _outlet(article):
 def _rank_order(count, similarities):
     """
     Article indices from most to least relevant to the query.
-    Without similarities, GNews's own order (its relevance ranking) is used.
+    Without similarities, GNews's order is used: best match first (fetch_news asks for sortby=relevance).
     """
     if similarities is None:
         return list(range(count))
