@@ -27,6 +27,19 @@ GNEWS_MAX_ARTICLES = 10
 # so an article is either usable everywhere or nowhere.
 MIN_TEXT_LEN = 100
 
+# Headers for scraping article pages. httpx's default User-Agent ("python-httpx/x.y")
+# tells news sites the request comes from a script, and many answer 403 "Access Denied".
+# A browser User-Agent gets past those simple rules (not JavaScript challenges or paywalls).
+SCRAPE_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                  "(KHTML, like Gecko) Chrome/141.0.0.0 Safari/537.36",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.9",
+}
+
+# Only these pages are parsed; PDFs, images and feeds are skipped
+HTML_CONTENT_TYPES = ("text/html", "application/xhtml+xml")
+
 def has_enough_text(text) -> bool:
     return bool(text) and len(text) >= MIN_TEXT_LEN
 
@@ -93,6 +106,7 @@ def _failure_reason(e: Exception) -> str:
     """
     Groups a scrape failure so the logs show which fix would pay off:
     HTTP errors point to blocking, too little text to paywalls or empty pages.
+    ScrapeFailed reasons: "HTTP <code>", "not HTML (<type>)", "too little text".
     """
     if isinstance(e, ScrapeFailed):
         return str(e)
@@ -112,12 +126,20 @@ async def fetch_one_article(client: httpx.AsyncClient, url: str) -> dict:
         response = await client.get(url, timeout=15.0, follow_redirects=True)
         http_status = response.status_code
 
+        # Check before parsing: an error page ("Access Denied", "404 Not Found") can have
+        # enough text to pass as an article, and would then be cached, embedded and indexed.
+        # The status is the final one, after redirects.
+        if http_status != 200:
+            raise ScrapeFailed(f"HTTP {http_status}")
+        content_type = response.headers.get("content-type", "").split(";")[0].strip().lower()
+        if content_type and content_type not in HTML_CONTENT_TYPES:
+            raise ScrapeFailed(f"not HTML ({content_type})")
+
         # Parsing runs in a thread so the event loop keeps serving other requests
         full_text = await asyncio.to_thread(extract_text, response.text)
 
         if not has_enough_text(full_text):
-            # Name the status when it wasn't 200: an error page that is too short also lands here
-            raise ScrapeFailed("too little text" if http_status == 200 else f"too little text (HTTP {http_status})")
+            raise ScrapeFailed("too little text")
 
         return {
             "url": url,
@@ -147,13 +169,6 @@ def _scrape_summary(results: list[dict]) -> str:
     reasons = Counter(res['reason'] for res in results if res['status'] == 'failed')
     if reasons:
         summary += " Failed: " + ", ".join(f"{reason} x{n}" for reason, n in reasons.most_common()) + "."
-
-    # A page that succeeded with a non-200 status is an error page used as an article
-    accepted_errors = Counter(res['http_status'] for res in results
-                              if res['status'] == 'success' and res['http_status'] != 200)
-    if accepted_errors:
-        summary += " Used as articles despite an error status: " + ", ".join(
-            f"HTTP {code} x{n}" for code, n in accepted_errors.most_common()) + "."
     return summary
 
 async def scrape_results(urls: list[str]) -> list[dict]:
@@ -163,7 +178,8 @@ async def scrape_results(urls: list[str]) -> list[dict]:
     if not urls:
         return []
 
-    async with httpx.AsyncClient(verify=SSL_CONTEXT, limits=httpx.Limits(max_connections=20)) as client:
+    async with httpx.AsyncClient(verify=SSL_CONTEXT, headers=SCRAPE_HEADERS,
+                                 limits=httpx.Limits(max_connections=20)) as client:
         print(f"[INFO] Starting parallel scrape for {len(urls)} articles...")
         results = await asyncio.gather(*(fetch_one_article(client, url) for url in urls))
 
