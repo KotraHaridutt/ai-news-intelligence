@@ -6,5 +6,6 @@ __pycache__/
 docs/
 gaps/
 implemented/
+ideas/
 # Local test environment
 .local/

@@ -1,3 +1,11 @@
+import sys
+# Log lines include article titles from news sites. Where the output encoding can't write a
+# character (e.g. "₹" when output is redirected on Windows, cp1252), print() would raise and
+# fail the build that logged it. Unwritable characters are escaped instead ("\u20b9").
+for _stream in (sys.stdout, sys.stderr):
+    if hasattr(_stream, "reconfigure"):
+        _stream.reconfigure(errors="backslashreplace")
+
 from pathlib import Path
 from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
@@ -9,9 +17,9 @@ import time
 import markdown2
 
 # --- Our Services ---
-from services import errors
+from services import cache_service, errors
 from services.errors import AppError
-from services.pipeline_service import get_pipeline_data
+from services.pipeline_service import get_pipeline_data, build_time
 from services.rag_service import run_rag_query_with_store
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -64,6 +72,24 @@ def render_markdown(text) -> str:
     """
     return markdown2.markdown(text or "", safe_mode="escape")
 
+async def remember_answer(query: str, view: str, text: str, built_at) -> str | None:
+    """
+    Saves an answer the user is shown, so that following the topic later can store what it
+    said as "already told" (feature 1). The page gets the id and sends it back on Follow; ids,
+    not the topic, so two people reading the same topic never get each other's answer.
+    Returns None if it couldn't be saved (no Redis, or a failed write): the answer is still
+    shown, it just can't be followed.
+    """
+    answer_id = cache_service.new_id()
+    saved = await cache_service.set_answer(answer_id, {
+        "query": cache_service.normalize_query(query),
+        "view": view,
+        "text": text,
+        "built_at": built_at,
+        "created_at": build_time(),
+    })
+    return answer_id if saved else None
+
 
 @app.get("/", response_class=HTMLResponse)
 async def home(request: Request):
@@ -84,6 +110,7 @@ async def query_endpoint(req: QueryRequest):
         "cited_sources": rag_data["sources"],
         "related_links": data["related_links"],
         "total_articles_found": len(data["articles"]),
+        "answer_id": await remember_answer(query, "report", rag_data["answer"], data.get("built_at")),
         "time_taken": f"{time.time() - start_time:.2f}s"
     }
     
@@ -101,6 +128,7 @@ async def api_timeline(req: QueryRequest):
         "query": query,
         "timeline_html": render_markdown(rag_data["answer"]),
         "cited_sources": rag_data["sources"],
+        "answer_id": await remember_answer(query, "timeline", rag_data["answer"], data.get("built_at")),
         "time_taken": f"{time.time() - start_time:.2f}s"
     }
 
@@ -116,6 +144,7 @@ async def api_contradictions(req: QueryRequest):
         "query": query,
         "analysis_html": render_markdown(rag_data["answer"]),
         "cited_sources": rag_data["sources"],
+        "answer_id": await remember_answer(query, "contradictions", rag_data["answer"], data.get("built_at")),
         "time_taken": f"{time.time() - start_time:.2f}s"
     }
 

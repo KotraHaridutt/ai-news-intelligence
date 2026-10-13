@@ -1,6 +1,7 @@
 import os
 import asyncio
 import time
+from datetime import datetime, timezone
 
 from services import cache_service, errors
 from services.news_fetcher import fetch_news, scrape_pages
@@ -29,9 +30,20 @@ MAX_CONCURRENT_BUILDS = max(1, int(os.getenv("MAX_CONCURRENT_BUILDS", "3")))
 _build_slots = asyncio.Semaphore(MAX_CONCURRENT_BUILDS)
 
 
+def build_time() -> str:
+    """
+    When a build ran, e.g. '2026-10-13T03:16:33.512+00:00'. It names the build: an answer
+    records the built_at of the build it came from, so Follow can tell whether the article
+    list it would save is still the one that answer was written from (feature 1).
+    Milliseconds, so two builds of one topic can't share a value.
+    """
+    return datetime.now(timezone.utc).isoformat(timespec="milliseconds")
+
+
 async def get_pipeline_data(query: str):
     """
-    Returns {"articles", "vector_store", "related_links"} for a query, with a built index.
+    Returns {"articles", "vector_store", "related_links", "built_at"} for a query, with a built index.
+    built_at is None for a cache entry written before feature 1 (it had no built_at).
     Raises AppError (with the status and message the user sees) when no index can be
     built: GNews failed, no news in the window, no readable page, or Gemini failed.
     Every request waiting on the same build gets the same error.
@@ -127,6 +139,7 @@ async def _rebuild_from_cache(cached):
         "articles": articles,
         "vector_store": vector_store,
         "related_links": cached.get("related_links", []),
+        "built_at": cached.get("built_at"),
     }
 
 
@@ -137,6 +150,8 @@ async def _build(key: str, search_query: str):
     Cached only if it fully succeeded. Raises AppError for every failure the user
     should see; raising also skips the cache write.
     """
+    built_at = build_time()
+
     # 1. Fetch the article list (fetch_news raises AppError if GNews fails)
     found = await fetch_news(search_query)
     if not found:
@@ -195,6 +210,7 @@ async def _build(key: str, search_query: str):
         await cache_service.set_articles(key, {
             "articles": [{field: article.get(field) for field in ARTICLE_META_FIELDS} for article in articles],
             "related_links": related_links,
+            "built_at": built_at,
         })
     else:
         print(f"[WARN] Build for '{key}' not cached (clustering ok: {clustering_ok}, ranking ok: {ranking_ok}).")
@@ -203,4 +219,5 @@ async def _build(key: str, search_query: str):
         "articles": articles,
         "vector_store": vector_store,
         "related_links": related_links,
+        "built_at": built_at,
     }

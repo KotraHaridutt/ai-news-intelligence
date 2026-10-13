@@ -1,8 +1,10 @@
 import os
+import re
 import json
 import time
 import random
 import hashlib
+import secrets
 import numpy as np
 from dotenv import load_dotenv
 import redis.asyncio as redis
@@ -34,6 +36,11 @@ ARTICLES_TTL = 2 * 60 * 60       # How fresh the news is
 PAGE_TTL = 36 * 60 * 60          # Scraped page text; some pages (live blogs) change
 EMB_TTL = 7 * 24 * 60 * 60       # Same text + same model always gives the same vector
 TTL_JITTER = 0.10                # +/-10% so keys written together don't expire together
+# An answer can be followed only while the build it came from is cached, so it lives as long
+ANSWER_TTL = ARTICLES_TTL
+# A followed topic expires after this long without a check (feature-1 decision #14).
+# Exact, not jittered: the page tells the user "30 days".
+WATCH_TTL = 30 * 24 * 60 * 60
 
 # Keys per MGET / pipeline. Keeps each request well under Upstash's size limit
 # (~50 vectors x 12 KB = ~600 KB).
@@ -64,8 +71,27 @@ def emb_key(model: str, text: str) -> str:
     text_hash = hashlib.sha256(text.encode("utf-8")).hexdigest()
     return f"{KEY_VERSION}:emb:{model}:{text_hash}"
 
+def answer_key(answer_id: str) -> str:
+    return f"{KEY_VERSION}:answer:{answer_id}"
+
+def watch_key(watch_id: str) -> str:
+    return f"{KEY_VERSION}:watch:{watch_id}"
+
 def ttl_with_jitter(base_ttl: int) -> int:
     return int(base_ttl * random.uniform(1 - TTL_JITTER, 1 + TTL_JITTER))
+
+
+# --- Ids for answers and followed topics ---
+# Random and unguessable: whoever has a watch id can read and check that followed topic.
+# token_urlsafe(16) gives 22 characters of A-Z a-z 0-9 - _.
+_ID_PATTERN = re.compile(r"[A-Za-z0-9_-]{22}")
+
+def new_id() -> str:
+    return secrets.token_urlsafe(16)
+
+def is_valid_id(value) -> bool:
+    """Checked before any Redis call, so a typed or cut-off id never reaches Redis."""
+    return isinstance(value, str) and _ID_PATTERN.fullmatch(value) is not None
 
 
 # --- Low-level batch helpers ---
@@ -91,18 +117,23 @@ async def _mget(keys: list[str]) -> list[bytes | None]:
         _on_redis_error("read", e)
         return [None] * len(keys)
 
-async def _mset_with_ttl(items: list[tuple[str, bytes | str]], base_ttl: int):
+async def _mset_with_ttl(items: list[tuple[str, bytes | str]], base_ttl: int) -> bool:
+    """Returns whether everything was written. Callers that only cache can ignore it."""
     # Always SET ... EX: a plain SET has no TTL and would remove an existing one.
-    if not _redis_available() or not items:
-        return
+    if not items:
+        return True
+    if not _redis_available():
+        return False
     try:
         for i in range(0, len(items), BATCH_SIZE):
             pipe = redis_client.pipeline(transaction=False)
             for key, value in items[i:i + BATCH_SIZE]:
                 pipe.set(key, value, ex=ttl_with_jitter(base_ttl))
             await pipe.execute()
+        return True
     except Exception as e:
         _on_redis_error("write", e)
+        return False
 
 
 # --- Article list (metadata only, no full_text) ---
@@ -119,6 +150,78 @@ async def get_articles(normalized_query: str) -> dict | None:
 
 async def set_articles(normalized_query: str, data: dict):
     await _mset_with_ttl([(articles_key(normalized_query), json.dumps(data))], ARTICLES_TTL)
+
+
+# --- Answers shown to the user (feature 1: what V1 said, for Follow) ---
+# {"query" (normalized), "view", "text" (the answer's markdown), "built_at", "created_at"}.
+# Still a cache: a failed write doesn't fail the answer, the answer just can't be followed.
+
+async def set_answer(answer_id: str, record: dict) -> bool:
+    """Returns whether the record was saved."""
+    return await _mset_with_ttl([(answer_key(answer_id), json.dumps(record))], ANSWER_TTL)
+
+async def get_answers(answer_ids: list[str]) -> dict[str, dict]:
+    """Returns {answer_id: record} for the ids that exist; malformed ids are skipped without a lookup."""
+    ids = [i for i in dict.fromkeys(answer_ids) if is_valid_id(i)]
+    values = await _mget([answer_key(i) for i in ids])
+    records = {}
+    for answer_id, raw in zip(ids, values):
+        if raw is None:
+            continue
+        try:
+            records[answer_id] = json.loads(raw)
+        except ValueError as e:
+            print(f"[WARN] Corrupt answer record {answer_id}: {e}")
+    return records
+
+
+# --- Followed topics (feature 1) ---
+# Not a cache: a followed topic is the only copy of what the user has already been shown.
+# A read or write that silently did nothing would show the same "new" stories again on the
+# next check, so these raise WatchStoreUnavailable instead, and the endpoint answers 503.
+
+class WatchStoreUnavailable(Exception):
+    """Redis isn't configured, is in its back-off after an error, or the call failed."""
+
+def _watch_store():
+    if redis_client is None:
+        raise WatchStoreUnavailable("REDIS_URL is not set")
+    if not _redis_available():
+        raise WatchStoreUnavailable(f"Redis is skipped after an error (back-off {BACKOFF_SECONDS}s)")
+    return redis_client
+
+async def _watch_call(action: str, fn, *args, **kwargs):
+    client = _watch_store()
+    try:
+        return await fn(client, *args, **kwargs)
+    except Exception as e:
+        _on_redis_error(f"watch {action}", e)
+        raise WatchStoreUnavailable(f"watch {action} failed: {type(e).__name__}: {e}") from e
+
+async def get_watch(watch_id: str) -> dict | None:
+    """The followed topic's snapshot, or None if the id is malformed, unknown or expired."""
+    if not is_valid_id(watch_id):
+        return None
+    raw = await _watch_call("read", lambda c: c.get(watch_key(watch_id)))
+    if raw is None:
+        return None
+    try:
+        return json.loads(raw)
+    except ValueError as e:
+        print(f"[WARN] Corrupt watch {watch_id}: {e}")
+        return None
+
+async def set_watch(watch_id: str, snapshot: dict):
+    """Saves the snapshot and restarts its 30-day expiry. Raises WatchStoreUnavailable on failure."""
+    if not is_valid_id(watch_id):
+        raise ValueError(f"invalid watch id: {watch_id!r}")
+    await _watch_call("write", lambda c: c.set(watch_key(watch_id), json.dumps(snapshot), ex=WATCH_TTL))
+
+async def delete_watch(watch_id: str):
+    """Deleting a malformed, unknown or already expired id is not an error."""
+    if not is_valid_id(watch_id):
+        return
+    await _watch_call("delete", lambda c: c.delete(watch_key(watch_id)))
 
 
 # --- Page texts ---
