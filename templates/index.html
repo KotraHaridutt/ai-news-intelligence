@@ -24,11 +24,18 @@
             <button id="analyze-btn" onclick="fetchNews()" class="bg-blue-600 text-white px-4 rounded-lg hover:bg-blue-700 disabled:opacity-50 disabled:cursor-not-allowed disabled:hover:bg-blue-600">Analyze</button>
         </div>
 
+        <!-- Topics followed in this browser (feature 1). Hidden while the list is empty -->
+        <section id="following" class="hidden mt-6 p-4 border rounded-lg bg-white shadow-sm" aria-label="Followed topics">
+            <h2 class="font-semibold mb-2">Following</h2>
+            <ul id="following-list" class="divide-y text-sm"></ul>
+        </section>
+
         <div id="loading" class="hidden text-center mt-6 text-blue-600 font-medium">
             <p id="loading-text">Analyzing... This can take a moment for a new topic.</p>
         </div>
 
         <div id="error" role="alert" class="hidden mt-6 p-4 border border-red-300 rounded-lg bg-red-50 text-red-700"></div>
+        <div id="notice" role="status" class="hidden mt-6 p-4 border border-blue-200 rounded-lg bg-blue-50 text-blue-800 break-words"></div>
 
         <div id="result" class="hidden mt-8 grid grid-cols-4 gap-8">
 
@@ -42,10 +49,16 @@
                 <h2 id="view-title" class="text-xl font-semibold mb-3">Intelligence Report</h2>
                 <div id="summary" class="mb-6 p-4 border rounded-lg bg-white shadow-sm">
                     </div>
-                
+
                 <h3 class="font-semibold mb-2">Cited Sources</h3>
                 <ul id="cited-sources" class="list-disc ml-5 space-y-1 text-sm">
                     </ul>
+
+                <!-- Follow this topic: later checks show only what this report didn't contain -->
+                <div class="mt-6 flex flex-wrap items-center gap-3">
+                    <button id="follow-btn" onclick="followTopic()" class="border border-blue-600 text-blue-700 px-4 py-2 rounded-lg hover:bg-blue-50 disabled:opacity-50 disabled:cursor-not-allowed">Follow this topic</button>
+                    <span id="follow-note" class="text-sm text-gray-600"></span>
+                </div>
             </div>
 
             <div class="col-span-4 md:col-span-1">
@@ -55,6 +68,17 @@
             </div>
 
         </div>
+
+        <!-- What's new in a followed topic since the last check (feature 1) -->
+        <section id="update-view" class="hidden mt-8" aria-live="polite">
+            <h2 id="update-title" class="text-xl font-semibold mb-1"></h2>
+            <p id="update-window" class="text-sm text-gray-600 mb-3"></p>
+            <p id="update-gap" class="hidden text-sm mb-3 p-3 rounded-lg bg-amber-50 text-amber-800"></p>
+            <p id="update-message" class="hidden text-sm mb-3 p-3 rounded-lg bg-amber-50 text-amber-800"></p>
+            <div id="update-body" class="space-y-4"></div>
+            <button id="log-btn" onclick="toggleLog()" class="mt-6 text-sm text-blue-700 hover:underline disabled:opacity-50">Story log ▸</button>
+            <div id="story-log" class="hidden mt-3 space-y-3 text-sm"></div>
+        </section>
 
     </div>
 
@@ -85,6 +109,14 @@
             return el;
         }
 
+        // A small element with text (never HTML) and classes
+        function textEl(tag, text, className) {
+            const el = document.createElement(tag);
+            if (className) el.className = className;
+            el.textContent = text;
+            return el;
+        }
+
         // A full build takes ~30 s and the server gives the AI step at most 75 s, so a slow
         // request still gets the server's own message first. After this long it is given up.
         const REQUEST_TIMEOUT_MS = 120000;
@@ -109,6 +141,14 @@
 
         function hideError() {
             document.getElementById("error").classList.add("hidden");
+            document.getElementById("notice").classList.add("hidden");
+        }
+
+        // A message that isn't an error (e.g. "Link copied")
+        function showNotice(message) {
+            const el = document.getElementById("notice");
+            el.textContent = message;
+            el.classList.remove("hidden");
         }
 
         // The three views of a topic: where each one's answer comes from and how it is shown
@@ -130,13 +170,17 @@
             },
         };
 
-        let busy = false;          // a request is running: Analyze and the tabs wait for it
+        let busy = false;          // a request is running: Analyze, the tabs and Follow wait for it
         let shownQuery = null;     // the topic of the report on screen; the tabs ask about this one
-        let answers = {};          // view -> {html, sources}, kept until the next Analyze
+        let answers = {};          // view -> {html, sources, answerId}, kept until the next Analyze
         let activeView = "report";
+        let currentUpdate = null;  // the check result on screen (its watch_id opens the story log)
 
         // An error whose message is meant for the user. Any other error is a bug in this page.
-        class ShownError extends Error {}
+        // status: the HTTP status, when the server sent one (a 404 on a check means the topic expired)
+        class ShownError extends Error {
+            constructor(message, status) { super(message); this.status = status; }
+        }
 
         function messageFor(error) {
             if (error instanceof ShownError) return error.message;
@@ -144,21 +188,21 @@
             return "Something went wrong on our side. Please try again.";
         }
 
-        // One request to our API, shared by all three views: the 120 s timeout, network errors,
-        // the server's own error messages and invalid JSON are handled here once.
+        // One request to our API, shared by every call on the page: the 120 s timeout, network
+        // errors, the server's own error messages and invalid JSON are handled here once.
         // Returns the parsed response, or throws a ShownError with the message to show.
-        async function postQuery(endpoint, query) {
+        async function apiRequest(method, endpoint, body) {
             // Gives up on a request that hangs (e.g. a dropped connection) instead of waiting forever
             const controller = new AbortController();
             const timer = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
+            const options = { method, signal: controller.signal };
+            if (body !== undefined) {
+                options.headers = { "Content-Type": "application/json" };
+                options.body = JSON.stringify(body);
+            }
             let response, responseText;
             try {
-                response = await fetch(endpoint, {
-                    method: "POST",
-                    headers: { "Content-Type": "application/json" },
-                    body: JSON.stringify({ query }),
-                    signal: controller.signal
-                });
+                response = await fetch(endpoint, options);
                 responseText = await response.text();
             } catch (networkError) {
                 console.error("Network error:", networkError);
@@ -177,7 +221,7 @@
             }
             if (!response.ok) {
                 // Our errors look like {"detail": "No news from the last 2 days was found for ..."}
-                throw new ShownError(friendlyError(response.status, data && data.detail));
+                throw new ShownError(friendlyError(response.status, data && data.detail), response.status);
             }
             if (data === null) {
                 // The raw response is in the console (logged above) for debugging
@@ -187,17 +231,50 @@
             return data;
         }
 
+        // The three views send {"query": ...}
+        function postQuery(endpoint, query) {
+            return apiRequest("POST", endpoint, { query });
+        }
+
         function setBusy(on, loadingText) {
             busy = on;
             document.getElementById("analyze-btn").disabled = on;
             for (const view of Object.keys(VIEWS)) document.getElementById(`tab-${view}`).disabled = on;
+            document.getElementById("log-btn").disabled = on;
             const loading = document.getElementById("loading");
             if (on) {
+                document.getElementById("follow-btn").disabled = true;
                 document.getElementById("loading-text").textContent = loadingText;
                 loading.classList.remove("hidden");
             } else {
                 loading.classList.add("hidden");
+                refreshFollowButton();
             }
+        }
+
+        // --- Dates ---
+        const MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+
+        // '2026-10-12T14:59:09Z' -> '12 Oct' (or '12 Oct 14:59' with the time), in UTC; '' if unreadable
+        function formatDate(iso, withTime) {
+            const d = new Date(iso);
+            if (!iso || isNaN(d.getTime())) return "";
+            const day = `${d.getUTCDate()} ${MONTHS[d.getUTCMonth()]}`;
+            if (!withTime) return day;
+            const pad = n => String(n).padStart(2, "0");
+            return `${day} ${pad(d.getUTCHours())}:${pad(d.getUTCMinutes())}`;
+        }
+
+        // '22 h ago', '3 days ago'
+        function timeAgo(iso) {
+            const d = new Date(iso);
+            if (!iso || isNaN(d.getTime())) return "";
+            const minutes = Math.max(0, Math.round((Date.now() - d.getTime()) / 60000));
+            if (minutes < 1) return "just now";
+            if (minutes < 60) return `${minutes} min ago`;
+            const hours = Math.round(minutes / 60);
+            if (hours < 48) return `${hours} h ago`;
+            return `${Math.round(hours / 24)} days ago`;
         }
 
         function markTabs(active) {
@@ -212,7 +289,7 @@
         }
 
         // Shows a loaded answer: its text (HTML from the server; markdown2 safe_mode has
-        // already escaped any raw HTML) and its own cited sources
+        // already escaped any raw HTML) and its own cited sources, each with its date
         function renderView(view) {
             const { html, sources } = answers[view];
             activeView = view;
@@ -229,6 +306,8 @@
                 sources.forEach(item => {
                     const li = document.createElement("li");
                     li.appendChild(makeLink(item.url, item.title, "text-blue-600 underline"));
+                    const date = formatDate(item.published_at);
+                    if (date) li.appendChild(textEl("span", ` · ${date}`, "text-gray-500"));
                     citedSourcesEl.appendChild(li);
                 });
             } else {
@@ -236,7 +315,8 @@
             }
         }
 
-        // Related Links come with the report and stay the same in every view
+        // Related Links come with the report and stay the same in every view. A link that
+        // stands for a group of articles on one story says how many covered it.
         function renderRelatedLinks(links) {
             const relatedLinksEl = document.getElementById("related-links");
             relatedLinksEl.innerHTML = "";
@@ -247,7 +327,9 @@
                     card.appendChild(makeLink(item.url, item.title, "font-medium text-blue-700 hover:underline"));
                     const source = document.createElement("p");
                     source.className = "text-gray-500 text-xs mt-1";
-                    source.textContent = item.source || "";
+                    const inGroup = item.articles_in_group;
+                    const count = inGroup > 1 ? `${inGroup} articles` : "";
+                    source.textContent = [item.source || "", count].filter(Boolean).join(" · ");
                     card.appendChild(source);
                     relatedLinksEl.appendChild(card);
                 });
@@ -271,6 +353,7 @@
             setBusy(true, VIEWS.report.loading);
             button.textContent = "Analyzing...";
             resultDiv.classList.add("hidden");
+            hideUpdate();
 
             // Clear the old topic: its answers, report and links
             answers = {};
@@ -285,7 +368,7 @@
                 // The server reports an empty answer as an error, so this shouldn't happen
                 if (!data.summary_html) throw new ShownError(VIEWS.report.empty);
 
-                answers.report = { html: data.summary_html, sources: data.cited_sources };
+                answers.report = { html: data.summary_html, sources: data.cited_sources, answerId: data.answer_id || null };
                 renderView("report");
                 renderRelatedLinks(data.related_links);
                 // Only a fully drawn report makes this the topic the tabs ask about
@@ -314,7 +397,7 @@
                 const data = await postQuery(VIEWS[view].endpoint, shownQuery);
                 const html = data[VIEWS[view].field];
                 if (!html) throw new ShownError(VIEWS[view].empty);
-                answers[view] = { html, sources: data.cited_sources };
+                answers[view] = { html, sources: data.cited_sources, answerId: data.answer_id || null };
                 renderView(view);
             } catch (error) {
                 // The view that was on screen stays (or is drawn again, if this one failed halfway
@@ -326,6 +409,388 @@
                 setBusy(false);
             }
         }
+
+        // ===================== Following a topic (feature 1) =====================
+        // The followed topics live in this browser (no login): [{watch_id, query, last_checked_at,
+        // expired}]. Storage can be unavailable (private mode, blocked, full); the page then keeps
+        // the list for this visit only.
+        const FOLLOW_STORAGE_KEY = "aiNews.followed.v1";
+        const WATCH_ID = /^[A-Za-z0-9_-]{22}$/;
+
+        function loadFollowed() {
+            try {
+                const list = JSON.parse(localStorage.getItem(FOLLOW_STORAGE_KEY) || "[]");
+                return Array.isArray(list)
+                    ? list.filter(f => f && typeof f.query === "string" && WATCH_ID.test(f.watch_id || ""))
+                    : [];
+            } catch (e) {
+                return [];
+            }
+        }
+
+        function saveFollowed() {
+            try {
+                localStorage.setItem(FOLLOW_STORAGE_KEY, JSON.stringify(followed));
+            } catch (e) {
+                // Storage unavailable: the list still works until the page is closed
+            }
+        }
+
+        let followed = loadFollowed();
+
+        const normalizeTopic = q => String(q || "").split(/\s+/).filter(Boolean).join(" ").toLowerCase();
+        const followedEntry = id => followed.find(f => f.watch_id === id);
+        const followedTopic = query => followed.find(f => normalizeTopic(f.query) === normalizeTopic(query));
+
+        // Under the report: "Follow this topic", or why it can't be followed
+        function refreshFollowButton() {
+            const button = document.getElementById("follow-btn");
+            const note = document.getElementById("follow-note");
+            if (shownQuery === null) return;
+            if (followedTopic(shownQuery)) {
+                button.textContent = "Following ✓";
+                button.disabled = true;
+                note.textContent = "Use Check in the Following list to see only what's new.";
+            } else if (!answers.report || !answers.report.answerId) {
+                button.textContent = "Follow this topic";
+                button.disabled = true;
+                note.textContent = "Following isn't available for this report right now.";
+            } else {
+                button.textContent = "Follow this topic";
+                button.disabled = busy;
+                note.textContent = "Come back later and see only what's new.";
+            }
+        }
+
+        function renderFollowing() {
+            const section = document.getElementById("following");
+            const list = document.getElementById("following-list");
+            list.innerHTML = "";
+            if (followed.length === 0) {
+                section.classList.add("hidden");
+                return;
+            }
+            section.classList.remove("hidden");
+            const button = (label, onClick, className) => {
+                const b = textEl("button", label, className || "text-blue-700 hover:underline");
+                b.onclick = onClick;
+                return b;
+            };
+            for (const entry of followed) {
+                const li = document.createElement("li");
+                li.className = "py-2 flex flex-wrap items-center gap-x-4 gap-y-1";
+                li.appendChild(textEl("span", entry.query, "font-medium"));
+                const status = entry.expired
+                    ? "expired"
+                    : (entry.last_checked_at ? `checked ${timeAgo(entry.last_checked_at)}` : "not checked yet");
+                li.appendChild(textEl("span", status, entry.expired ? "text-red-700" : "text-gray-500"));
+                if (!entry.expired) {
+                    li.appendChild(button("Check for updates", () => checkTopic(entry.watch_id),
+                        "bg-blue-600 text-white px-3 py-1 rounded hover:bg-blue-700"));
+                    li.appendChild(button("Copy link", () => copyFollowLink(entry.watch_id)));
+                }
+                li.appendChild(button(entry.expired ? "Remove" : "Stop following", () => stopFollowing(entry.watch_id),
+                    "text-gray-600 hover:underline"));
+                list.appendChild(li);
+            }
+        }
+
+        // Follow: saves the report on screen (and the other views already opened) as the
+        // starting point. Later checks show only what these answers didn't contain.
+        async function followTopic() {
+            if (busy || shownQuery === null || !answers.report || !answers.report.answerId) return;
+            hideError();
+            const answerIds = {};
+            for (const view of Object.keys(VIEWS)) {
+                if (answers[view] && answers[view].answerId) answerIds[view] = answers[view].answerId;
+            }
+            setBusy(true, "Following this topic...");
+            try {
+                const data = await apiRequest("POST", "/api/follow", { query: shownQuery, answer_ids: answerIds });
+                if (!WATCH_ID.test(data.watch_id || "")) throw new ShownError("The server sent an unexpected response. Please try again.");
+                followed = followed.filter(f => f.watch_id !== data.watch_id);
+                followed.push({ watch_id: data.watch_id, query: data.query || shownQuery, last_checked_at: null, followed_at: data.created_at });
+                saveFollowed();
+                renderFollowing();
+                showNotice(`Following "${data.query || shownQuery}". Use Check for updates to see only what's new since this report.`);
+            } catch (error) {
+                showError(messageFor(error));
+            } finally {
+                setBusy(false);
+            }
+        }
+
+        // Check for updates: only what's new since the last look
+        async function checkTopic(watchId) {
+            const entry = followedEntry(watchId);
+            if (busy || !entry) return;
+            hideError();
+            setBusy(true, `Checking "${entry.query}" for updates...`);
+            try {
+                const data = await apiRequest("POST", `/api/follow/${encodeURIComponent(watchId)}/check`);
+                entry.last_checked_at = data.checked_at || new Date().toISOString();
+                entry.expired = false;
+                saveFollowed();
+                renderUpdate(data);
+            } catch (error) {
+                if (error instanceof ShownError && error.status === 404) {
+                    // Expired on the server (30 days without a check) or a bad link: offer to remove it
+                    entry.expired = true;
+                    saveFollowed();
+                }
+                showError(messageFor(error));
+            } finally {
+                renderFollowing();
+                setBusy(false);
+            }
+        }
+
+        async function stopFollowing(watchId) {
+            if (busy || !followedEntry(watchId)) return;
+            hideError();
+            // Removed from this browser at once; the server copy is deleted too, or expires by itself
+            followed = followed.filter(f => f.watch_id !== watchId);
+            saveFollowed();
+            renderFollowing();
+            refreshFollowButton();
+            if (currentUpdate && currentUpdate.watch_id === watchId) hideUpdate();
+            try {
+                await apiRequest("DELETE", `/api/follow/${encodeURIComponent(watchId)}`);
+            } catch (error) {
+                if (!(error instanceof ShownError && error.status === 404)) {
+                    showNotice("Removed from this browser. The server couldn't be reached, so the topic's saved history will expire on its own after 30 days.");
+                }
+            }
+        }
+
+        // A link that adds the followed topic to another browser's list
+        function followLink(watchId) {
+            return `${location.origin}${location.pathname}?follow=${encodeURIComponent(watchId)}`;
+        }
+
+        async function copyFollowLink(watchId) {
+            const entry = followedEntry(watchId);
+            if (!entry) return;
+            hideError();
+            let link;
+            try {
+                link = followLink(watchId);
+                await navigator.clipboard.writeText(link);
+                showNotice(`Link copied. Open it in another browser to follow "${entry.query}" there.`);
+            } catch (e) {
+                showNotice(link ? `Copy this link to follow "${entry.query}" in another browser: ${link}` : "Couldn't make a link here.");
+            }
+        }
+
+        // Opening the page with ?follow=<id> adds that topic to this browser's list
+        async function openFollowLink() {
+            let watchId = null;
+            try {
+                watchId = new URLSearchParams(location.search).get("follow");
+                if (watchId !== null) history.replaceState(null, "", location.pathname);
+            } catch (e) {
+                return;
+            }
+            if (watchId === null) return;
+            if (!WATCH_ID.test(watchId)) {
+                return showError("This follow link is incomplete. Copy the whole link again, or follow the topic yourself.");
+            }
+            if (followedEntry(watchId)) return;
+            setBusy(true, "Opening the followed topic...");
+            try {
+                const data = await apiRequest("GET", `/api/follow/${encodeURIComponent(watchId)}`);
+                followed.push({ watch_id: watchId, query: data.query, last_checked_at: data.checks ? data.last_checked_at : null });
+                saveFollowed();
+                renderFollowing();
+                showNotice(`"${data.query}" is now in your Following list.`);
+            } catch (error) {
+                showError(messageFor(error));
+            } finally {
+                setBusy(false);
+            }
+        }
+
+        // --- The update view ---
+
+        function hideUpdate() {
+            currentUpdate = null;
+            document.getElementById("update-view").classList.add("hidden");
+            document.getElementById("story-log").classList.add("hidden");
+        }
+
+        function linkList(links) {
+            const ul = document.createElement("ul");
+            ul.className = "list-disc ml-5 space-y-1 text-sm";
+            for (const item of links || []) {
+                const li = document.createElement("li");
+                li.appendChild(makeLink(item.url, item.title, "text-blue-600 underline"));
+                const meta = [item.source_name, formatDate(item.published_at)].filter(Boolean).join(", ");
+                if (meta) li.appendChild(textEl("span", ` (${meta})`, "text-gray-500"));
+                ul.appendChild(li);
+            }
+            return ul;
+        }
+
+        // HTML from the server: summaries and new facts went through markdown2 safe_mode (escaped)
+        function serverHtml(html) {
+            const div = document.createElement("div");
+            div.className = "prose max-w-none my-2";
+            div.innerHTML = html;
+            return div;
+        }
+
+        function storyCard() {
+            const card = document.createElement("div");
+            card.className = "p-4 border rounded-lg bg-white shadow-sm";
+            return card;
+        }
+
+        function renderUpdate(data) {
+            currentUpdate = data;
+            document.getElementById("result").classList.add("hidden");
+            document.getElementById("update-view").classList.remove("hidden");
+            document.getElementById("story-log").classList.add("hidden");
+            document.getElementById("log-btn").textContent = "Story log ▸";
+            document.getElementById("update-title").textContent = `What's new: ${data.query}`;
+
+            const w = data.window || {};
+            let windowText = `Covers articles published ${formatDate(w.from, true)} – ${formatDate(w.to_approx, true)} UTC `
+                + "(up to the 10 best matches; the news feed runs about 12 hours behind).";
+            if (data.reused) windowText += ` Shown from your check ${timeAgo(data.checked_at)}.`;
+            document.getElementById("update-window").textContent = windowText;
+
+            const gapEl = document.getElementById("update-gap");
+            if (w.gap_not_covered) {
+                gapEl.textContent = `Your last check was a while ago: articles published between ${formatDate(w.gap_not_covered.from, true)} `
+                    + `and ${formatDate(w.gap_not_covered.to, true)} UTC couldn't be searched.`;
+                gapEl.classList.remove("hidden");
+            } else {
+                gapEl.classList.add("hidden");
+            }
+            const messageEl = document.getElementById("update-message");
+            if (data.message) {
+                messageEl.textContent = data.message;
+                messageEl.classList.remove("hidden");
+            } else {
+                messageEl.classList.add("hidden");
+            }
+
+            const body = document.getElementById("update-body");
+            body.innerHTML = "";
+            const newStories = data.new_stories || [];
+            const updates = data.updates || [];
+
+            if (data.nothing_new) {
+                const since = data.previous_check ? ` (${timeAgo(data.previous_check)})` : "";
+                body.appendChild(textEl("p", `Nothing new since your last check${since}.`, "p-4 border rounded-lg bg-white"));
+            }
+
+            if (newStories.length) {
+                body.appendChild(textEl("h3", `New stories (${newStories.length})`, "font-semibold"));
+                for (const story of newStories) {
+                    const card = storyCard();
+                    const first = (story.links || [])[0] || {};
+                    card.appendChild(makeLink(first.url, story.title, "font-medium text-blue-700 hover:underline"));
+                    const count = `${story.articles} ${story.articles === 1 ? "article" : "articles"}`;
+                    card.appendChild(textEl("p", [(story.outlets || []).join(", "), count].filter(Boolean).join(" · "), "text-xs text-gray-500 mt-1"));
+                    if (story.related_to) {
+                        card.appendChild(textEl("p", `Related to: ${story.related_to.title}`, "text-xs text-gray-600 mt-1"));
+                    }
+                    card.appendChild(story.summary_html
+                        ? serverHtml(story.summary_html)
+                        : textEl("p", "No summary: the AI couldn't check this story. The articles are linked below.", "text-sm text-gray-600 my-2"));
+                    card.appendChild(linkList(story.links));
+                    body.appendChild(card);
+                }
+            }
+
+            if (updates.length) {
+                body.appendChild(textEl("h3", `Updates on stories you've seen (${updates.length})`, "font-semibold"));
+                for (const update of updates) {
+                    const card = storyCard();
+                    card.appendChild(textEl("p", update.story_title, "font-medium"));
+                    if (update.first_seen) card.appendChild(textEl("p", `First seen ${formatDate(update.first_seen)}`, "text-xs text-gray-500 mt-1"));
+                    card.appendChild(serverHtml(update.new_facts_html));
+                    card.appendChild(linkList(update.links));
+                    body.appendChild(card);
+                }
+            }
+
+            const hidden = data.hidden_repeats || [];
+            if (hidden.length) {
+                const box = document.createElement("div");
+                box.className = "text-sm text-gray-600";
+                const n = hidden.length;
+                box.appendChild(textEl("span", `${n} new ${n === 1 ? "article" : "articles"} only repeated what you'd already seen, so ${n === 1 ? "it's" : "they're"} hidden. `));
+                const list = linkList(hidden);
+                list.classList.add("hidden");
+                const toggle = textEl("button", "Show them", "text-blue-700 hover:underline");
+                toggle.onclick = () => {
+                    const open = list.classList.contains("hidden");
+                    if (open) list.classList.remove("hidden"); else list.classList.add("hidden");
+                    toggle.textContent = open ? "Hide them" : "Show them";
+                };
+                box.appendChild(toggle);
+                box.appendChild(list);
+                body.appendChild(box);
+            }
+
+            const unreadable = data.unreadable || [];
+            if (unreadable.length) {
+                const box = document.createElement("div");
+                box.className = "text-sm text-gray-600";
+                box.appendChild(textEl("p", "Also found, but couldn't be read (blocked or paywalled):"));
+                box.appendChild(linkList(unreadable));
+                body.appendChild(box);
+            }
+
+            if (newStories.some(s => s.summary_html) || updates.length) {
+                body.appendChild(textEl("p", "Summaries are AI-written from the linked articles.", "text-xs text-gray-500"));
+            }
+        }
+
+        // --- The story log: every story this topic has had ---
+        async function toggleLog() {
+            const logEl = document.getElementById("story-log");
+            const button = document.getElementById("log-btn");
+            if (busy || !currentUpdate) return;
+            if (!logEl.classList.contains("hidden")) {
+                logEl.classList.add("hidden");
+                button.textContent = "Story log ▸";
+                return;
+            }
+            hideError();
+            setBusy(true, "Loading the story log...");
+            try {
+                const data = await apiRequest("GET", `/api/follow/${encodeURIComponent(currentUpdate.watch_id)}`);
+                logEl.innerHTML = "";
+                const stories = data.stories || [];
+                logEl.appendChild(textEl("p", `${stories.length} ${stories.length === 1 ? "story" : "stories"} since ${formatDate(data.created_at)}`, "text-gray-600"));
+                for (const story of stories) {
+                    const card = storyCard();
+                    const first = (story.links || [])[0] || {};
+                    card.appendChild(makeLink(first.url, story.title, "font-medium text-blue-700 hover:underline"));
+                    const seen = formatDate(story.first_seen) === formatDate(story.last_seen)
+                        ? `Seen ${formatDate(story.first_seen)}`
+                        : `First seen ${formatDate(story.first_seen)}, last seen ${formatDate(story.last_seen)}`;
+                    const count = `${story.articles_seen} ${story.articles_seen === 1 ? "article" : "articles"}`;
+                    card.appendChild(textEl("p", [seen, (story.outlets || []).join(", "), count].filter(Boolean).join(" · "), "text-xs text-gray-500 mt-1"));
+                    if (story.related_to && story.related_to.title) {
+                        card.appendChild(textEl("p", `Related to: ${story.related_to.title}`, "text-xs text-gray-600 mt-1"));
+                    }
+                    logEl.appendChild(card);
+                }
+                logEl.classList.remove("hidden");
+                button.textContent = "Story log ▾";
+            } catch (error) {
+                showError(messageFor(error));
+            } finally {
+                setBusy(false);
+            }
+        }
+
+        renderFollowing();
+        openFollowLink();
     </script>
 </body>
 </html>
