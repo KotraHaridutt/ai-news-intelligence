@@ -146,8 +146,12 @@ async def _mset_with_ttl(items: list[tuple[str, bytes | str]], base_ttl: int) ->
 
 # --- Article list (metadata only, no full_text) ---
 
-async def get_articles(normalized_query: str) -> dict | None:
-    [raw] = await _mget([articles_key(normalized_query)])
+async def get_articles(normalized_query: str, strict: bool = False) -> dict | None:
+    """strict (Follow): a failed read raises WatchStoreUnavailable instead of reading as a miss."""
+    if strict:
+        raw = await _watch_call("article list read", lambda c: c.get(articles_key(normalized_query)))
+    else:
+        [raw] = await _mget([articles_key(normalized_query)])
     if raw is None:
         return None
     try:
@@ -181,10 +185,18 @@ async def set_answer(answer_id: str, record: dict) -> bool:
     """Returns whether the record was saved."""
     return await _mset_with_ttl([(answer_key(answer_id), json.dumps(record))], ANSWER_TTL)
 
-async def get_answers(answer_ids: list[str]) -> dict[str, dict]:
-    """Returns {answer_id: record} for the ids that exist; malformed ids are skipped without a lookup."""
+async def get_answers(answer_ids: list[str], strict: bool = False) -> dict[str, dict]:
+    """
+    Returns {answer_id: record} for the ids that exist; malformed ids are skipped without a lookup.
+    strict (Follow): a failed read raises WatchStoreUnavailable instead of reading as "no such
+    answer", so a Redis outage isn't reported to the user as an expired report.
+    """
     ids = [i for i in dict.fromkeys(answer_ids) if is_valid_id(i)]
-    values = await _mget([answer_key(i) for i in ids])
+    keys = [answer_key(i) for i in ids]
+    if strict:
+        values = await _watch_call("answers read", lambda c: c.mget(keys)) if keys else []
+    else:
+        values = await _mget(keys)
     records = {}
     for answer_id, raw in zip(ids, values):
         if raw is None:
@@ -210,6 +222,10 @@ def _watch_store():
     if not _redis_available():
         raise WatchStoreUnavailable(f"Redis is skipped after an error (back-off {BACKOFF_SECONDS}s)")
     return redis_client
+
+def require_watch_store():
+    """Raises WatchStoreUnavailable now, before any work is done for a followed topic."""
+    _watch_store()
 
 async def _watch_call(action: str, fn, *args, **kwargs):
     client = _watch_store()

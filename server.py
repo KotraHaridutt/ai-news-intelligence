@@ -17,7 +17,7 @@ import time
 import markdown2
 
 # --- Our Services ---
-from services import cache_service, errors
+from services import cache_service, errors, follow_service
 from services.errors import AppError
 from services.pipeline_service import get_pipeline_data, build_time
 from services.rag_service import run_rag_query_with_store
@@ -38,6 +38,11 @@ if static_dir.exists():
 
 class QueryRequest(BaseModel):
     query: str
+
+class FollowRequest(BaseModel):
+    query: str
+    # The answers on the page: {"report": id, "timeline": id, "contradictions": id}
+    answer_ids: dict[str, str | None] = {}
 
 # --- Errors ---
 # Every failure reaches the page as {"detail": "<message for the user>"} with a real error
@@ -147,6 +152,32 @@ async def api_contradictions(req: QueryRequest):
         "answer_id": await remember_answer(query, "contradictions", rag_data["answer"], data.get("built_at")),
         "time_taken": f"{time.time() - start_time:.2f}s"
     }
+
+# --- Following a topic (feature 1): services/follow_service.py ---
+
+@app.post("/api/follow")
+async def api_follow(req: FollowRequest):
+    """Saves the report on the page (V1) as a followed topic. No GNews or chat call."""
+    start_time = time.time()
+    query = require_query(req.query)
+    result = await follow_service.follow(query, req.answer_ids)
+    return {**result, "time_taken": f"{time.time() - start_time:.2f}s"}
+
+@app.post("/api/follow/{watch_id}/check")
+async def api_follow_check(watch_id: str):
+    """Check for updates: only what is new since the last look (or the stored result, within 30 min)."""
+    start_time = time.time()
+    result = await follow_service.check(watch_id, render_markdown)
+    return {**result, "time_taken": f"{time.time() - start_time:.2f}s"}
+
+@app.get("/api/follow/{watch_id}")
+async def api_follow_log(watch_id: str):
+    """The followed topic's story log and its last result. Redis only."""
+    return await follow_service.story_log(watch_id)
+
+@app.delete("/api/follow/{watch_id}")
+async def api_unfollow(watch_id: str):
+    return await follow_service.unfollow(watch_id)
 
 if __name__ == "__main__":
     import uvicorn

@@ -242,10 +242,12 @@ def _told_text(snapshot, articles, classified, outcomes, texts) -> str:
             parts.append(f"Update on: {titles.get(item['story_id'], item['story_id'])}\n{texts[item['story_id']]}")
     return "\n\n".join(parts)
 
-def merge(snapshot, articles, article_vectors, classified, outcomes: dict, texts: dict, fetched_at: str, now: str) -> dict:
+def merge(snapshot, articles, article_vectors, classified, outcomes: dict, texts: dict, fetched_at: str, now: str,
+          ids_out: dict | None = None) -> dict:
     """
     The snapshot after a check. outcomes: {new key or story id: SHOWN | NOTHING_NEW | UNJUDGED};
     texts: {same key: the summary or new facts shown}. Returns a new dict; the input is unchanged.
+    ids_out, if given, receives {new key: the story id it became} for the new stories kept.
 
       new story, shown or unjudged  -> a known story (s<n>); unjudged ones were shown without a
                                        summary, so they count as seen
@@ -265,7 +267,9 @@ def merge(snapshot, articles, article_vectors, classified, outcomes: dict, texts
         outcome = outcomes.get(item["key"], UNJUDGED)
         idxs = item["articles"]
         if outcome in (SHOWN, UNJUDGED):
-            _new_story(snap, articles, article_vectors, idxs, now, related_to=item["related_to"])
+            story = _new_story(snap, articles, article_vectors, idxs, now, related_to=item["related_to"])
+            if ids_out is not None:
+                ids_out[item["key"]] = story["id"]
         elif item["related_to"] in by_id:
             _add_to_story(by_id[item["related_to"]], articles, article_vectors, idxs, now)
         newly_seen += [articles[i]["url"] for i in idxs]

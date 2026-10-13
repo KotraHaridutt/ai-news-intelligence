@@ -147,3 +147,26 @@ def report_failed(e: Exception, prompt_type: str):
 def empty_report(prompt_type: str):
     name = _OUTPUT_NAMES.get(prompt_type, "answer")
     return AppError(502, f"The AI returned an empty {name}. Please try again.", f"{prompt_type}: empty answer")
+
+
+# --- Following a topic (feature 1) ---
+
+def follow_unavailable(log=""):
+    """Redis isn't configured, is unreachable, or is in its back-off: followed topics can't be read or saved."""
+    return AppError(503, "Following topics is unavailable right now. You can still analyze topics as usual.", log)
+
+def report_too_old(log=""):
+    """V1's answer or article list expired, or the article list was rebuilt since the report."""
+    return AppError(409, "This report is more than 2 hours old. Analyze the topic again, then follow it.", log)
+
+def report_not_followable(log=""):
+    """No report id, or an answer id that belongs to another topic or view."""
+    return AppError(409, "This report can't be followed. Analyze the topic again, then follow it.", log)
+
+def watch_not_found(log=""):
+    return AppError(404, "This followed topic has expired after 30 days without a check, or the link is incomplete. "
+                         "Follow it again to start a new history.", log)
+
+def check_not_saved(log=""):
+    """The check worked but its result couldn't be saved: showing it would show the same news again next time."""
+    return AppError(503, "Couldn't save this check, so its results aren't shown. Please check again in a minute.", log)
