@@ -128,7 +128,8 @@ def analysis_failed(e: Exception):
     return AppError(502, "The AI service couldn't analyze the articles. Please try again.", log)
 
 # What the user asked for, by prompt type
-_OUTPUT_NAMES = {"report": "report", "timeline": "timeline", "contradictions": "analysis of conflicting reports"}
+_OUTPUT_NAMES = {"report": "report", "timeline": "timeline", "contradictions": "analysis of conflicting reports",
+                 "update": "update"}
 
 def report_failed(e: Exception, prompt_type: str):
     """The chat model (or the retrieval step before it) failed."""
