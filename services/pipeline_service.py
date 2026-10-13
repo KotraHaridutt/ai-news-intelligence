@@ -97,6 +97,12 @@ async def _load_or_build(key: str, search_query: str):
     start_time = time.time()
 
     cached = await cache_service.get_articles(key)
+    if cached is not None and not cached.get("built_at"):
+        # Written before builds had a built_at (feature 1). A report from it could never be
+        # followed (Follow would say "more than 2 hours old" about a fresh report), so it is
+        # rebuilt once. Only in the first 2 h after the deploy; page text and vectors are reused.
+        print(f"[INFO] Cache entry for '{key}' has no built_at (written before feature 1). Rebuilding it.")
+        cached = None
     if cached is not None:
         data = await _rebuild_from_cache(cached)
         if data is not None:

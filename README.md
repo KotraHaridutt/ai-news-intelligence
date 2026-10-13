@@ -1,6 +1,6 @@
 # AI News Intelligence
 
-Turn a topic's news coverage into one grounded briefing. Enter a topic, and the app fetches recent coverage, scrapes the full text, groups duplicate stories, keeps one or two articles per story, and uses retrieval-augmented generation (RAG) over what's left to produce an **intelligence report**, a **timeline**, and an analysis of **where sources disagree**, with links back to every source used.
+Turn a topic's news coverage into one grounded briefing. Enter a topic, and the app fetches recent coverage, scrapes the full text, groups duplicate stories, keeps one or two articles per story, and uses retrieval-augmented generation (RAG) over what's left to produce an **intelligence report**, a **timeline**, and an analysis of **where sources disagree**, with links back to every source used. **Follow** a topic, and later checks show only what's new since you last looked: new stories, and new facts about the ones you've already read.
 
 **Live demo:** https://ai-news-intelligence-xdtc.onrender.com
 *(Free-tier hosting: the first request after a period of inactivity can take up to a minute while the server wakes up.)*
@@ -16,6 +16,7 @@ This project automates that work:
 - **Groups duplicate coverage** so you see each distinct storyline once.
 - **Answers only from fresh, fetched articles**, not from an LLM's training data.
 - **Cites its sources**, so every output can be checked against the original articles.
+- **Remembers what you've read**, so coming back to a topic shows what changed instead of the whole story again.
 
 ## Features
 
@@ -25,9 +26,10 @@ This project automates that work:
 | **Timeline** | Key events ordered by date, each with its outlet; relative dates ("on Tuesday") are resolved against the article's publish date |
 | **Contradictions** | Conflicting claims and opposing viewpoints, attributed to the outlets (or quoted people) that make them |
 | **Related links** | The biggest stories first (with how many articles covered each), then the most relevant unique stories, one link per story |
-| **Source citations** | Every response lists the articles its answer was generated from |
+| **Source citations** | Every response lists the articles its answer was generated from, with their dates |
+| **Follow a topic** | "Check for updates" shows only what the report you read (and every check since) didn't contain: new stories with short summaries, new facts on known stories, or "Nothing new". Repeats are hidden but listed, blocked pages are listed, and a story log keeps every story the topic has had |
 
-In the page, the report, timeline and contradictions are three tabs over the same topic. Timeline and Contradictions load on their first click and are kept until the next search, so switching between views costs nothing.
+In the page, the report, timeline and contradictions are three tabs over the same topic. Timeline and Contradictions load on their first click and are kept until the next search, so switching between views costs nothing. **Follow this topic** under the report adds it to a Following list kept in your browser (no account); a link moves a followed topic to another browser.
 
 ---
 
@@ -58,15 +60,41 @@ flowchart TD
 5. **Retrieve:** each view picks its own 10 chunks. The **report** takes the chunks nearest the query; the **timeline** searches with "what happened and when: dates, days, announcements" added to the query (chosen from 5 measured options: the most date words in the retrieved chunks); **contradictions** uses maximal marginal relevance (MMR, λ 0.5), so a chunk must also differ from those already picked and repeated wire copy gives way to other viewpoints. In every view a story gets at most 3 of the 10 slots, unless the other stories can't fill them. Measured on 8 topics, indexes hold 7-60 chunks, and without that cap one story (two long articles) took 14 of 15 slots ("artificial intelligence"); with it, that topic's contradictions context spans 8 outlets instead of 2. Each answer logs what was used: `RAG [contradictions, mmr]: Retrieved 10 of 22 chunks (k=10, max 3 per story) from 6 articles: "title" [0, 1] | ...`.
 6. **Generate:** place the retrieved chunks in one prompt (LangChain's "stuff" strategy) with one of three templates. Each chunk starts with a `[Source: <title> | <outlet> | Published: 2026-10-09 14:30 UTC]` line, so the model can say which outlet reported what and turn "on Tuesday" into a date; in a live comparison the report went from naming 0 to all 5 outlets, and the timeline from 3 to 6 exact dates. The chunks sit in an `<articles>` block that the prompt marks as untrusted data whose instructions must never be followed, and scraped text can't close that block or fake a `[Source: ...]` line (both patterns are rewritten before the prompt is built). Each template instructs the model to use only the provided context and to say so when the context is insufficient. The whole answer step (retrieval and generation) has a 75 s deadline, so a slow model gets a clear "took too long" message before the page gives up.
 
+### Following a topic
+
+```mermaid
+flowchart TD
+    V1[Report V1 on the page] -- Follow --> S[(Snapshot in Redis<br/>V1's stories and their article vectors<br/>every V1 URL as seen<br/>V1's text as 'already told')]
+    C[Check for updates] --> W[GNews: only articles published since the last fetch<br/>minus the 12 h delay, up to 7 days back]
+    W --> P[Scrape, embed, group and choose<br/>as for a report, no index]
+    P --> D{Each article: seen URL?<br/>distance to the nearest known story}
+    S --> D
+    D -- seen --> X[never shown again]
+    D -- "< 0.12" --> K[update to a known story]
+    D -- "0.12–0.18" --> RL[new story, related to a known one]
+    D -- "≥ 0.18" --> N[new story]
+    K & RL & N --> F[One Gemini call, JSON:<br/>per story, only the facts not already told,<br/>or null = nothing new, hidden]
+    F --> M[Merge into the snapshot, save, then show]
+```
+
+1. **Follow** saves the report on the page as V1: the stories it was built from, every article in that build as *seen*, and the report's own text (plus any timeline or contradictions opened) as *already told*. No news search and no AI call.
+2. **Check for updates** searches only what was published since the previous fetch. GNews's free plan returns articles at least **12 h** old (measured), so the window starts at the previous fetch minus 12 h; it reaches up to **7 days** back (measured), and a longer gap is reported instead of skipped.
+3. **Code decides what's new.** An article whose URL was seen is never shown again. Every other article is compared with the stored vectors of the known stories. Measured on 32 hand-labelled articles a day apart: the same storyline was 0.046-0.153 apart, a follow-up 0.107-0.165, a different story 0.196 or more. So below **0.12** an article is an update to a known story, between 0.12 and **0.18** a new story *related* to one, and above that a new story. Each article is decided on its own: one outlet's page boilerplate once put different stories in one group.
+4. **The LLM only judges facts.** One structured call per check, and only when there are unseen articles, asks: for each story, what in these articles was *not* already told? A known story gets only its new facts; a new story gets a summary without them; `null` hides it as a repeat. In a live run, an article re-reporting a V1 story a day later came back with only the facts V1 hadn't told; two other outlets' copies of one new event came back hidden or with only their extra facts.
+5. **Saved before shown.** The result is stored before it is returned, so nothing shown can come back as "new". A check within 30 minutes returns the stored result; a check with nothing unseen costs no AI call.
+
 ### Caching
 
 Steps 1–4 are cached in Redis ([Upstash](https://upstash.com/)), outside the app process, so cached work survives restarts and deploys:
 
 | Key | Holds | TTL |
 |---|---|---|
-| `v1:articles:<query>` | Article list (metadata and theme IDs) and related links, without page text | 2 h |
+| `v1:articles:<query>` | Article list (metadata and theme IDs), related links and `built_at`, without page text | 2 h |
 | `v1:page:<url>` | Scraped article text | 36 h |
 | `v1:emb:<model>:<task type>:<sha256 of text>` | Embedding vector (`float32` bytes) | 7 days |
+| `v1:since:<hour>:<query>` | A check's article list for a window (shared by checks of a topic in the same hour) | 2 h |
+| `v1:answer:<answer_id>` | An answer shown on the page (query, view, markdown, `built_at`), so Follow can store what it said | 2 h |
+| `v1:watch:<watch_id>` | A followed topic: its stories (float16 vectors), seen URLs, "already told" text, last result | 30 days after the last check |
 
 - **A cache hit** rebuilds the FAISS index from cached page text and vectors, with no GNews call, scraping or embedding (about 1.5 s in testing, against about 28 s for a full build).
 - **Page text and vectors are shared across queries**, keyed by URL and by text hash, so a new query that returns articles seen before only scrapes and embeds what's new. Identical wire copies are embedded once.
@@ -74,7 +102,8 @@ Steps 1–4 are cached in Redis ([Upstash](https://upstash.com/)), outside the a
 - **Failed builds are never cached** (Gemini errors, all-paywall results), so a temporary failure isn't remembered as "no articles". If only the answer step fails, the finished build stays cached and a retry repeats just the LLM call.
 - **Identical concurrent requests share one build**, and at most 3 different builds run at once (`MAX_CONCURRENT_BUILDS`); cache hits don't wait.
 - **The server stays responsive during a build:** Gemini calls are async, and parsing, DBSCAN and the FAISS build run in threads. Gemini embedding calls retry rate-limit (429) and server errors with exponential back-off.
-- **Redis is optional.** Without `REDIS_URL`, or while Redis is unreachable, every request runs the full pipeline.
+- **Redis is optional for reports.** Without `REDIS_URL`, or while Redis is unreachable, every report request runs the full pipeline. Following topics needs Redis: without it, the follow endpoints answer 503 "Following topics is unavailable right now" and everything else works.
+- **Followed topics are not a cache.** Their reads and writes report a Redis failure (503) instead of passing silently, because a check that was shown but not saved would show the same news again.
 
 All three endpoints share the cache, so switching from the report to the timeline or contradictions view only costs one LLM call.
 
@@ -91,15 +120,15 @@ All three endpoints share the cache, so switching from the report to the timelin
 | Clustering | scikit-learn DBSCAN, NumPy |
 | RAG | LangChain (text splitter, retrieval and stuff-documents chains), FAISS (`faiss-cpu`) |
 | Caching | Upstash Redis (`redis` asyncio client) |
-| LLM | Google Gemini Flash (`gemini-3.8-flash`, falling back to `gemini-3.6-flash`), thinking level `low`, default temperature, 45 s timeout per attempt, 75 s deadline for the whole answer step |
-| Frontend | Jinja2 template, Tailwind CSS, vanilla JavaScript |
+| LLM | Google Gemini Flash (`gemini-3.8-flash`, falling back to `gemini-3.6-flash`), thinking level `low`, default temperature, 45 s timeout per attempt, 75 s deadline for the whole answer step; the follow check uses structured output (JSON schema, Pydantic) |
+| Frontend | Jinja2 template, Tailwind CSS, vanilla JavaScript; followed topics in `localStorage` |
 | Deployment | Render (free tier) |
 
 ---
 
 ## API
 
-All endpoints accept a JSON body `{"query": "<topic>"}`. Interactive documentation is available at `/docs`.
+The three views accept a JSON body `{"query": "<topic>"}`. Interactive documentation is available at `/docs`.
 
 ### `POST /query`: intelligence report
 
@@ -113,17 +142,45 @@ All endpoints accept a JSON body `{"query": "<topic>"}`. Interactive documentati
     {"title": "EU passes landmark AI law", "url": "https://...", "source": "Reuters"}
   ],
   "total_articles_found": 24,
+  "answer_id": "Xy3kQ0…",
   "time_taken": "8.41s"
 }
 ```
 
+`answer_id` names this answer for **Follow** (`null` if it couldn't be saved; the answer is still shown).
+
 ### `POST /api/timeline`: chronological events
 
-Returns `query`, `timeline_html`, `cited_sources` and `time_taken`. The page's Timeline tab.
+Returns `query`, `timeline_html`, `cited_sources`, `answer_id` and `time_taken`. The page's Timeline tab.
 
 ### `POST /api/contradictions`: conflicting claims across sources
 
-Returns `query`, `analysis_html`, `cited_sources` and `time_taken`. The page's Contradictions tab.
+Returns `query`, `analysis_html`, `cited_sources`, `answer_id` and `time_taken`. The page's Contradictions tab.
+
+### Following a topic
+
+| Endpoint | Does | Calls GNews / Gemini |
+|---|---|---|
+| `POST /api/follow` `{"query", "answer_ids": {"report", "timeline"?, "contradictions"?}}` | Saves the report on the page as V1. Returns `watch_id`, `query`, `created_at`, `stories` | no / no |
+| `POST /api/follow/{watch_id}/check` | What's new since the last check (the stored result within 30 min) | 1 request (0 if shared or reused) / 0 or 1 call |
+| `GET /api/follow/{watch_id}` | The story log and the last result | no / no |
+| `DELETE /api/follow/{watch_id}` | Stop following | no / no |
+
+A check returns:
+
+```json
+{
+  "watch_id": "m7Mo_3_ZiCUYl4Ce6-nQMA", "query": "Tesla", "checked_at": "…", "previous_check": "…",
+  "window": {"from": "2026-10-11T16:00:00Z", "to_approx": "2026-10-12T16:42:10Z", "gap_not_covered": null},
+  "articles_found": 10,
+  "new_stories": [{"story_id": "s6", "title": "…", "outlets": ["Business Insider"], "articles": 1,
+                   "summary_html": "<p>…</p>", "related_to": null, "links": [{"title": "…", "url": "…", "source_name": "…", "published_at": "…"}]}],
+  "updates": [{"story_id": "s2", "story_title": "…", "first_seen": "…", "new_facts_html": "<p>…</p>", "links": []}],
+  "hidden_repeats": [{"title": "…", "url": "…", "source_name": "…", "published_at": "…"}],
+  "unreadable": [],
+  "nothing_new": false, "message": null, "reused": false, "time_taken": "7.30s"
+}
+```
 
 **Errors:** every failure returns a real error status and `{"detail": "<message for the user>"}`, never `200` with error text. The page shows `detail` as it is.
 
@@ -136,6 +193,9 @@ Returns `query`, `analysis_html`, `cited_sources` and `time_taken`. The page's C
 | `502` | GNews or Gemini answered with an error, or the AI returned an empty answer | The AI couldn't write the report. Please try again. |
 | `503` | Temporary: GNews daily quota, rate limit or maintenance; Gemini busy or rate-limited | Today's news search limit has been reached. It resets at midnight UTC, so please try again later. |
 | `504` | Gemini took too long (embedding, or the 75 s answer deadline) | The AI took too long to write the report. Please try again. |
+| `409` | Follow: the report's article list expired or was rebuilt since the report (or the answer belongs to another topic) | This report is more than 2 hours old. Analyze the topic again, then follow it. |
+| `404` | A followed topic that expired (30 days without a check) or an incomplete link | This followed topic has expired after 30 days without a check, or the link is incomplete. Follow it again to start a new history. |
+| `503` | Following without Redis; or a check that worked but couldn't be saved (it isn't shown) | Following topics is unavailable right now. You can still analyze topics as usual. |
 
 All messages live in [`services/errors.py`](services/errors.py). The page has its own messages for what the server can't answer: no connection, a proxy error while the server wakes up, and no answer after 120 s.
 
@@ -200,13 +260,17 @@ The free tier has 512 MB of RAM, so embeddings come from the Gemini API instead 
 ai-news-intelligence/
 ├── server.py                    # FastAPI app and endpoints
 ├── services/
-│   ├── pipeline_service.py      # Pipeline: cache hit/miss, single-flight, build limit
-│   ├── cache_service.py         # Redis keys, TTLs, batched reads/writes
-│   ├── news_fetcher.py          # Article discovery (GNews) and concurrent scraping
+│   ├── pipeline_service.py      # Pipeline: cache hit/miss, single-flight, build limit; the check build for followed topics
+│   ├── cache_service.py         # Redis keys, TTLs, batched reads/writes; answer records and followed topics
+│   ├── news_fetcher.py          # Article discovery (GNews), the check window, concurrent scraping
 │   ├── errors.py                # AppError: one status + user-facing message per failure point
 │   ├── clustering_service.py    # DBSCAN theme clustering
-│   └── rag_service.py           # Chunking, cached embeddings, FAISS index, prompts, retrieval per view
-├── templates/index.html         # Web UI: report, timeline and contradictions tabs
+│   ├── selection_service.py     # Rank by relevance, keep ≤ 2 articles per story, Related Links
+│   ├── rag_service.py           # Chunking, cached embeddings, FAISS index, prompts, retrieval per view
+│   ├── novelty_service.py       # Following: a topic's snapshot; seen / update / related / new; merge; story log
+│   ├── fact_check_service.py    # Following: the one structured LLM call that keeps only facts not already told
+│   └── follow_service.py        # Following: Follow, Check, story log, unfollow
+├── templates/index.html         # Web UI: report / timeline / contradictions tabs, Following list, update view
 ├── static/style.css
 ├── render.yaml                  # Render deployment blueprint
 ├── Procfile
@@ -227,6 +291,10 @@ ai-news-intelligence/
 - **Cache the inputs, not the index.** Redis stores page text and embedding vectors, and the FAISS index is rebuilt from them on each request. Storing the FAISS object itself would need `pickle` (unsafe to load, tied to library versions), while rebuilding the index from 7-60 vectors takes milliseconds. Keying text and vectors by URL and content hash lets different queries share the expensive work.
 - **Errors are raised, not returned.** Each failure point raises one error type carrying its HTTP status and a user-facing message, and one handler turns it into the response. Before, `None` and `[]` were passed up through three layers that each had to guess what they meant, and five different failures reached the user as the same "no articles" 404.
 - **Paragraph-aware chunking.** News articles are plain prose, so splitting at paragraph boundaries keeps each claim together with its context without the extra cost of semantic chunking.
+- **What's new is decided by code; the LLM only judges facts.** Whether an article was seen, and which story it belongs to, comes from stored URLs and embedding distances with thresholds measured across days, not from the model. The model is asked one narrower question (what in these articles wasn't already told?) and answers in JSON, so "nothing new" is a `null` the code acts on. A general assistant asked to "summarize what's new" doesn't know exactly what you read.
+- **Follow by answer id, not by topic.** Every answer on the page has its own id, and Follow saves exactly those answers plus the article list they were built from (checked by its build time). Two people reading the same topic never get each other's report as "already told", and a list rebuilt after the report is refused instead of silently paired with it.
+- **Decide each article on its own.** A day-later re-report of a known story measured 0.153 from it, and one outlet's page boilerplate grouped two different stories at 0.10-0.12; deciding per article (and splitting groups whose articles disagree) keeps a new story from being labelled as an old one.
+- **Save before show.** A check's result is stored before it is returned; if storing fails, it isn't shown. Anything shown is therefore never shown again as new.
 
 ## Limitations and roadmap
 
@@ -236,7 +304,15 @@ ai-news-intelligence/
 - [x] Keep duplicate coverage from dominating the context (choose step: at most 2 articles per story before indexing)
 - [x] Make embedding, indexing and LLM calls fully non-blocking (`ainvoke`, `asyncio.to_thread`)
 - [x] Replace the in-process cache with a shared cache (Redis) that survives restarts
+- [x] Follow a topic and see only what changed since the last look
 - [ ] Add inline per-claim citations and an automated faithfulness check
+
+Limits of following, on the free plans:
+
+- **"Latest" is at least 12 hours old:** the GNews free plan returns articles with a 12-hour delay, and a check shows the window it covered.
+- **10 articles per check:** a busy topic can have more new articles than one search returns; the check shows the 10 best matches.
+- **No account:** followed topics live in the browser; a link moves one to another browser, and a topic expires after 30 days without a check.
+- **20 AI calls a day per model** on the Gemini free tier, shared by reports and checks (a check with nothing unseen uses none).
 
 ## License
 
