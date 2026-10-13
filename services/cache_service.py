@@ -71,6 +71,14 @@ def emb_key(model: str, text: str) -> str:
     text_hash = hashlib.sha256(text.encode("utf-8")).hexdigest()
     return f"{KEY_VERSION}:emb:{model}:{text_hash}"
 
+def since_key(normalized_query: str, from_hour: str) -> str:
+    """
+    A check's article list (feature 1): one per topic and window start hour, so checks of the
+    same topic in the same hour share one GNews request. Its own key family, not articles:,
+    so no typed query can ever collide with it; from_hour has a fixed length and comes first.
+    """
+    return f"{KEY_VERSION}:since:{from_hour}:{normalized_query}"
+
 def answer_key(answer_id: str) -> str:
     return f"{KEY_VERSION}:answer:{answer_id}"
 
@@ -150,6 +158,19 @@ async def get_articles(normalized_query: str) -> dict | None:
 
 async def set_articles(normalized_query: str, data: dict):
     await _mset_with_ttl([(articles_key(normalized_query), json.dumps(data))], ARTICLES_TTL)
+
+async def get_since_articles(normalized_query: str, from_hour: str) -> dict | None:
+    [raw] = await _mget([since_key(normalized_query, from_hour)])
+    if raw is None:
+        return None
+    try:
+        return json.loads(raw)
+    except ValueError as e:
+        print(f"[WARN] Corrupt check cache entry for '{normalized_query}' from {from_hour}: {e}")
+        return None
+
+async def set_since_articles(normalized_query: str, from_hour: str, data: dict):
+    await _mset_with_ttl([(since_key(normalized_query, from_hour), json.dumps(data))], ARTICLES_TTL)
 
 
 # --- Answers shown to the user (feature 1: what V1 said, for Follow) ---

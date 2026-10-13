@@ -76,15 +76,69 @@ async def _gnews_turn():
         finally:
             _gnews_last_done = time.monotonic()   # also after a failed request
 
+def _gnews_time(dt: datetime) -> str:
+    """The UTC format GNews expects, e.g. '2026-10-09T10:00:00Z'."""
+    return dt.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
 def _window_start() -> str:
     """Start of the news window in the UTC format GNews expects, e.g. '2026-10-09T10:00:00Z'."""
-    start = datetime.now(timezone.utc) - timedelta(hours=NEWS_WINDOW_HOURS)
-    return start.strftime("%Y-%m-%dT%H:%M:%SZ")
+    return _gnews_time(datetime.now(timezone.utc) - timedelta(hours=NEWS_WINDOW_HOURS))
 
-async def fetch_news(query: str) -> list[dict]:
+# --- Window for "Check for updates" (feature 1) ---
+# Measured on the free plan (feature-1 Section A): the newest article GNews returns is never
+# less than 12 h old, so a fetch at time T sees articles published up to about T - 12 h.
+GNEWS_DELAY_HOURS = 12
+# How far back a check may search. Measured: the free plan returns articles 6-7 days old.
+# Also how long a followed topic keeps its stories' vectors, so a story older than this
+# couldn't be matched anyway. A longer gap is reported to the user instead of searched.
+MAX_LOOKBACK_HOURS = 7 * 24
+
+def _as_utc(value) -> datetime:
+    if isinstance(value, str):
+        value = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc)
+
+def check_window(since, now=None) -> dict:
+    """
+    The search window for a check, given when the previous fetch ran (`since`: V1's build or
+    the last check, a datetime or ISO string). The previous fetch saw articles up to about
+    since - delay, so this one starts there:
+
+      from       since - delay, rounded DOWN to the hour (so checks in the same hour share one
+                 fetch; the extra minutes only re-find articles the seen list already holds).
+                 If that is earlier than now - MAX_LOOKBACK_HOURS, the limit rounded UP instead
+      to_approx  now - delay: the newest article this fetch can return (not sent to GNews)
+      gap_not_covered  {"from", "to"}: the part since the previous fetch that this one can't
+                 search (only when the limit applied), else None
+    All values are GNews-format UTC strings; "from_hour" ('2026-10-11T13') names the window.
+    """
+    now = _as_utc(now or datetime.now(timezone.utc))
+    previous_end = _as_utc(since) - timedelta(hours=GNEWS_DELAY_HOURS)
+    earliest = now - timedelta(hours=MAX_LOOKBACK_HOURS)
+    start = previous_end.replace(minute=0, second=0, microsecond=0)
+    if start < earliest:
+        # Up, not down, so the window never reaches past what the plan was measured to return.
+        # Whatever lies between the previous fetch and here is reported, never skipped silently.
+        start = earliest.replace(minute=0, second=0, microsecond=0)
+        if start < earliest:
+            start += timedelta(hours=1)
+    gap = None
+    if previous_end < start:
+        gap = {"from": _gnews_time(previous_end), "to": _gnews_time(start)}
+    return {
+        "from": _gnews_time(start),
+        "from_hour": start.strftime("%Y-%m-%dT%H"),
+        "to_approx": _gnews_time(now - timedelta(hours=GNEWS_DELAY_HOURS)),
+        "gap_not_covered": gap,
+    }
+
+async def fetch_news(query: str, window_from: str | None = None) -> list[dict]:
     """
     Fetches the article list for a query from GNews: the best matches
-    published in the last NEWS_WINDOW_HOURS, best match first.
+    published in the last NEWS_WINDOW_HOURS, best match first. With window_from (a check's
+    window, see check_window), the best matches published since then instead.
     Returns [] only when GNews answered with no articles. Raises AppError when the
     request fails, so an outage isn't shown to the user as "no news found".
     """
@@ -99,7 +153,7 @@ async def fetch_news(query: str) -> list[dict]:
         # GNews's default is "publishedAt" (newest first). We can only re-rank the
         # 10 articles it returns, so ask for the 10 that match the query best.
         "sortby": "relevance",
-        "from": _window_start(),
+        "from": window_from or _window_start(),
         "token": GNEWS_API_KEY,
     }
 

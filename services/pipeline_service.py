@@ -4,7 +4,7 @@ import time
 from datetime import datetime, timezone
 
 from services import cache_service, errors
-from services.news_fetcher import fetch_news, scrape_pages
+from services.news_fetcher import fetch_news, scrape_pages, check_window
 from services.clustering_service import group_by_theme
 from services.rag_service import build_vector_store, get_vectors, get_query_vector
 from services.selection_service import (
@@ -16,11 +16,14 @@ from services.selection_service import (
 # 'indexed' marks the articles the choose step picked for the FAISS index, so a hit
 # rebuilds the same index as the miss did. 'unique' and 'similarity' record why.
 ARTICLE_META_FIELDS = ("url", "title", "source_name", "published_at", "theme_id", "indexed", "unique", "similarity")
+# What a check keeps of an article it found but couldn't read (blocked, paywalled, timed out)
+UNREADABLE_FIELDS = ("url", "title", "source_name", "published_at")
 
 # --- Single-flight ---
 # One build per normalized query at a time in this process. Later identical
 # requests await the same task instead of starting their own build.
-_inflight: dict[str, asyncio.Task] = {}
+# Keys: the normalized query for a report build, ("since", from_hour, query) for a check.
+_inflight: dict[str | tuple, asyncio.Task] = {}
 
 # --- Build limit ---
 # At most this many full builds (GNews + scrape + embed + index) run at once.
@@ -40,32 +43,49 @@ def build_time() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="milliseconds")
 
 
-async def get_pipeline_data(query: str):
+async def get_pipeline_data(query: str, since=None):
     """
     Returns {"articles", "vector_store", "related_links", "built_at"} for a query, with a built index.
     built_at is None for a cache entry written before feature 1 (it had no built_at).
     Raises AppError (with the status and message the user sees) when no index can be
     built: GNews failed, no news in the window, no readable page, or Gemini failed.
     Every request waiting on the same build gets the same error.
+
+    With `since` (when the previous fetch ran: V1's build or the last check), the build for a
+    "Check for updates" instead: see _build_since for what it returns. No index, and an empty
+    window or unreadable pages are results, not errors.
     """
     key = cache_service.normalize_query(query)
     # GNews gets the query as the user typed it (whitespace tidied), so search operators
     # like AND/OR/NOT reach it unchanged; only the cache key is lowercased.
     search_query = " ".join(query.split())
 
-    task = _inflight.get(key)
-    if task is None:
-        task = asyncio.create_task(_load_or_build(key, search_query))
-        _inflight[key] = task
-        task.add_done_callback(lambda t: _on_task_done(key, t))
+    if since is None:
+        flight, label = key, f"'{key}'"
+        start = lambda: _load_or_build(key, search_query)
     else:
-        print(f"[INFO] Joining in-flight build for '{key}'")
+        window = check_window(since)
+        flight, label = ("since", window["from_hour"], key), f"'{key}' since {window['from']}"
+        start = lambda: _load_or_build_since(key, search_query, window)
+
+    task = _inflight.get(flight)
+    if task is None:
+        task = asyncio.create_task(start())
+        _inflight[flight] = task
+        task.add_done_callback(lambda t: _on_task_done(flight, t))
+    else:
+        print(f"[INFO] Joining in-flight build for {label}")
 
     # shield: if this request is cancelled, the build keeps running for the others
-    return await asyncio.shield(task)
+    data = await asyncio.shield(task)
+    if since is not None:
+        # Requests in the same hour share the fetch, but the part a long gap couldn't
+        # search depends on each request's own `since`
+        data = {**data, "window": {**data["window"], "gap_not_covered": window["gap_not_covered"]}}
+    return data
 
 
-def _on_task_done(key: str, task: asyncio.Task):
+def _on_task_done(key, task: asyncio.Task):
     if _inflight.get(key) is task:
         del _inflight[key]
     # Mark the exception as retrieved so an error with no waiters left isn't logged as "never retrieved"
@@ -158,10 +178,7 @@ async def _build(key: str, search_query: str):
         raise errors.no_recent_news(search_query)
 
     # GNews can list the same URL twice; keep the first
-    unique = {}
-    for article in found:
-        unique.setdefault(article['url'], article)
-    found = list(unique.values())
+    found = _unique_by_url(found)
 
     # 2. Page texts: cached ones first, scrape only the rest
     articles = await _attach_pages(found)
@@ -174,29 +191,9 @@ async def _build(key: str, search_query: str):
     except Exception as e:
         print(f"[ERROR] Failed to embed articles for clustering: {e}")
         article_vectors = None
-    # DBSCAN is CPU work: run it in a thread so the event loop stays free
-    clustering_ok = await asyncio.to_thread(group_by_theme, articles, article_vectors)
 
-    # 4. Rank + choose (gap_1): which articles reach the index and the Related Links
-    similarities, ranking_ok = None, False
-    if clustering_ok:
-        try:
-            query_vector = await get_query_vector(key)
-            similarities = cosine_similarities(article_vectors, query_vector)
-            ranking_ok = True
-        except Exception as e:
-            print(f"[ERROR] Failed to embed the query for ranking: {e}. Ranking by GNews relevance order.")
-        promote_unique(articles, similarities)
-        choose_articles(articles, article_vectors, similarities)
-        related_links = build_related_links(articles, similarities)
-        print(f"[INFO] Selection for '{key}': " + "\n".join(selection_report(articles, similarities)))
-    else:
-        # Grouping failed, so duplicates can't be told apart: index everything, no Related Links
-        for article in articles:
-            article['indexed'], article['unique'] = True, False
-        related_links = []
-    for i, article in enumerate(articles):
-        article['similarity'] = round(similarities[i], 4) if similarities else None
+    # 3-4. Group, rank + choose (gap_1): which articles reach the index and the Related Links
+    clustering_ok, ranking_ok, related_links = await _group_and_choose(key, f"'{key}'", articles, article_vectors)
 
     # 5. Index only the chosen articles (raises AppError if Gemini fails)
     vector_store = await build_vector_store([article for article in articles if article['indexed']])
@@ -221,3 +218,149 @@ async def _build(key: str, search_query: str):
         "related_links": related_links,
         "built_at": built_at,
     }
+
+
+def _unique_by_url(found):
+    unique = {}
+    for article in found:
+        unique.setdefault(article['url'], article)
+    return list(unique.values())
+
+
+async def _group_and_choose(key: str, label: str, articles, article_vectors):
+    """
+    Steps 3-4 of a build, shared by report builds and checks: group duplicates (DBSCAN),
+    rank by query relevance, keep at most 2 articles per group (sets theme_id, unique,
+    indexed and similarity on each article, in place). Returns (clustering_ok, ranking_ok,
+    related_links). Without article vectors grouping fails, and every article is indexed.
+    """
+    # DBSCAN is CPU work: run it in a thread so the event loop stays free
+    clustering_ok = await asyncio.to_thread(group_by_theme, articles, article_vectors)
+
+    similarities, ranking_ok = None, False
+    if clustering_ok:
+        try:
+            query_vector = await get_query_vector(key)
+            similarities = cosine_similarities(article_vectors, query_vector)
+            ranking_ok = True
+        except Exception as e:
+            print(f"[ERROR] Failed to embed the query for ranking: {e}. Ranking by GNews relevance order.")
+        promote_unique(articles, similarities)
+        choose_articles(articles, article_vectors, similarities)
+        related_links = build_related_links(articles, similarities)
+        print(f"[INFO] Selection for {label}: " + "\n".join(selection_report(articles, similarities)))
+    else:
+        # Grouping failed, so duplicates can't be told apart: index everything, no Related Links
+        for article in articles:
+            article['indexed'], article['unique'] = True, False
+        related_links = []
+    for i, article in enumerate(articles):
+        article['similarity'] = round(similarities[i], 4) if similarities else None
+    return clustering_ok, ranking_ok, related_links
+
+
+# --- Builds for "Check for updates" (feature 1) ---
+# A check needs the articles published since the previous fetch, their page text and their
+# article vectors (to compare with the stories already seen), grouped and chosen like a
+# report build. It needs no FAISS index: the fact check reads the chosen articles' first
+# chunks directly, so building one would only spend embedding calls on chunks.
+
+def _pick(article, fields):
+    return {field: article.get(field) for field in fields}
+
+
+async def _article_vectors(articles):
+    """Article vectors, read from the 7-day cache first. A check can't compare without them."""
+    if not articles:
+        return []
+    try:
+        return await get_vectors([article['full_text'] for article in articles])
+    except Exception as e:
+        raise errors.analysis_failed(e) from e
+
+
+async def _load_or_build_since(key: str, search_query: str, window: dict):
+    start_time = time.time()
+    label = f"'{key}' since {window['from']}"
+
+    cached = await cache_service.get_since_articles(key, window["from_hour"])
+    if cached is not None:
+        data = await _since_from_cache(cached)
+        print(f"[INFO] Check cache HIT for {label}: {len(data['articles'])} articles in {time.time() - start_time:.2f}s")
+        return data
+    print(f"[INFO] Check cache MISS for {label}. Fetching.")
+
+    if _build_slots.locked():
+        print(f"[INFO] All {MAX_CONCURRENT_BUILDS} build slots busy. Check for {label} is waiting.")
+    async with _build_slots:
+        data = await _build_since(key, search_query, window)
+    print(f"[INFO] Check build for {label} finished in {time.time() - start_time:.2f}s: "
+          f"{data['articles_found']} found, {len(data['articles'])} readable, {len(data['unreadable'])} unreadable")
+    return data
+
+
+async def _since_from_cache(cached):
+    """Hit path: the cached article list -> page texts (scraping any that expired) -> article vectors."""
+    articles = cached.get("articles", [])
+    with_text = await _attach_pages(articles) if articles else []
+    readable = {article['url'] for article in with_text}
+    lost = [_pick(article, UNREADABLE_FIELDS) for article in articles if article['url'] not in readable]
+    if lost:
+        print(f"[WARN] {len(lost)} cached check article(s) couldn't be read again.")
+    return {
+        "articles": with_text,
+        "article_vectors": await _article_vectors(with_text),
+        "unreadable": cached.get("unreadable", []) + lost,
+        "articles_found": cached.get("articles_found", len(articles)),
+        "built_at": cached.get("built_at"),
+        "window": cached.get("window", {}),
+    }
+
+
+async def _build_since(key: str, search_query: str, window: dict):
+    """
+    Miss path of a check: GNews from window['from'] -> page texts -> article vectors -> group
+    -> rank + choose. Returns
+      articles         readable articles with full_text, theme_id, unique, indexed, similarity
+      article_vectors  one vector per article, same order
+      unreadable       articles found but not readable (url, title, source_name, published_at)
+      articles_found   how many GNews returned
+      built_at, window ({from, from_hour, to_approx}; gap_not_covered is added per request)
+    No articles in the window, or none readable, is a result (the check shows "nothing new" or
+    the unreadable ones), not an error. Raises AppError if GNews or Gemini fails.
+    Cached like a report build: only if it fully succeeded, and not when nothing was readable
+    (a blocked page may be readable on the next try).
+    """
+    built_at = build_time()
+    found = _unique_by_url(await fetch_news(search_query, window_from=window["from"]))
+    result = {
+        "articles": [], "article_vectors": [], "unreadable": [],
+        "articles_found": len(found), "built_at": built_at,
+        "window": {k: window[k] for k in ("from", "from_hour", "to_approx")},
+    }
+
+    def cache_entry():
+        return {**{k: v for k, v in result.items() if k != "article_vectors"},
+                "articles": [_pick(article, ARTICLE_META_FIELDS) for article in result["articles"]]}
+
+    if not found:
+        print(f"[INFO] No articles for '{key}' since {window['from']}.")
+        await cache_service.set_since_articles(key, window["from_hour"], cache_entry())
+        return result
+
+    articles = await _attach_pages(found)
+    readable = {article['url'] for article in articles}
+    result["unreadable"] = [_pick(article, UNREADABLE_FIELDS) for article in found if article['url'] not in readable]
+    if not articles:
+        print(f"[WARN] Check for '{key}': {len(found)} found, none readable. Not cached.")
+        return result
+
+    vectors = await _article_vectors(articles)
+    clustering_ok, ranking_ok, _ = await _group_and_choose(key, f"'{key}' since {window['from']}", articles, vectors)
+    result.update(articles=articles, article_vectors=vectors)
+
+    if clustering_ok and ranking_ok:
+        await cache_service.set_since_articles(key, window["from_hour"], cache_entry())
+    else:
+        print(f"[WARN] Check build for '{key}' not cached (clustering ok: {clustering_ok}, ranking ok: {ranking_ok}).")
+    return result
