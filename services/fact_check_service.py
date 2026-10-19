@@ -6,7 +6,7 @@ from datetime import datetime
 from pydantic import BaseModel, Field
 from langchain_core.exceptions import OutputParserException
 
-from services import errors, observability, prompts
+from services import errors, observability, online_checks, prompts
 from services import rag_service as rag
 from services.novelty_service import SHOWN, NOTHING_NEW, UNJUDGED
 
@@ -195,6 +195,8 @@ async def run_fact_check(query, stories, known_stories, told) -> dict:
         result = read_answer(answer, stories)
         counts = {kind: sum(1 for story_id, o in result["outcomes"].items() if o == kind) for kind in (SHOWN, NOTHING_NEW, UNJUDGED)}
         run.add_outputs({"usable": result["usable"], **counts})
+        # The fact check's health on this check (Section I #66): feedback on the trace, never an error
+        online_checks.fact_check(answer, result["outcomes"], [s["id"] for s in stories])
     print(f"[INFO] UPDATE: judged {articles} articles in {len(stories)} stories ({new_count} new, {len(stories) - new_count} known), "
           f"{excerpts} chunks, {len(prompt):,} characters; result: {counts[SHOWN]} shown, "
           f"{counts[NOTHING_NEW]} nothing new, {counts[UNJUDGED]} unjudged")

@@ -9,7 +9,7 @@ from dotenv import load_dotenv
 
 # observability sets up tracing (one client, redaction) for every model call made from here,
 # also when a script imports this module without server.py
-from services import cache_service, errors, observability, prompts, usage  # noqa: F401
+from services import cache_service, errors, observability, online_checks, prompts, usage  # noqa: F401
 from services.news_fetcher import has_enough_text
 
 # --- LangChain Imports ---
@@ -577,4 +577,7 @@ async def run_rag_query_with_store(query, vector_store, prompt_type):
         run.add_outputs({"answer_chars": len(result["answer"]), "sources": len(result["sources"]), "chunks": len(documents)})
         if not result["answer"]:
             raise errors.empty_report(prompt_type)
+        # The free code checks on this answer (Section I): feedback on the trace, never an error
+        online_checks.answer(prompt_type, result["answer"], documents, list(vector_store.docstore._dict.values()),
+                             RETRIEVAL_K, STORY_CAP)
         return result

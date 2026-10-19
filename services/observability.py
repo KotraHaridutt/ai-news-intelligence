@@ -3,8 +3,10 @@ import atexit
 import functools
 import hashlib
 import os
+import queue
 import re
 import subprocess
+import threading
 import time
 from contextvars import ContextVar
 from pathlib import Path
@@ -224,11 +226,13 @@ def configure_tracing(environ=None) -> dict:
 
 
 def flush(timeout: float = FLUSH_TIMEOUT_SECONDS):
-    """Sends the traces still queued, waiting at most `timeout` seconds. Never raises."""
+    """Sends the traces and feedback still queued, waiting at most `timeout` seconds. Never raises."""
     if _client is None:
         return
+    deadline = time.monotonic() + timeout
+    _wait_for_feedback(timeout)
     try:
-        _client.flush(timeout=timeout)
+        _client.flush(timeout=max(0.1, deadline - time.monotonic()))
     except Exception as e:
         print(f"[WARN] Couldn't send the last traces to LangSmith: {type(e).__name__}: {e}")
 
@@ -290,6 +294,70 @@ def ref_of(run) -> str | None:
     return str(run.trace_id).replace("-", "")[-8:]
 
 
+# --- Feedback scores (Section I) ---
+# extend_trace_retention=False, because LangSmith otherwise upgrades every trace that gets feedback
+# to its longer, paid retention, and these come on every answer. But the SDK batches feedback
+# with the traces only when that flag is True: with False, create_feedback is a blocking POST
+# /feedback with retries (found in Section I). So it's sent from one daemon thread of our own,
+# never from the request, with a bounded queue (LangSmith down must not grow memory on 512 MB).
+FEEDBACK_QUEUE_SIZE = 500
+FEEDBACK_ATTEMPTS = 3
+_feedback_queue: queue.Queue = queue.Queue(maxsize=FEEDBACK_QUEUE_SIZE)
+_feedback_thread: threading.Thread | None = None
+_feedback_lock = threading.Lock()
+_project_ids: dict[str, str] = {}
+
+
+def _project_id(name: str | None) -> str | None:
+    """The project's id, for session_id (feedback without it is deprecated by the SDK). Cached."""
+    if not name:
+        return None
+    if name not in _project_ids:
+        try:
+            _project_ids[name] = str(_client.read_project(project_name=name).id)
+        except Exception:
+            return None            # not created yet (the first trace creates it): try again next time
+    return _project_ids[name]
+
+
+def _send_feedback():
+    while True:
+        item = _feedback_queue.get()
+        try:
+            _client.create_feedback(**item, session_id=_project_id(item.pop("project", None)),
+                                    extend_trace_retention=False, stop_after_attempt=FEEDBACK_ATTEMPTS)
+        except Exception as e:
+            print(f"[WARN] Couldn't record feedback {item.get('key')}: {type(e).__name__}: {e}")
+        finally:
+            _feedback_queue.task_done()
+
+
+def _wait_for_feedback(timeout: float):
+    """Waits until the queued feedback is sent, at most `timeout` seconds."""
+    with _feedback_queue.all_tasks_done:
+        _feedback_queue.all_tasks_done.wait_for(lambda: _feedback_queue.unfinished_tasks == 0, timeout)
+
+
+def feedback(key: str, score, comment: str | None = None):
+    """
+    A feedback score on the current request's trace. Queued and sent in the background, so the
+    request never waits for it. No-op with tracing off or outside a traced request; never raises.
+    """
+    global _feedback_thread
+    run = get_current_run_tree()
+    if _client is None or run is None or not status["enabled"]:
+        return
+    with _feedback_lock:
+        if _feedback_thread is None:
+            _feedback_thread = threading.Thread(target=_send_feedback, name="langsmith-feedback", daemon=True)
+            _feedback_thread.start()
+    try:
+        _feedback_queue.put_nowait({"trace_id": run.trace_id, "key": key, "score": score, "comment": comment,
+                                    "project": run.session_name})
+    except queue.Full:
+        print(f"[WARN] Couldn't record feedback {key}: {FEEDBACK_QUEUE_SIZE} scores waiting (is LangSmith down?)")
+
+
 def current_trace() -> dict | None:
     """The current trace's id and ref, to link a request that joins work another one started."""
     run = get_current_run_tree()
@@ -329,7 +397,7 @@ _totals: ContextVar[dict | None] = ContextVar("request_totals", default=None)
 
 # Totals worth filtering or grouping by in LangSmith: copied onto the root as metadata too
 _TOTALS_AS_METADATA = ("answered_by", "cost_usd", "chat_calls", "chat_errors", "skipped_model",
-                       "prompt_version", "config_version")
+                       "prompt_version", "config_version", "check_score", "checks_failed")
 
 
 def add_totals(**amounts):
