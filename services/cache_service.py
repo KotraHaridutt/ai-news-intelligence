@@ -85,6 +85,10 @@ def answer_key(answer_id: str) -> str:
 def watch_key(watch_id: str) -> str:
     return f"{KEY_VERSION}:watch:{watch_id}"
 
+def usage_key(model: str, day: str) -> str:
+    """One model's Gemini usage on one day (feature 2 #33); day is the Pacific date, '2026-10-19'."""
+    return f"{KEY_VERSION}:usage:{model}:{day}"
+
 def ttl_with_jitter(base_ttl: int) -> int:
     return int(base_ttl * random.uniform(1 - TTL_JITTER, 1 + TTL_JITTER))
 
@@ -291,3 +295,38 @@ async def set_cached_vectors(model: str, texts: list[str], vectors):
         for text, vector in zip(texts, vectors)
     ]
     await _mset_with_ttl(items, EMB_TTL)
+
+
+# --- Daily Gemini usage (feature 2, #33) ---
+# A hash per model per day: attempts, answers, errors by kind, tokens. The day is Pacific time,
+# when Google resets the free quota. Kept 2 days. Like the cache, a Redis failure never fails a
+# request: the count is just missing for that call.
+USAGE_TTL = 2 * 24 * 60 * 60
+
+async def add_usage(model: str, day: str, counts: dict[str, int]) -> dict[str, int] | None:
+    """Adds `counts` to the model's day and returns the day's totals, or None without Redis."""
+    if not _redis_available() or not counts:
+        return None
+    key = usage_key(model, day)
+    try:
+        pipe = redis_client.pipeline(transaction=False)
+        for field, amount in counts.items():
+            pipe.hincrby(key, field, int(amount))
+        pipe.expire(key, USAGE_TTL)
+        pipe.hgetall(key)
+        totals = (await pipe.execute())[-1]
+        return {k.decode() if isinstance(k, bytes) else k: int(v) for k, v in totals.items()}
+    except Exception as e:
+        _on_redis_error("usage write", e)
+        return None
+
+async def get_usage(model: str, day: str) -> dict[str, int] | None:
+    """The model's totals for the day ({} if none yet), or None without Redis."""
+    if not _redis_available():
+        return None
+    try:
+        totals = await redis_client.hgetall(usage_key(model, day))
+        return {k.decode() if isinstance(k, bytes) else k: int(v) for k, v in totals.items()}
+    except Exception as e:
+        _on_redis_error("usage read", e)
+        return None

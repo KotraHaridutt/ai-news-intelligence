@@ -6,6 +6,7 @@ import os
 import re
 import subprocess
 import time
+from contextvars import ContextVar
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -319,6 +320,44 @@ def summarize(value, depth=0):
     return value
 
 
+# --- Request totals (Section D, #36) ---
+# One dict per request: chat calls, tokens, cost, embedding estimates, cache hits, the model that
+# answered. Set by request_span; work started inside the request (the build task, the model
+# callbacks) sees the same dict, because a task copies the context and the dict is shared. A
+# request that joins someone else's build adds nothing for it: that work is in the other trace.
+_totals: ContextVar[dict | None] = ContextVar("request_totals", default=None)
+
+# Totals worth filtering or grouping by in LangSmith: copied onto the root as metadata too
+_TOTALS_AS_METADATA = ("answered_by", "cost_usd", "chat_calls", "chat_errors", "skipped_model")
+
+
+def add_totals(**amounts):
+    """
+    Adds to the current request's totals: numbers are summed, anything else is set (e.g.
+    answered_by). Does nothing outside a request (scripts, tests calling services directly).
+    """
+    totals = _totals.get()
+    if totals is None:
+        return
+    for key, value in amounts.items():
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            totals[key] = round(totals.get(key, 0) + value, 8)
+        else:
+            totals[key] = value
+
+
+def current_totals() -> dict | None:
+    totals = _totals.get()
+    return dict(totals) if totals is not None else None
+
+
+def _record_totals(run, totals: dict):
+    if not totals:
+        return
+    run.add_outputs({"usage": dict(totals)})
+    run.add_metadata({key: totals[key] for key in _TOTALS_AS_METADATA if key in totals})
+
+
 def _request_inputs(kwargs: dict, view: str | None) -> tuple[dict, dict]:
     inputs, metadata = {}, {}
     req = kwargs.get("req")
@@ -368,24 +407,31 @@ def request_span(name: str, view: str | None = None):
         @functools.wraps(fn)
         async def wrapper(*args, **kwargs):
             inputs, metadata = _request_inputs(kwargs, view)
-            # LangSmith passes a span's tags and metadata down to the runs started inside it, so
-            # the view tag marks every run of that answer ("all report runs"); requests themselves
-            # are the root runs (no "request" tag: it would be on every run too)
-            async with span(name, inputs=inputs, metadata=metadata, tags=[view] if view else None) as run:
-                ref = ref_of(run)
-                if ref:
-                    run.add_metadata({"ref": ref})
-                started = time.perf_counter()
-                try:
-                    result = await fn(*args, **kwargs)
-                except BaseException as e:
-                    _record_failure(run, e)
-                    raise
-                if isinstance(result, dict) and result.get("watch_id") and "thread_id" not in metadata:
-                    run.add_metadata({"thread_id": short_hash(result["watch_id"])})
-                run.add_outputs({"status": 200, "seconds": round(time.perf_counter() - started, 2),
-                                 "response": summarize(result)})
-                return result
+            totals = {}
+            token = _totals.set(totals)
+            try:
+                # LangSmith passes a span's tags and metadata down to the runs started inside it, so
+                # the view tag marks every run of that answer ("all report runs"); requests themselves
+                # are the root runs (no "request" tag: it would be on every run too)
+                async with span(name, inputs=inputs, metadata=metadata, tags=[view] if view else None) as run:
+                    ref = ref_of(run)
+                    if ref:
+                        run.add_metadata({"ref": ref})
+                    started = time.perf_counter()
+                    try:
+                        result = await fn(*args, **kwargs)
+                    except BaseException as e:
+                        _record_failure(run, e)
+                        _record_totals(run, totals)
+                        raise
+                    if isinstance(result, dict) and result.get("watch_id") and "thread_id" not in metadata:
+                        run.add_metadata({"thread_id": short_hash(result["watch_id"])})
+                    run.add_outputs({"status": 200, "seconds": round(time.perf_counter() - started, 2),
+                                     "response": summarize(result)})
+                    _record_totals(run, totals)
+                    return result
+            finally:
+                _totals.reset(token)
         return wrapper
     return decorate
 

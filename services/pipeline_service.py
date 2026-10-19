@@ -146,12 +146,15 @@ async def _load_or_build(key: str, search_query: str):
         data = await _rebuild_from_cache(cached)
         if data is not None:
             observability.annotate(path="cache_hit")
+            observability.add_totals(articles_cache="hit")
             print(f"[INFO] Cache HIT for '{key}': index rebuilt in {time.time() - start_time:.2f}s")
             return data
         observability.annotate(path="cache_unusable_full_build")
+        observability.add_totals(articles_cache="unusable")
         print(f"[WARN] Cache entry for '{key}' couldn't be rebuilt. Running the full pipeline.")
     else:
         observability.annotate(path="cache_miss_full_build")
+        observability.add_totals(articles_cache="miss")
         print(f"[INFO] Cache MISS for '{key}'. Running the full pipeline.")
 
     if _build_slots.locked():
@@ -181,6 +184,7 @@ async def _attach_pages(articles):
         await cache_service.set_pages(scraped)
         pages.update(scraped)
     observability.annotate(urls=len(urls), from_cache=len(urls) - len(to_scrape), scraped=len(to_scrape), scrape_ok=len(scraped))
+    observability.add_totals(pages_from_cache=len(urls) - len(to_scrape), pages_scraped=len(to_scrape))
     print(f"[INFO] Pages: {len(urls)} URLs, {len(urls) - len(to_scrape)} from cache, "
           f"{len(to_scrape)} to scrape, {len(scraped)} succeeded.")
 

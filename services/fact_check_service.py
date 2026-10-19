@@ -35,18 +35,21 @@ class FactCheckAnswer(BaseModel):
     updates: list[UpdateAnswer] = Field(description="One entry per known story id")
 
 
-def _structured(model_name):
+def _structured(model_name, role="primary"):
     # Structured output per model, then the fallback: the fallback wrapper itself has no
     # with_structured_output (plan P7). Same thinking level, timeout and attempts as the views;
     # the retries wrap the structured model, because a retry wrapper has no with_structured_output
     # either. Only busy answers are retried: an answer that can't be parsed is not.
-    return rag._retrying(rag._chat_model(model_name).with_structured_output(FactCheckAnswer, method="json_schema"))
+    return rag._retrying(rag._chat_model(model_name, role).with_structured_output(FactCheckAnswer, method="json_schema"))
 
 try:
-    fact_check_llm = _structured(rag.CHAT_MODEL).with_fallbacks([_structured(rag.FALLBACK_CHAT_MODEL)])
+    fact_check_llm = _structured(rag.CHAT_MODEL).with_fallbacks([_structured(rag.FALLBACK_CHAT_MODEL, "fallback")])
+    # Used instead while the primary's daily quota is used up (feature 2 #34)
+    fact_check_fallback_only = _structured(rag.FALLBACK_CHAT_MODEL, "fallback")
 except Exception as e:
     print(f"[ERROR] Failed to load the fact-check model: {e}")
     fact_check_llm = None
+    fact_check_fallback_only = None
 
 
 UPDATE_PROMPT_TEMPLATE = """
@@ -191,8 +194,9 @@ async def run_fact_check(query, stories, known_stories, told) -> dict:
     async with observability.span("fact_check", inputs={"query": query, "stories": [s["id"] for s in stories]},
                                   metadata={"new": new_count, "known": len(stories) - new_count, "articles": articles,
                                             "chunks": excerpts, "prompt_chars": len(prompt)}, tags=["answer"]) as run:
+        model = rag.pick_chat_model(fact_check_llm, fact_check_fallback_only)
         try:
-            answer = await asyncio.wait_for(fact_check_llm.ainvoke(prompt, config={"run_name": "generate", "tags": ["update"]}),
+            answer = await asyncio.wait_for(model.ainvoke(prompt, config={"run_name": "generate", "tags": ["update"]}),
                                             rag.CHAT_DEADLINE_SECONDS)
             if not isinstance(answer, FactCheckAnswer):
                 raise OutputParserException(f"expected FactCheckAnswer, got {type(answer).__name__}")

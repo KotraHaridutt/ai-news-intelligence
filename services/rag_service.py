@@ -5,11 +5,10 @@ import random
 from datetime import date, datetime, timezone
 import numpy as np
 from dotenv import load_dotenv
-from google.genai import errors as genai_errors
 
 # observability sets up tracing (one client, redaction) for every model call made from here,
 # also when a script imports this module without server.py
-from services import cache_service, errors, observability  # noqa: F401
+from services import cache_service, errors, observability, usage  # noqa: F401
 from services.news_fetcher import has_enough_text
 
 # --- LangChain Imports ---
@@ -88,27 +87,25 @@ RETRIEVAL_SETTINGS = {
 CHAT_RETRYABLE_CODES = {408, 429, 500, 502, 503, 504}
 
 def _api_error_code(e):
-    """The Gemini API status code behind an exception, or None. LangChain raises its own
-    error *from* the SDK's APIError, so the cause chain is searched."""
-    for _ in range(5):
-        if e is None:
-            return None
-        if isinstance(e, genai_errors.APIError):
-            return e.code
-        e = e.__cause__ or e.__context__
-    return None
+    """The Gemini API status code behind an exception, or None (errors.api_error searches the
+    cause chain: LangChain raises its own error *from* the SDK's APIError)."""
+    api = errors.api_error(e)
+    return api.code if api is not None else None
 
 def _is_chat_retryable(e):
-    # A timeout isn't an APIError, so it isn't retried (see above)
-    return _api_error_code(e) in CHAT_RETRYABLE_CODES
+    # A timeout isn't an APIError, so it isn't retried (see above). Neither is a 429 for the
+    # daily quota: it can't pass before midnight Pacific, so it goes straight to the fallback.
+    return _api_error_code(e) in CHAT_RETRYABLE_CODES and not errors.is_daily_quota_error(e)
 
-def _chat_model(model_name):
-    """One chat model without retries (1 = no retries in this SDK; 0 would mean its default)."""
+def _chat_model(model_name, role="primary"):
+    """One chat model without retries (1 = no retries in this SDK; 0 would mean its default).
+    The usage callback sees every attempt: tokens, cost, the daily count, one log line (#31)."""
     return ChatGoogleGenerativeAI(
         model=model_name,
         thinking_level=THINKING_LEVEL,
         timeout=CHAT_TIMEOUT_SECONDS,
         max_retries=1,
+        callbacks=[usage.UsageHandler(role)],
     )
 
 def _retrying(runnable):
@@ -121,13 +118,34 @@ def _retrying(runnable):
 # The chat models retry through with_retry (see above).
 # The embeddings client has no retries, so embedding calls go through call_with_retry below.
 try:
-    llm = _retrying(_chat_model(CHAT_MODEL)).with_fallbacks([_retrying(_chat_model(FALLBACK_CHAT_MODEL))])
+    llm = _retrying(_chat_model(CHAT_MODEL)).with_fallbacks([_retrying(_chat_model(FALLBACK_CHAT_MODEL, "fallback"))])
+    # Used instead of llm while the primary's daily quota is used up (#34)
+    llm_fallback_only = _retrying(_chat_model(FALLBACK_CHAT_MODEL, "fallback"))
     embeddings_model = GoogleGenerativeAIEmbeddings(model=EMBEDDING_MODEL)
     print("[INFO] RAG models loaded successfully.")
 except Exception as e:
     print(f"[ERROR] Failed to load RAG models: {e}")
     llm = None
+    llm_fallback_only = None
     embeddings_model = None
+
+
+def pick_chat_model(full, fallback_only):
+    """
+    The chat runnable for this call (#34). While the primary model's daily quota is used up
+    (it answered a daily-limit 429 earlier today), the fallback is called directly: no wasted
+    request, no wait. While both are used up, the request is refused at once with when the
+    limit resets, instead of two failing calls.
+    """
+    primary_left = usage.exhausted(CHAT_MODEL)
+    if primary_left is None:
+        return full
+    fallback_left = usage.exhausted(FALLBACK_CHAT_MODEL)
+    if fallback_left is not None:
+        raise errors.ai_daily_limit(min(primary_left, fallback_left), "daily quota used up on both chat models")
+    observability.annotate(skipped_model=CHAT_MODEL, skipped_for_s=primary_left)
+    observability.add_totals(skipped_model=CHAT_MODEL)
+    return fallback_only
 
 # PROMPTS
 REPORT_PROMPT_TEMPLATE = """
@@ -253,7 +271,8 @@ RETRY_BASE_DELAY = 2.0        # seconds: ~2, 4, 8 between attempts, plus up to 1
 RETRYABLE_CODES = {429, 500, 502, 503, 504}
 
 def _is_retryable(e):
-    return _api_error_code(e) in RETRYABLE_CODES
+    # A daily-quota 429 can't pass before midnight Pacific: not retried
+    return _api_error_code(e) in RETRYABLE_CODES and not errors.is_daily_quota_error(e)
 
 def _embedding_inputs(args, kwargs):
     """What an embedding attempt records: how many texts and characters, or the query itself."""
@@ -273,15 +292,22 @@ async def call_with_retry(label, fn, *args, **kwargs):
     Each attempt is its own traced run (#21): a retried call shows every try, its error and
     the wait before it, instead of one slow call.
     """
+    first = args[0] if args else None
+    texts = [first] if isinstance(first, str) else list(first or [])
+    characters = sum(len(t) for t in texts)
     waited = 0.0
     for attempt in range(RETRY_ATTEMPTS + 1):
         try:
             tags = [f"retry:attempt:{attempt + 1}"] if attempt else None
             async with observability.span(EMBEDDING_MODEL, run_type="embedding", inputs=_embedding_inputs(args, kwargs),
-                                          metadata={"label": label, "attempt": attempt + 1, "waited_before_s": round(waited, 1)},
+                                          metadata={"label": label, "attempt": attempt + 1, "waited_before_s": round(waited, 1),
+                                                    "estimated_tokens": usage.estimate_tokens(characters)},
                                           tags=tags):
-                return await fn(*args, **kwargs)
+                result = await fn(*args, **kwargs)
+            usage.record_embedding(EMBEDDING_MODEL, characters, len(texts))
+            return result
         except Exception as e:
+            usage.record_embedding(EMBEDDING_MODEL, characters, len(texts), error=e)
             if attempt == RETRY_ATTEMPTS or not _is_retryable(e):
                 raise
             waited = RETRY_BASE_DELAY * 2 ** attempt + random.uniform(0, 1)
@@ -317,7 +343,8 @@ async def get_vectors(texts):
         raise RuntimeError("Embeddings model not loaded.")
 
     vectors = await cache_service.get_cached_vectors(EMB_CACHE_MODEL, texts)
-    cache_hits = sum(v is not None for v in vectors)
+    cached_flags = [v is not None for v in vectors]
+    cache_hits = sum(cached_flags)
 
     # Wire copies often have identical text, so embed each distinct missing text once
     missing_texts = list(dict.fromkeys(t for t, v in zip(texts, vectors) if v is None))
@@ -333,7 +360,11 @@ async def get_vectors(texts):
         vectors = [v if v is not None else embedded[t] for t, v in zip(texts, vectors)]
 
     duplicates = len(texts) - cache_hits - len(missing_texts)
-    observability.annotate(from_cache=cache_hits, embedded=len(missing_texts), duplicates=duplicates)
+    # Tokens the cache saved (#35): the texts read from Redis instead of being embedded
+    saved = usage.estimate_tokens(sum(len(t) for t, v in zip(texts, cached_flags) if v))
+    observability.annotate(from_cache=cache_hits, embedded=len(missing_texts), duplicates=duplicates,
+                           estimated_tokens_saved=saved)
+    observability.add_totals(vectors_from_cache=cache_hits, embedding_tokens_saved_est=saved)
     print(f"[INFO] Vectors: {len(texts)} texts, {cache_hits} from cache, {len(missing_texts)} embedded, {duplicates} duplicates.")
     return vectors
 
@@ -565,7 +596,6 @@ async def run_rag_query_with_store(query, vector_store, prompt_type):
         raise ValueError(f"Unknown prompt type: {prompt_type!r}")
 
     prompt = PromptTemplate(template=prompt_template, input_variables=["context", "input"])
-    qa_chain = create_stuff_documents_chain(llm, prompt, document_prompt=DOCUMENT_PROMPT)
 
     async def retrieve_and_answer():
         documents = await _retrieve(vector_store, query, prompt_type)
@@ -582,6 +612,8 @@ async def run_rag_query_with_store(query, vector_store, prompt_type):
     async with observability.span(prompt_type, inputs={"query": query, "view": prompt_type},
                                   metadata={"chat_model": CHAT_MODEL, "fallback_model": FALLBACK_CHAT_MODEL,
                                             "deadline_s": CHAT_DEADLINE_SECONDS}, tags=["answer"]) as run:
+        # Raises "today's AI limit" (503) at once when both models' daily quota is used up (#34)
+        qa_chain = create_stuff_documents_chain(pick_chat_model(llm, llm_fallback_only), prompt, document_prompt=DOCUMENT_PROMPT)
         try:
             # One deadline for retrieval and the answer, as before
             documents, answer = await asyncio.wait_for(retrieve_and_answer(), CHAT_DEADLINE_SECONDS)

@@ -16,3 +16,4 @@ langchain_text_splitters
 faiss-cpu
 redis
 langsmith
+tzdata

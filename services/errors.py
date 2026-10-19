@@ -1,4 +1,5 @@
 import asyncio
+import re
 import httpx
 from google.genai import errors as genai_errors
 
@@ -89,11 +90,50 @@ AI_NOT_CONFIGURED = "The AI service isn't set up correctly on the server. Please
 BUSY_CODES = {429, 500, 502, 503}
 CONFIG_CODES = {401, 403, 404}   # bad key, no permission, unknown model name
 
+# The free tier allows a fixed number of requests per model per day (20 chat calls). When they're
+# used up, Gemini answers 429 with quotaId "GenerateRequestsPerDayPerProjectPerModel-FreeTier" and
+# a retryDelay until the reset (midnight Pacific time), e.g. "retryDelay': '27370s'" (seen
+# 2026-10-11). A per-minute 429 says "PerMinute" instead and passes in seconds.
+_DAILY_QUOTA = re.compile(r"PerDay", re.IGNORECASE)
+_RETRY_DELAY = re.compile(r"retryDelay'?\"?:\s*'?\"?(\d+)s")
+
+def api_error(e):
+    """The SDK's APIError behind an exception (LangChain raises its own error *from* it), or None."""
+    for _ in range(6):
+        if e is None:
+            return None
+        if isinstance(e, genai_errors.APIError):
+            return e
+        e = e.__cause__ or e.__context__
+    return None
+
+def is_daily_quota_error(e) -> bool:
+    """A 429 because today's free requests for this model are used up (not a per-minute limit)."""
+    api = api_error(e)
+    return api is not None and api.code == 429 and bool(_DAILY_QUOTA.search(str(api)))
+
+def retry_after_seconds(e) -> int | None:
+    """The retryDelay Gemini sends with a quota error: seconds until it would accept requests again."""
+    api = api_error(e)
+    match = _RETRY_DELAY.search(str(api)) if api is not None else None
+    return int(match.group(1)) if match else None
+
+def _until_text(seconds) -> str:
+    """' (in about 7 hours)', ' (in about 40 minutes)', or '' when unknown."""
+    if not seconds:
+        return ""
+    if seconds >= 3600:
+        hours = round(seconds / 3600)
+        return f" (in about {hours} hour{'s' if hours != 1 else ''})"
+    return f" (in about {max(1, round(seconds / 60))} minutes)"
+
 def gemini_failure_kind(e: Exception) -> str:
     """
-    'config', 'busy', 'timeout' or 'other' for a failed Gemini call. LangChain wraps the
-    SDK's errors, so the cause chain is searched (as rag_service._is_retryable does).
+    'config', 'daily_limit', 'busy', 'timeout' or 'other' for a failed Gemini call. LangChain
+    wraps the SDK's errors, so the cause chain is searched (as rag_service._api_error_code does).
     """
+    if is_daily_quota_error(e):
+        return "daily_limit"
     for _ in range(6):
         if e is None:
             break
@@ -115,11 +155,18 @@ def gemini_failure_kind(e: Exception) -> str:
 def ai_not_configured(log=""):
     return AppError(500, AI_NOT_CONFIGURED, log)
 
+def ai_daily_limit(seconds_left=None, log=""):
+    """Today's free Gemini requests are used up (feature 2 #34): no point retrying for hours."""
+    return AppError(503, "Today's free AI limit has been reached. It resets at midnight Pacific time"
+                         f"{_until_text(seconds_left)}. Please try again then.", log)
+
 def analysis_failed(e: Exception):
     """Embedding the articles (building the index) failed."""
     kind, log = gemini_failure_kind(e), f"embedding failed: {type(e).__name__}: {e}"
     if kind == "config":
         return ai_not_configured(log)
+    if kind == "daily_limit":
+        return ai_daily_limit(retry_after_seconds(e), log)
     if kind == "busy":
         return AppError(503, "Couldn't analyze the articles right now because the AI service is busy. "
                              "Please try again in a minute.", log)
@@ -137,6 +184,8 @@ def report_failed(e: Exception, prompt_type: str):
     kind, log = gemini_failure_kind(e), f"{prompt_type} generation failed: {type(e).__name__}: {e}"
     if kind == "config":
         return ai_not_configured(log)
+    if kind == "daily_limit":
+        return ai_daily_limit(retry_after_seconds(e), log)
     if kind == "busy":
         return AppError(503, f"The AI service is busy right now, so the {name} couldn't be written. "
                              "Please try again in a minute.", log)
