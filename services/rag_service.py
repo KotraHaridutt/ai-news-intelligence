@@ -7,7 +7,9 @@ import numpy as np
 from dotenv import load_dotenv
 from google.genai import errors as genai_errors
 
-from services import cache_service, errors
+# observability sets up tracing (one client, redaction) for every model call made from here,
+# also when a script imports this module without server.py
+from services import cache_service, errors, observability  # noqa: F401
 from services.news_fetcher import has_enough_text
 
 # --- LangChain Imports ---

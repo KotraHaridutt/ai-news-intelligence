@@ -10,3 +10,12 @@ services:
         value: 3.12.1
       - key: REDIS_URL
         sync: false
+      # LangSmith tracing (feature 2). Without LANGSMITH_API_KEY tracing stays off.
+      - key: LANGSMITH_API_KEY
+        sync: false
+      - key: LANGSMITH_TRACING
+        value: "true"
+      - key: LANGSMITH_PROJECT
+        value: ai-news-prod
+      - key: APP_ENV
+        value: prod

@@ -6,6 +6,8 @@ for _stream in (sys.stdout, sys.stderr):
     if hasattr(_stream, "reconfigure"):
         _stream.reconfigure(errors="backslashreplace")
 
+import asyncio
+from contextlib import asynccontextmanager
 from pathlib import Path
 from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
@@ -17,6 +19,8 @@ import time
 import markdown2
 
 # --- Our Services ---
+# observability first: it decides whether traces are sent before any model is called
+from services import observability
 from services import cache_service, errors, follow_service
 from services.errors import AppError
 from services.pipeline_service import get_pipeline_data, build_time
@@ -24,7 +28,14 @@ from services.rag_service import run_rag_query_with_store
 
 BASE_DIR = Path(__file__).resolve().parent
 
-app = FastAPI(title="AI News Intelligence API")
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    yield
+    # Shutdown: send the traces still queued. Render's free plan stops an idle app, and
+    # traces queued at that moment would be lost. Waits at most 5 s; never raises.
+    await asyncio.to_thread(observability.shutdown)
+
+app = FastAPI(title="AI News Intelligence API", lifespan=lifespan)
 
 # Setup templates and static files
 templates = Jinja2Templates(directory=str(BASE_DIR / "templates"))
