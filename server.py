@@ -103,8 +103,10 @@ async def remember_answer(query: str, view: str, text: str, built_at) -> str | N
     said as "already told" (feature 1). The page gets the id and sends it back on Follow; ids,
     not the topic, so two people reading the same topic never get each other's answer.
     Returns None if it couldn't be saved (no Redis, or a failed write): the answer is still
-    shown, it just can't be followed.
+    shown, it just can't be followed. The record also keeps which model, prompt version and
+    settings wrote it (feature 2 #40), from this request's totals.
     """
+    totals = observability.current_totals() or {}
     answer_id = cache_service.new_id()
     saved = await cache_service.set_answer(answer_id, {
         "query": cache_service.normalize_query(query),
@@ -112,6 +114,7 @@ async def remember_answer(query: str, view: str, text: str, built_at) -> str | N
         "text": text,
         "built_at": built_at,
         "created_at": build_time(),
+        **{key: totals[key] for key in ("answered_by", "prompt_version", "config_version") if key in totals},
     })
     return answer_id if saved else None
 
