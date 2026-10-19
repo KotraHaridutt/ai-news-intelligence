@@ -1,9 +1,9 @@
 """
 Feature 2, Section G (#56): is the judge right often enough to be trusted?
 
-  python evals/calibrate.py prepare   build the calibration set (5 chat calls: new answers from frozen contexts)
-  python evals/calibrate.py judge     run the judges on it (9 chat calls), save their verdicts
-  python evals/calibrate.py score     compare the verdicts with the labels (no calls; rerun after reviewing)
+  .local/venv/Scripts/python.exe evals/calibrate.py prepare   build the calibration set (5 chat calls: new answers from frozen contexts)
+  .local/venv/Scripts/python.exe evals/calibrate.py judge     run the judges on it (9 chat calls), save their verdicts
+  .local/venv/Scripts/python.exe evals/calibrate.py score     compare the verdicts with the labels (no calls; rerun after reviewing)
 
 The set: 7 answers (2 real answers from gap 4, 5 new ones from Section F's frozen contexts: a report,
 a timeline, two contradictions, and one on the injection context) and the two real fact checks

@@ -2,8 +2,8 @@
 Feature 2, Section F (#45-#48): freezes the evaluation data locally, so every later step (labels,
 datasets, experiments) works on exactly the same articles, chunks and retrieval results.
 
-  python evals/prepare_data.py                 everything
-  python evals/prepare_data.py --only topics   or: fact_check, injection
+  .local/venv/Scripts/python.exe evals/prepare_data.py                 everything
+  .local/venv/Scripts/python.exe evals/prepare_data.py --only topics   or: fact_check, injection
 
 Writes to .local/evals/ (git-ignored: it holds scraped article text, #50):
   topics/<slug>.json          the articles (with text), their chunks, and what retrieval picks per view

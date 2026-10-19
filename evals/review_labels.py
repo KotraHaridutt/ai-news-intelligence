@@ -1,8 +1,8 @@
 """
 Feature 2, Section F: review the proposed evaluation labels in the browser and save your version.
 
-  python evals/review_labels.py            opens http://127.0.0.1:8765
-  python evals/review_labels.py --port 9000 --no-browser
+  .local/venv/Scripts/python.exe evals/review_labels.py            opens http://127.0.0.1:8765
+  .local/venv/Scripts/python.exe evals/review_labels.py --port 9000 --no-browser
 
 One page, two parts:
   Retrieval    per topic, every chunk: grade 2 (belongs in an answer) / 1 (useful background) /

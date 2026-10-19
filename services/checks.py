@@ -154,16 +154,28 @@ def check_fact_check(answer, sent_ids) -> dict:
                    missing=sorted(sent - set(given)), duplicates=duplicates, unknown=sorted(set(given) - sent))
 
 
-def check_retrieval(documents, k: int = 10, cap: int = 3) -> dict:
-    """What retrieval picked: at most `cap` chunks per story (the cap is soft: it may be exceeded when
-    the other stories can't fill k), and how many stories the chunks cover."""
+def check_retrieval(documents, k: int = 10, cap: int = 3, index=None) -> dict:
+    """
+    What retrieval picked: at most `cap` chunks per story (the cap is soft: it may be exceeded when
+    the stories can't fill k under it), and how many stories the chunks cover. `index`: every chunk
+    of the index (documents or metadata dicts), when known: then going over the cap is allowed
+    exactly when the index's stories can't give k chunks at `cap` each. Without it, only when the
+    retrieved stories x cap < k (Section H: with k=15, OpenAI's index could give 14, Tesla's 9).
+    """
     story = lambda m: ("theme", m.get("theme_id")) if m.get("theme_id", -1) != -1 else ("article", m.get("source"))
+    meta = lambda doc: getattr(doc, "metadata", doc)
     per_story = {}
     for doc in documents:
-        meta = getattr(doc, "metadata", doc)
-        per_story[story(meta)] = per_story.get(story(meta), 0) + 1
+        per_story[story(meta(doc))] = per_story.get(story(meta(doc)), 0) + 1
     over = {str(s): n for s, n in per_story.items() if n > cap}
-    soft_ok = not over or len(per_story) * cap < k            # only over when there weren't enough stories
+    if index is not None:
+        available = {}
+        for doc in index:
+            available[story(meta(doc))] = available.get(story(meta(doc)), 0) + 1
+        fillable = sum(min(cap, n) for n in available.values())
+    else:
+        fillable = len(per_story) * cap
+    soft_ok = not over or fillable < k              # over the cap only when the cap couldn't fill k
     return _result({"k_chunks": len(documents) == k or len(documents) < k and not over, "story_cap": soft_ok},
                    chunks=len(documents), stories=len(per_story), max_per_story=max(per_story.values()) if per_story else 0)
 

@@ -2,9 +2,9 @@
 Mirrors the app's prompts (services/prompts.py) to the LangSmith Prompt Hub (feature 2, #41).
 Run it by hand after changing a prompt:
 
-  python scripts/push_prompts.py              push the prompts whose text changed
-  python scripts/push_prompts.py --dry-run    only show what would be pushed
-  python scripts/push_prompts.py --tag prod   also point the "prod" tag at the current versions,
+  .local/venv/Scripts/python.exe scripts/push_prompts.py              push the prompts whose text changed
+  .local/venv/Scripts/python.exe scripts/push_prompts.py --dry-run    only show what would be pushed
+  .local/venv/Scripts/python.exe scripts/push_prompts.py --tag prod   also point the "prod" tag at the current versions,
                                               which is what PROMPT_SOURCE=hub:prod loads
 
 Each prompt is "ai-news-<name>" (private). Each commit is tagged "v-<version>" and described with

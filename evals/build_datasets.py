@@ -2,8 +2,8 @@
 Feature 2, Section F (#45-#49): creates or updates the four LangSmith datasets from the frozen data
 and labels in .local/evals/ (see prepare_data.py and review_labels.py).
 
-  python evals/build_datasets.py             upload (only what changed)
-  python evals/build_datasets.py --dry-run   show what would change
+  .local/venv/Scripts/python.exe evals/build_datasets.py             upload (only what changed)
+  .local/venv/Scripts/python.exe evals/build_datasets.py --dry-run   show what would change
 
   ai-news-retrieval    topic x view: which chunks belong in an answer (grades 0/1/2, dated chunks)
   ai-news-answers      topic x view: the frozen context the model gets, and the grades of its chunks
