@@ -55,15 +55,41 @@ def payload() -> dict:
                                                       "published_at": a.get("published_at"), "excerpt": _excerpt(a.get("full_text"))}
                                                      for a in s["articles"]]} for s in case["stories"]],
                            "labels": (labels or {}).get("stories", {})})
-    return {"retrieval": retrieval, "fact_check": fact_check}
+    judge = []
+    items_path = data.EVALS / "calibration" / "items.json"
+    for item in (json.loads(items_path.read_text(encoding="utf-8")) if items_path.exists() else []):
+        labels, status = data.labels("judge", item["id"])
+        if item["kind"] == "answer":
+            evidence = "\n\n".join(f"[{c.get('source_name')} | {c.get('published_at')}] {c.get('title')}\n{c.get('page_content')}" for c in item["context"])
+            units = item["units"]
+        else:
+            evidence = "ALREADY TOLD:\n" + item["told"]
+            units = [f"({u['story_id']}) {u['text']}" for u in item["units"]]
+        judge.append({"slug": item["id"], "query": item["query"], "kind": item["kind"], "view": item.get("view"), "status": status,
+                      "evidence": evidence, "units": units, "labels": (labels or {}).get("units", {})})
+    return {"retrieval": retrieval, "fact_check": fact_check, "judge": judge}
 
 
 def _valid(kind: str, slug: str, body: dict) -> str | None:
     """Why a save is refused, or None. Only known topics, only the expected shape."""
     known = {"retrieval": {t["slug"]: {c["id"] for c in t["chunks"]} for t in data.topics()},
              "fact_check": {c["slug"]: {s["id"] for s in c["stories"]} for c in data.fact_check_cases()}}
+    items_path = data.EVALS / "calibration" / "items.json"
+    calibration = json.loads(items_path.read_text(encoding="utf-8")) if items_path.exists() else []
+    known["judge"] = {i["id"]: {str(n) for n in range(1, len(i["units"]) + 1)} for i in calibration}
+    kinds = {i["id"]: i["kind"] for i in calibration}
     if kind not in known or slug not in known[kind]:
         return "unknown topic"
+    if kind == "judge":
+        units = body.get("units")
+        if not isinstance(units, dict) or set(units) != known[kind][slug]:
+            return "every unit must be labelled, and nothing else"
+        fields = ("factual", "supported", "outlet_correct", "disagreement", "disagreement_real") if kinds[slug] == "answer" \
+            else ("factual", "already_told", "supported")
+        for unit in units.values():
+            if not isinstance(unit.get("factual"), bool) or any(unit.get(k) not in (True, False, None) for k in fields):
+                return "each unit needs factual true/false and the other fields true, false or empty"
+        return None
     items = body.get("chunks" if kind == "retrieval" else "stories")
     if not isinstance(items, dict) or set(items) != known[kind][slug]:
         return "every item of the topic must be labelled, and nothing else"
@@ -142,12 +168,38 @@ const el = (tag, cls, text) => { const e = document.createElement(tag); if (cls)
 async function load() { D = await (await fetch("/api/data")).json(); nav(); show(D.retrieval[0] ? ["retrieval", 0] : ["fact_check", 0]); }
 function nav() {
   const n = document.getElementById("nav"); n.innerHTML = "";
-  for (const [kind, list] of [["retrieval", D.retrieval], ["fact_check", D.fact_check]]) list.forEach((t, i) => {
-    const b = el("button", current && current[0] === kind && current[1] === i ? "on" : "", (kind === "retrieval" ? "Chunks: " : "Fact check: ") + t.slug + (t.status === "reviewed" ? " ✓" : ""));
+  const names = { retrieval: "Chunks: ", fact_check: "Fact check: ", judge: "Judge: " };
+  for (const [kind, list] of [["retrieval", D.retrieval], ["fact_check", D.fact_check], ["judge", D.judge]]) list.forEach((t, i) => {
+    const b = el("button", current && current[0] === kind && current[1] === i ? "on" : "", names[kind] + t.slug + (t.status === "reviewed" ? " ✓" : ""));
     b.onclick = () => show([kind, i]); n.appendChild(b);
   });
 }
-function show(sel) { current = sel; nav(); const [kind, i] = sel; (kind === "retrieval" ? showRetrieval : showFact)(D[kind][i]); }
+function show(sel) { current = sel; nav(); const [kind, i] = sel; ({ retrieval: showRetrieval, fact_check: showFact, judge: showJudge })[kind](D[kind][i]); }
+function tri(name, value, onchange) {
+  const s = el("select"); for (const [v, t] of [["", "–"], ["true", "yes"], ["false", "no"]]) { const o = el("option", null, t); o.value = v; s.appendChild(o); }
+  s.value = value === true ? "true" : value === false ? "false" : ""; s.title = name;
+  s.onchange = () => onchange(s.value === "" ? null : s.value === "true"); return s;
+}
+function showJudge(t) {
+  const v = document.getElementById("view"); v.innerHTML = "";
+  v.appendChild(el("h2", null, `${t.slug}: ${t.units.length} units (${t.status})`));
+  v.appendChild(el("p", "muted", t.kind === "answer"
+    ? "Per unit, what a careful fact-checker would answer: factual (states a fact about the news) · supported (every fact is in the excerpts) · outlet correct (if it names an outlet: that outlet's excerpt says it) · disagreement / real (contradictions answers)."
+    : "Per unit of the text the fact check showed: factual · already told (the reader was told this, even in other words) · supported (its story's excerpts say it)."));
+  const ev = el("details", "card"); ev.appendChild(el("summary", null, "The excerpts / what was told")); ev.appendChild(el("pre", null, t.evidence)); v.appendChild(ev);
+  const original = JSON.parse(JSON.stringify(t.labels)); const out = JSON.parse(JSON.stringify(t.labels));
+  const fields = t.kind === "answer" ? ["factual", "supported", "outlet_correct", "disagreement", "disagreement_real"] : ["factual", "already_told", "supported"];
+  t.units.forEach((text, n) => {
+    const id = String(n + 1); const lab = out[id] || (out[id] = { factual: true });
+    const card = el("div", "card"); const mark = () => card.classList.toggle("changed", JSON.stringify(out[id]) !== JSON.stringify(original[id]));
+    card.appendChild(el("div", null, `[${id}] ${text}`));
+    const row = el("div", "row");
+    for (const f of fields) { const l = el("label", "muted", f.replace("_", " ") + " "); l.appendChild(tri(f, lab[f], val => { lab[f] = val; mark(); })); row.appendChild(l); }
+    if (lab.reason) row.appendChild(el("span", "reason", lab.reason));
+    card.appendChild(row); v.appendChild(card);
+  });
+  v.appendChild(saveBar("judge", t, () => ({ units: Object.fromEntries(Object.entries(out).map(([k, x]) => [k, Object.fromEntries(fields.map(f => [f, f === "factual" ? !!x[f] : (x[f] ?? null)]))])) })));
+}
 function radio(name, value, checked, text, onchange) {
   const l = el("label"); const r = el("input"); r.type = "radio"; r.name = name; r.value = value; r.checked = checked; r.onchange = onchange; l.append(r, " " + text); return l;
 }
@@ -199,7 +251,7 @@ function saveBar(kind, t, labels) {
       const r = await fetch("/api/save", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ kind, slug: t.slug, labels: labels() }) });
       const j = await r.json();
       if (!r.ok) { st.textContent = "Not saved: " + (j.error || r.status); return; }
-      t.status = "reviewed"; t.labels = labels()[kind === "retrieval" ? "chunks" : "stories"]; st.textContent = "Saved ✓ " + j.saved; nav();
+      t.status = "reviewed"; t.labels = labels()[{ retrieval: "chunks", fact_check: "stories", judge: "units" }[kind]]; st.textContent = "Saved ✓ " + j.saved; nav();
     } catch (e) { st.textContent = "Not saved: the review server isn't running."; }
   };
   bar.append(b, st); return bar;

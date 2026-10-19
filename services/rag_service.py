@@ -84,8 +84,11 @@ RETRIEVAL_SETTINGS = {
     "contradictions": {"search": "mmr", "lambda_mult": 0.5},
 }
 
-# The busy answers worth another attempt: the Google SDK's own list (408 included)
-CHAT_RETRYABLE_CODES = {408, 429, 500, 502, 503, 504}
+# The busy answers worth another attempt: the Google SDK's own list (408 included), except 504.
+# The SDK sends our timeout to Google, and Gemini answers 504 DEADLINE_EXCEEDED when it runs out
+# (seen 2026-10-19: every attempt "504 after 44 s"). That is a timeout, so it goes straight to the
+# fallback like one; retrying it used the rest of the 75 s deadline and the fallback never ran.
+CHAT_RETRYABLE_CODES = {408, 429, 500, 502, 503}
 
 def _api_error_code(e):
     """The Gemini API status code behind an exception, or None (errors.api_error searches the

@@ -135,6 +135,14 @@ async def drain():
         await asyncio.gather(*list(_pending), return_exceptions=True)
 
 
+async def _count(model: str, counts: dict):
+    """Adds to the day's counter without a log line (an attempt being sent)."""
+    try:
+        await cache_service.add_usage(model, quota_day(), counts)
+    except Exception as e:
+        print(f"[WARN] Couldn't count Gemini usage: {type(e).__name__}: {e}")
+
+
 async def _count_and_log(model: str, counts: dict, line: str, chat: bool):
     try:
         totals = await cache_service.add_usage(model, quota_day(), counts)
@@ -180,7 +188,12 @@ class UsageHandler(AsyncCallbackHandler):
     async def on_chat_model_start(self, serialized, messages, *, run_id, tags=None, metadata=None, **kwargs):
         model = (metadata or {}).get("ls_model_name") or ((serialized or {}).get("kwargs") or {}).get("model") or "?"
         view = next((tag for tag in (tags or []) if tag in VIEWS), "chat")
-        self._started[run_id] = (time.perf_counter(), str(model).removeprefix("models/"), view)
+        model = str(model).removeprefix("models/")
+        self._started[run_id] = (time.perf_counter(), model, view)
+        # Counted when it's sent, not when it ends: an attempt the 75 s deadline cuts off never
+        # ends normally (no on_llm_end / on_llm_error), but Google has received it (Section G)
+        observability.add_totals(chat_calls=1)
+        _background(_count(model, {"attempts": 1}))
 
     async def on_llm_end(self, response, *, run_id, **kwargs):
         started, model, view = self._started.pop(run_id, (time.perf_counter(), "?", "chat"))
@@ -194,12 +207,12 @@ class UsageHandler(AsyncCallbackHandler):
         input_tokens, output_tokens = usage.get("input_tokens", 0), usage.get("output_tokens", 0)
         thinking = (usage.get("output_token_details") or {}).get("reasoning", 0)
         cost = cost_usd(model, input_tokens, output_tokens)
-        observability.add_totals(chat_calls=1, input_tokens=input_tokens, output_tokens=output_tokens,
+        observability.add_totals(input_tokens=input_tokens, output_tokens=output_tokens,
                                  thinking_tokens=thinking, cost_usd=cost or 0, answered_by=answered)
         line = (f"[INFO] LLM {view}: {answered} in {input_tokens:,} · thinking {thinking:,} · out {output_tokens:,} tokens, "
                 f"{seconds:.1f} s, " + (f"~${cost:.4f}" if cost is not None else "price unknown")
                 + f", fallback {'yes' if self.role == 'fallback' else 'no'}")
-        _background(_count_and_log(model, {"attempts": 1, "ok": 1, "input_tokens": input_tokens,
+        _background(_count_and_log(model, {"ok": 1, "input_tokens": input_tokens,
                                            "output_tokens": output_tokens, "thinking_tokens": thinking}, line, chat=True))
 
     async def on_llm_error(self, error, *, run_id, **kwargs):
@@ -207,9 +220,9 @@ class UsageHandler(AsyncCallbackHandler):
         kind = _error_kind(error)
         if kind == "daily_limit":
             mark_exhausted(model, errors.retry_after_seconds(error))
-        observability.add_totals(chat_calls=1, chat_errors=1)
+        observability.add_totals(chat_errors=1)
         line = f"[WARN] LLM {view}: {model} attempt failed ({kind}) after {time.perf_counter() - started:.1f} s"
-        _background(_count_and_log(model, {"attempts": 1, kind: 1}, line, chat=True))
+        _background(_count_and_log(model, {kind: 1}, line, chat=True))
 
 
 # --- Embedding calls (#35) ---
