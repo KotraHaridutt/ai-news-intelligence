@@ -41,9 +41,15 @@ EMB_QUERY_CACHE_MODEL = f"{EMBEDDING_MODEL}:{QUERY_TASK_TYPE}"
 # - thinking_level="low": the task is writing from the retrieved context, not multi-step
 #   reasoning, and the default ("high") adds reasoning tokens and latency.
 # - Timeout + fallback: a new model can be overloaded (measured: 503 "high demand", one call
-#   took 89 s, another 190 s). Each attempt is cut off after CHAT_TIMEOUT_SECONDS; the Google SDK
-#   retries 429/5xx and timeouts (CHAT_ATTEMPTS attempts per model), and if the primary model
-#   still fails, the request falls back to a stable older Flash model.
+#   took 89 s, another 190 s). Each attempt is cut off after CHAT_TIMEOUT_SECONDS. A busy answer
+#   (408, 429, 5xx) is retried (CHAT_ATTEMPTS attempts per model); a timed-out attempt is not:
+#   another 45 s on the same slow model can't finish inside the deadline, so it goes straight
+#   to the fallback, a stable older Flash model. (Before feature 2 the Google SDK did the
+#   retries, and the comment here said timeouts were retried; they never were: the SDK's async
+#   path uses aiohttp and its retry rule only knows httpx timeouts. Feature 2, Section A1.)
+# - The retries are LangChain's with_retry, not the SDK's: each attempt is then its own traced
+#   run (tag retry:attempt:2), so a retried 429 shows up, and is counted, instead of looking
+#   like one slow call. The SDK is set to 1 attempt, its "no retries" value.
 # GEMINI_CHAT_MODEL / GEMINI_FALLBACK_MODEL override the models without a code change
 # (thinking_level needs Gemini 3+).
 CHAT_MODEL = os.getenv("GEMINI_CHAT_MODEL", "gemini-3.8-flash")
@@ -51,10 +57,10 @@ FALLBACK_CHAT_MODEL = os.getenv("GEMINI_FALLBACK_MODEL", "gemini-3.6-flash")
 THINKING_LEVEL = "low"
 CHAT_TIMEOUT_SECONDS = 45     # per attempt (normal answers take ~10-30 s)
 CHAT_ATTEMPTS = 2             # per model, including the first try
-# Deadline for the whole answer step (retrieval + every attempt on both models). Without it
-# the worst case is ~2 models x 2 attempts x 45 s = 3 min, longer than the page waits (120 s),
-# so the user would see "took too long" instead of the real reason. A fast failure such as a
-# 429 still falls back within seconds; a model that hangs uses up the deadline.
+# Deadline for the whole answer step (retrieval + every attempt on both models). Without it a
+# primary that times out (45 s) and a slow fallback could together outlast the page's 120 s,
+# and the user would see "took too long" from the page instead of the real reason. A fast
+# failure such as a 429 still falls back within seconds; a model that hangs uses up the deadline.
 CHAT_DEADLINE_SECONDS = 75
 
 # --- Retrieval (gap_4 Section D) ---
@@ -78,19 +84,44 @@ RETRIEVAL_SETTINGS = {
     "contradictions": {"search": "mmr", "lambda_mult": 0.5},
 }
 
+# The busy answers worth another attempt: the Google SDK's own list (408 included)
+CHAT_RETRYABLE_CODES = {408, 429, 500, 502, 503, 504}
+
+def _api_error_code(e):
+    """The Gemini API status code behind an exception, or None. LangChain raises its own
+    error *from* the SDK's APIError, so the cause chain is searched."""
+    for _ in range(5):
+        if e is None:
+            return None
+        if isinstance(e, genai_errors.APIError):
+            return e.code
+        e = e.__cause__ or e.__context__
+    return None
+
+def _is_chat_retryable(e):
+    # A timeout isn't an APIError, so it isn't retried (see above)
+    return _api_error_code(e) in CHAT_RETRYABLE_CODES
+
 def _chat_model(model_name):
+    """One chat model without retries (1 = no retries in this SDK; 0 would mean its default)."""
     return ChatGoogleGenerativeAI(
         model=model_name,
         thinking_level=THINKING_LEVEL,
         timeout=CHAT_TIMEOUT_SECONDS,
-        max_retries=CHAT_ATTEMPTS,
+        max_retries=1,
     )
 
+def _retrying(runnable):
+    """CHAT_ATTEMPTS attempts on a busy answer, waiting ~1-2 s, ~2-3 s between them (exponential,
+    with jitter: the SDK's old timing). Applied after with_structured_output in the fact check."""
+    return runnable.with_retry(retry_if_exception_type=_is_chat_retryable, stop_after_attempt=CHAT_ATTEMPTS,
+                               wait_exponential_jitter=True)
+
 # Initialize Models (the one embeddings client used by clustering and indexing)
-# The chat models retry through the Google SDK (see above).
+# The chat models retry through with_retry (see above).
 # The embeddings client has no retries, so embedding calls go through call_with_retry below.
 try:
-    llm = _chat_model(CHAT_MODEL).with_fallbacks([_chat_model(FALLBACK_CHAT_MODEL)])
+    llm = _retrying(_chat_model(CHAT_MODEL)).with_fallbacks([_retrying(_chat_model(FALLBACK_CHAT_MODEL))])
     embeddings_model = GoogleGenerativeAIEmbeddings(model=EMBEDDING_MODEL)
     print("[INFO] RAG models loaded successfully.")
 except Exception as e:
@@ -222,29 +253,40 @@ RETRY_BASE_DELAY = 2.0        # seconds: ~2, 4, 8 between attempts, plus up to 1
 RETRYABLE_CODES = {429, 500, 502, 503, 504}
 
 def _is_retryable(e):
-    # LangChain raises GoogleGenerativeAIError *from* the SDK's APIError, so check the cause chain
-    for _ in range(5):
-        if e is None:
-            return False
-        if isinstance(e, genai_errors.APIError) and e.code in RETRYABLE_CODES:
-            return True
-        e = e.__cause__ or e.__context__
-    return False
+    return _api_error_code(e) in RETRYABLE_CODES
+
+def _embedding_inputs(args, kwargs):
+    """What an embedding attempt records: how many texts and characters, or the query itself."""
+    first = args[0] if args else None
+    if isinstance(first, str):
+        inputs = {"text": first}
+    else:
+        inputs = {"texts": len(first or []), "characters": sum(len(t) for t in first or [])}
+    if kwargs.get("task_type"):
+        inputs["task_type"] = kwargs["task_type"]
+    return inputs
 
 async def call_with_retry(label, fn, *args, **kwargs):
     """
     Awaits fn(*args, **kwargs), retrying rate-limit (429) and server (5xx) errors
     with exponential backoff and jitter. Other errors are raised immediately.
+    Each attempt is its own traced run (#21): a retried call shows every try, its error and
+    the wait before it, instead of one slow call.
     """
+    waited = 0.0
     for attempt in range(RETRY_ATTEMPTS + 1):
         try:
-            return await fn(*args, **kwargs)
+            tags = [f"retry:attempt:{attempt + 1}"] if attempt else None
+            async with observability.span(EMBEDDING_MODEL, run_type="embedding", inputs=_embedding_inputs(args, kwargs),
+                                          metadata={"label": label, "attempt": attempt + 1, "waited_before_s": round(waited, 1)},
+                                          tags=tags):
+                return await fn(*args, **kwargs)
         except Exception as e:
             if attempt == RETRY_ATTEMPTS or not _is_retryable(e):
                 raise
-            delay = RETRY_BASE_DELAY * 2 ** attempt + random.uniform(0, 1)
-            print(f"[WARN] {label} failed with a retryable error ({type(e).__name__}). Retry {attempt + 1}/{RETRY_ATTEMPTS} in {delay:.1f}s.")
-            await asyncio.sleep(delay)
+            waited = RETRY_BASE_DELAY * 2 ** attempt + random.uniform(0, 1)
+            print(f"[WARN] {label} failed with a retryable error ({type(e).__name__}). Retry {attempt + 1}/{RETRY_ATTEMPTS} in {waited:.1f}s.")
+            await asyncio.sleep(waited)
 
 class _QueryEmbeddingsWithRetry(Embeddings):
     """
@@ -263,6 +305,8 @@ class _QueryEmbeddingsWithRetry(Embeddings):
     async def aembed_query(self, text):
         return await call_with_retry("Query embedding", self.inner.aembed_query, text)
 
+@observability.traced("embed.documents", inputs=lambda a: {"texts": len(a["texts"]), "characters": sum(map(len, a["texts"]))},
+                      outputs=lambda vectors: {"vectors": len(vectors)})
 async def get_vectors(texts):
     """
     Returns one document vector per text, in order. Reads cached vectors first and
@@ -289,9 +333,11 @@ async def get_vectors(texts):
         vectors = [v if v is not None else embedded[t] for t, v in zip(texts, vectors)]
 
     duplicates = len(texts) - cache_hits - len(missing_texts)
+    observability.annotate(from_cache=cache_hits, embedded=len(missing_texts), duplicates=duplicates)
     print(f"[INFO] Vectors: {len(texts)} texts, {cache_hits} from cache, {len(missing_texts)} embedded, {duplicates} duplicates.")
     return vectors
 
+@observability.traced("embed.query", inputs=lambda a: {"text": a["text"]}, outputs=lambda v: {"dimensions": len(v)})
 async def get_query_vector(text):
     """
     Returns the query's RETRIEVAL_QUERY vector, used to rank articles by relevance.
@@ -302,6 +348,7 @@ async def get_query_vector(text):
         raise RuntimeError("Embeddings model not loaded.")
 
     [cached] = await cache_service.get_cached_vectors(EMB_QUERY_CACHE_MODEL, [text])
+    observability.annotate(from_cache=cached is not None)
     if cached is not None:
         return cached
 
@@ -310,6 +357,8 @@ async def get_query_vector(text):
     await cache_service.set_cached_vectors(EMB_QUERY_CACHE_MODEL, [text], [vector])
     return vector
 
+@observability.traced("index", inputs=lambda a: {"articles": len(a["articles"])},
+                      outputs=lambda store: {"chunks": store.index.ntotal if store is not None else 0})
 async def build_vector_store(articles):
     """
     Builds and returns a FAISS vector store from cached or newly embedded chunk vectors.
@@ -446,6 +495,17 @@ def _cap_per_story(documents, k, cap):
     chosen = sorted(taken + skipped[:k - len(taken)])
     return [documents[i] for i in chosen]
 
+def _retrieved_documents(documents):
+    """The retriever span's output, in the shape LangSmith shows as documents: each chunk's
+    start (the full text is in the LLM run's prompt) and where it came from."""
+    return {"documents": [{
+        "page_content": doc.page_content[:300] + ("..." if len(doc.page_content) > 300 else ""),
+        "metadata": {key: doc.metadata.get(key) for key in ("title", "source_name", "published_at", "chunk_index", "theme_id", "source")},
+        "type": "Document",
+    } for doc in documents]}
+
+@observability.traced("retrieve", run_type="retriever",
+                      inputs=lambda a: {"query": a["query"], "view": a["prompt_type"]}, outputs=_retrieved_documents)
 async def _retrieve(vector_store, query, prompt_type):
     """
     The chunks for one answer, picked with the prompt type's RETRIEVAL_SETTINGS, then capped
@@ -460,7 +520,11 @@ async def _retrieve(vector_store, query, prompt_type):
             search_query, k=index_size, fetch_k=index_size, lambda_mult=settings["lambda_mult"])
     else:
         ranked = await vector_store.asimilarity_search(search_query, k=index_size)
-    return _cap_per_story(ranked, RETRIEVAL_K, STORY_CAP)
+    documents = _cap_per_story(ranked, RETRIEVAL_K, STORY_CAP)
+    observability.annotate(search=settings["search"], query_suffix=settings.get("query_suffix"), k=RETRIEVAL_K,
+                           story_cap=STORY_CAP, index_size=index_size,
+                           stories=len({_story(doc.metadata) for doc in documents}))
+    return documents
 
 def _format_response(response):
     answer = response.get('answer') or ''
@@ -505,21 +569,31 @@ async def run_rag_query_with_store(query, vector_store, prompt_type):
 
     async def retrieve_and_answer():
         documents = await _retrieve(vector_store, query, prompt_type)
-        # The prompt gets copies with header values; the answer's sources come from the originals
-        answer = await qa_chain.ainvoke({"input": query, "context": _with_source_headers(documents)})
+        # The prompt gets copies with header values; the answer's sources come from the originals.
+        # run_name: the chain is traced as "generate" under its view's span, not as an unnamed
+        # stuff_documents_chain (the report and timeline traces looked the same, Section A2)
+        answer = await qa_chain.ainvoke({"input": query, "context": _with_source_headers(documents)},
+                                        config={"run_name": "generate", "tags": [prompt_type]})
         return documents, answer
 
     search = RETRIEVAL_SETTINGS[prompt_type]["search"]
     print(f"[INFO] RAG: Invoking chain with query: '{query}' for type: '{prompt_type}' ({search} search)")
-    try:
-        # One deadline for retrieval and the answer, as before
-        documents, answer = await asyncio.wait_for(retrieve_and_answer(), CHAT_DEADLINE_SECONDS)
-    except Exception as e:   # a missed deadline is a TimeoutError -> "took too long" (504)
-        raise errors.report_failed(e, prompt_type) from e
+    # The view's span: retrieval and the answer, under the request (#19, #22)
+    async with observability.span(prompt_type, inputs={"query": query, "view": prompt_type},
+                                  metadata={"chat_model": CHAT_MODEL, "fallback_model": FALLBACK_CHAT_MODEL,
+                                            "deadline_s": CHAT_DEADLINE_SECONDS}, tags=["answer"]) as run:
+        try:
+            # One deadline for retrieval and the answer, as before
+            documents, answer = await asyncio.wait_for(retrieve_and_answer(), CHAT_DEADLINE_SECONDS)
+        except Exception as e:   # a missed deadline is a TimeoutError -> "took too long" (504)
+            if isinstance(e, TimeoutError):
+                run.add_tags(["timeout"])
+            raise errors.report_failed(e, prompt_type) from e
 
-    summary = _retrieval_summary(documents, vector_store.index.ntotal, RETRIEVAL_K, STORY_CAP)
-    print(f"[INFO] RAG [{prompt_type}, {search}]: Retrieved {summary}")
-    result = _format_response({"answer": answer, "context": documents})
-    if not result["answer"]:
-        raise errors.empty_report(prompt_type)
-    return result
+        summary = _retrieval_summary(documents, vector_store.index.ntotal, RETRIEVAL_K, STORY_CAP)
+        print(f"[INFO] RAG [{prompt_type}, {search}]: Retrieved {summary}")
+        result = _format_response({"answer": answer, "context": documents})
+        run.add_outputs({"answer_chars": len(result["answer"]), "sources": len(result["sources"]), "chunks": len(documents)})
+        if not result["answer"]:
+            raise errors.empty_report(prompt_type)
+        return result

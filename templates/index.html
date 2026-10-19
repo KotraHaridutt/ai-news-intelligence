@@ -178,12 +178,19 @@
 
         // An error whose message is meant for the user. Any other error is a bug in this page.
         // status: the HTTP status, when the server sent one (a 404 on a check means the topic expired)
+        // ref: the server's reference for this error (the end of its trace id), shown with the
+        // message so a reported error can be found in the server's traces
         class ShownError extends Error {
-            constructor(message, status) { super(message); this.status = status; }
+            constructor(message, status, ref) { super(message); this.status = status; this.ref = ref; }
         }
 
+        // Only the expected shape (8 hex characters) is shown: anything else in "ref" is ignored
+        const REF = /^[0-9a-f]{8}$/;
+
         function messageFor(error) {
-            if (error instanceof ShownError) return error.message;
+            if (error instanceof ShownError) {
+                return typeof error.ref === "string" && REF.test(error.ref) ? `${error.message} (Ref: ${error.ref})` : error.message;
+            }
             console.error(error);
             return "Something went wrong on our side. Please try again.";
         }
@@ -220,8 +227,8 @@
                 console.error("Failed to parse JSON:", responseText);
             }
             if (!response.ok) {
-                // Our errors look like {"detail": "No news from the last 2 days was found for ..."}
-                throw new ShownError(friendlyError(response.status, data && data.detail), response.status);
+                // Our errors look like {"detail": "No news from the last 2 days was found for ...", "ref": "1a2b3c4d"}
+                throw new ShownError(friendlyError(response.status, data && data.detail), response.status, data && data.ref);
             }
             if (data === null) {
                 // The raw response is in the console (logged above) for debugging

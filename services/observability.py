@@ -1,14 +1,17 @@
+import asyncio
 import atexit
+import functools
 import hashlib
 import os
 import re
 import subprocess
+import time
 from pathlib import Path
 
 from dotenv import load_dotenv
 import langsmith
 from langsmith import utils as ls_utils
-from langsmith.anonymizer import create_anonymizer
+from langsmith.run_helpers import get_current_run_tree
 
 # --- LLM observability (feature 2): LangSmith tracing, set up in one place ---
 # Importing this module decides once whether traces are sent, where to, and with what
@@ -73,6 +76,51 @@ def make_redactor(environ=None):
             text = pattern.sub(replacement, text)
         return text
     return redact
+
+
+# --- Size (Section C, #29) ---
+# Measured in Section A: a traced answer stored the article text about five times (the chain's
+# input, format_inputs, format_docs, the prompt, the LLM's messages), ~176 KB per trace. The LLM
+# run keeps the full prompt and answer; in every other run, a string longer than TRIM_AT is cut
+# to its first TRIM_TO characters. TRIM_AT is per string, and the copies are lists of ~1,500-
+# character chunks, so it has to be below a chunk: 6,000 trimmed nothing (Section C measured
+# 186 KB for one cold report, 4 chain runs holding all 10 chunks each).
+TRIM_AT = 1000
+TRIM_TO = 300
+_MAX_DEPTH = 30
+# The payload keys of an LLM run: chat model inputs, completion inputs, model outputs
+_LLM_KEYS = ("messages", "prompts", "generations")
+
+
+def _trimmed(text: str) -> str:
+    return f"{text[:TRIM_TO]}... [trimmed: {len(text):,} characters; the full text is in the LLM run]"
+
+
+def make_scrubber(environ=None):
+    """
+    Returns scrub(data) -> data, applied by the LangSmith client to every run's inputs,
+    outputs, metadata and error before it's queued (it's the client's anonymizer, so it sees
+    LangChain's runs too). Masks secrets in every string; trims long strings except in an LLM
+    run's payload and in error text.
+    """
+    redact = make_redactor(environ)
+
+    def walk(value, trim, depth):
+        if isinstance(value, str):
+            value = redact(value)
+            return _trimmed(value) if trim and len(value) > TRIM_AT else value
+        if depth >= _MAX_DEPTH:
+            return value
+        if isinstance(value, dict):
+            return {k: walk(v, trim, depth + 1) for k, v in value.items()}
+        if isinstance(value, list):
+            return [walk(v, trim, depth + 1) for v in value]
+        return value
+
+    def scrub(data):
+        keep_whole = isinstance(data, dict) and (any(k in data for k in _LLM_KEYS) or set(data) == {"error"})
+        return walk(data, not keep_whole, 0)
+    return scrub
 
 
 def short_hash(value: str) -> str:
@@ -160,10 +208,7 @@ def configure_tracing(environ=None) -> dict:
     ls_utils.get_env_var.cache_clear()
     commit = _commit()
 
-    redact = make_redactor(environ)
-    # max_depth: an LLM run nests its text ~6 levels deep (outputs.generations[0][0].message
-    # .kwargs.content); the default of 10 is close enough to miss a deeper copy.
-    _client = langsmith.Client(anonymizer=create_anonymizer(redact, max_depth=30))
+    _client = langsmith.Client(anonymizer=make_scrubber(environ))
     metadata = {"app_env": APP_ENV}
     if commit:
         metadata["commit"] = commit
@@ -200,6 +245,149 @@ def shutdown(timeout: float = FLUSH_TIMEOUT_SECONDS):
         return
     _shut_down = True
     flush(timeout)
+
+
+# --- Spans (Section C) ---
+# The app's own steps, around what LangChain traces by itself. All of these do nothing that
+# matters when tracing is off: LangSmith still builds the run objects but never sends them.
+
+def span(name: str, run_type: str = "chain", inputs: dict | None = None, metadata: dict | None = None,
+         tags: list[str] | None = None):
+    """A traced block: `with span(...) as run:` or `async with`. An exception inside is recorded on it."""
+    return langsmith.trace(name, run_type=run_type, inputs=inputs or {}, metadata=metadata, tags=tags)
+
+
+def traced(name: str, run_type: str = "chain", inputs=None, outputs=None):
+    """
+    A traced function. `inputs(args: dict) -> dict` and `outputs(result) -> dict` choose what
+    is recorded: counts and ids rather than whole articles or snapshots.
+    """
+    return langsmith.traceable(name=name, run_type=run_type, process_inputs=inputs, process_outputs=outputs)
+
+
+def annotate(**metadata):
+    """Adds metadata to the current span (no-op outside one)."""
+    run = get_current_run_tree()
+    if run is not None:
+        run.add_metadata(metadata)
+
+
+def add_tags(*tags: str):
+    run = get_current_run_tree()
+    if run is not None:
+        run.add_tags(list(tags))
+
+
+def ref_of(run) -> str | None:
+    """
+    The reference shown to the user with an error: the last 8 characters of the trace id
+    (the first ones are a timestamp, shared by traces started close together). Every root
+    run carries it as metadata `ref`, so a reported error is found by filtering on it.
+    """
+    if run is None or not status["enabled"]:
+        return None
+    return str(run.trace_id).replace("-", "")[-8:]
+
+
+def current_trace() -> dict | None:
+    """The current trace's id and ref, to link a request that joins work another one started."""
+    run = get_current_run_tree()
+    ref = ref_of(run)
+    return {"trace_id": str(run.trace_id), "ref": ref} if ref else None
+
+
+def summarize(value, depth=0):
+    """
+    A small, safe picture of a response or result for a span's outputs: short strings as they
+    are, long ones as their length, lists as their length, ids as hashes (an answer or watch
+    id lets its holder follow or read a topic, so it never leaves the server).
+    """
+    if isinstance(value, dict):
+        if depth >= 2:
+            return f"{len(value)} keys"
+        out = {}
+        for key, item in value.items():
+            if key.endswith("_id") and isinstance(item, str):
+                out[key] = short_hash(item)
+            elif isinstance(item, str) and len(item) > 200:
+                out[f"{key}_chars"] = len(item)
+            else:
+                out[key] = summarize(item, depth + 1)
+        return out
+    if isinstance(value, (list, tuple)):
+        return len(value)
+    return value
+
+
+def _request_inputs(kwargs: dict, view: str | None) -> tuple[dict, dict]:
+    inputs, metadata = {}, {}
+    req = kwargs.get("req")
+    if req is not None and getattr(req, "query", None) is not None:
+        inputs["query"] = req.query
+    if view:
+        inputs["view"] = view
+    answer_ids = getattr(req, "answer_ids", None)
+    if answer_ids:
+        inputs["answers"] = sorted(view for view, answer_id in answer_ids.items() if answer_id)
+    watch_id = kwargs.get("watch_id")
+    if watch_id:
+        inputs["watch"] = short_hash(watch_id)
+        # LangSmith groups root runs with the same thread_id into one thread
+        metadata["thread_id"] = short_hash(watch_id)
+    return inputs, metadata
+
+
+def _record_failure(run, e: BaseException):
+    """Status, the user's message and the log reason on the request's span (#27)."""
+    if isinstance(e, asyncio.CancelledError):
+        run.add_tags(["cancelled"])
+        run.add_metadata({"status": "cancelled", "note": "the client left; shared work keeps running for others"})
+        return
+    status_code = getattr(e, "status", None)
+    if status_code is None:
+        run.add_tags(["error:500", "unexpected"])
+        run.add_metadata({"status": 500, "error_type": type(e).__name__})
+    else:
+        run.add_tags([f"error:{status_code}"] + (["timeout"] if status_code == 504 else []))
+        run.add_metadata({"status": status_code, "user_message": getattr(e, "message", ""), "log": getattr(e, "log", "")})
+    ref = ref_of(run)
+    if ref:
+        try:
+            e.trace_ref = ref        # server.py puts it in the error response (#28)
+        except Exception:
+            pass
+
+
+def request_span(name: str, view: str | None = None):
+    """
+    The root span of one API request (#19), named after its route, e.g. "POST /query".
+    Inputs: the query, the view, a followed topic's hash; outputs: a summary of the response
+    and its status. A failure records its status and messages and gives the error a ref.
+    """
+    def decorate(fn):
+        @functools.wraps(fn)
+        async def wrapper(*args, **kwargs):
+            inputs, metadata = _request_inputs(kwargs, view)
+            # LangSmith passes a span's tags and metadata down to the runs started inside it, so
+            # the view tag marks every run of that answer ("all report runs"); requests themselves
+            # are the root runs (no "request" tag: it would be on every run too)
+            async with span(name, inputs=inputs, metadata=metadata, tags=[view] if view else None) as run:
+                ref = ref_of(run)
+                if ref:
+                    run.add_metadata({"ref": ref})
+                started = time.perf_counter()
+                try:
+                    result = await fn(*args, **kwargs)
+                except BaseException as e:
+                    _record_failure(run, e)
+                    raise
+                if isinstance(result, dict) and result.get("watch_id") and "thread_id" not in metadata:
+                    run.add_metadata({"thread_id": short_hash(result["watch_id"])})
+                run.add_outputs({"status": 200, "seconds": round(time.perf_counter() - started, 2),
+                                 "response": summarize(result)})
+                return result
+        return wrapper
+    return decorate
 
 
 configure_tracing()

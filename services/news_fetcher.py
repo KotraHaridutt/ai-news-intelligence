@@ -11,7 +11,7 @@ from dotenv import load_dotenv
 import trafilatura
 from bs4 import BeautifulSoup
 
-from services import errors
+from services import errors, observability
 
 # Building a TLS context loads the CA bundle, which blocks for ~0.5 s. Build it once
 # at import and share it, instead of once per AsyncClient (i.e. per request).
@@ -134,6 +134,13 @@ def check_window(since, now=None) -> dict:
         "gap_not_covered": gap,
     }
 
+def _found_summary(articles):
+    """The GNews span's output: how many, from which outlets, and the titles (no page text)."""
+    return {"found": len(articles), "outlets": sorted({a.get("source_name") or "?" for a in articles}),
+            "titles": [(a.get("title") or "")[:100] for a in articles]}
+
+@observability.traced("gnews.search", run_type="tool", inputs=lambda a: {"query": a.get("query"), "from": a.get("window_from")},
+                      outputs=_found_summary)
 async def fetch_news(query: str, window_from: str | None = None) -> list[dict]:
     """
     Fetches the article list for a query from GNews: the best matches
@@ -217,6 +224,9 @@ def _failure_reason(e: Exception) -> str:
         return "connection error"
     return f"other: {type(e).__name__}"
 
+@observability.traced("scrape", run_type="tool", inputs=lambda a: {"url": a["url"]},
+                      outputs=lambda r: {"status": r["status"], "http_status": r["http_status"], "reason": r["reason"],
+                                         "chars": len(r["full_text"] or "")})
 async def fetch_one_article(client: httpx.AsyncClient, url: str) -> dict:
     """
     Asynchronously fetches and scrapes a single article using Trafilatura for clean text.

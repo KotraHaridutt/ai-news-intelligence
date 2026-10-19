@@ -58,11 +58,20 @@ class FollowRequest(BaseModel):
 # --- Errors ---
 # Every failure reaches the page as {"detail": "<message for the user>"} with a real error
 # status, never as 200 with error text. The page shows `detail` in its error box.
+# With tracing on, a traced request's error also carries "ref": the end of its trace id, shown
+# next to the message, so a reported error can be found in LangSmith (feature 2, #28).
+
+def error_content(message: str, exc: Exception) -> dict:
+    content = {"detail": message}
+    ref = getattr(exc, "trace_ref", None)
+    if ref:
+        content["ref"] = ref
+    return content
 
 @app.exception_handler(AppError)
 async def app_error_handler(request: Request, exc: AppError):
     print(f"[WARN] {request.url.path} -> {exc.status}: {exc.log}")
-    return JSONResponse(status_code=exc.status, content={"detail": exc.message})
+    return JSONResponse(status_code=exc.status, content=error_content(exc.message, exc))
 
 @app.exception_handler(RequestValidationError)
 async def validation_error_handler(request: Request, exc: RequestValidationError):
@@ -73,7 +82,7 @@ async def unexpected_error_handler(request: Request, exc: Exception):
     # A bug. Starlette re-raises the exception after this response is sent,
     # so uvicorn still logs the full traceback.
     print(f"[ERROR] {request.url.path} -> 500: unexpected {type(exc).__name__}: {exc}")
-    return JSONResponse(status_code=500, content={"detail": errors.UNEXPECTED_MESSAGE})
+    return JSONResponse(status_code=500, content=error_content(errors.UNEXPECTED_MESSAGE, exc))
 
 def require_query(query: str) -> str:
     if not query or not query.strip():
@@ -113,6 +122,7 @@ async def home(request: Request):
 
 
 @app.post("/query")
+@observability.request_span("POST /query", view="report")
 async def query_endpoint(req: QueryRequest):
     start_time = time.time()
     query = require_query(req.query)
@@ -133,6 +143,7 @@ async def query_endpoint(req: QueryRequest):
     return final_response
 
 @app.post("/api/timeline")
+@observability.request_span("POST /api/timeline", view="timeline")
 async def api_timeline(req: QueryRequest):
     start_time = time.time()
     query = require_query(req.query)
@@ -149,6 +160,7 @@ async def api_timeline(req: QueryRequest):
     }
 
 @app.post("/api/contradictions")
+@observability.request_span("POST /api/contradictions", view="contradictions")
 async def api_contradictions(req: QueryRequest):
     start_time = time.time()
     query = require_query(req.query)
@@ -165,8 +177,10 @@ async def api_contradictions(req: QueryRequest):
     }
 
 # --- Following a topic (feature 1): services/follow_service.py ---
+# Reading the story log and unfollowing are Redis-only and aren't traced.
 
 @app.post("/api/follow")
+@observability.request_span("POST /api/follow")
 async def api_follow(req: FollowRequest):
     """Saves the report on the page (V1) as a followed topic. No GNews or chat call."""
     start_time = time.time()
@@ -175,6 +189,7 @@ async def api_follow(req: FollowRequest):
     return {**result, "time_taken": f"{time.time() - start_time:.2f}s"}
 
 @app.post("/api/follow/{watch_id}/check")
+@observability.request_span("POST /api/follow/{watch_id}/check")
 async def api_follow_check(watch_id: str):
     """Check for updates: only what is new since the last look (or the stored result, within 30 min)."""
     start_time = time.time()

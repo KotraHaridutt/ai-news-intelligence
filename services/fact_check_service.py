@@ -5,7 +5,7 @@ from datetime import datetime
 from pydantic import BaseModel, Field
 from langchain_core.exceptions import OutputParserException
 
-from services import errors
+from services import errors, observability
 from services import rag_service as rag
 from services.novelty_service import SHOWN, NOTHING_NEW, UNJUDGED
 
@@ -37,8 +37,10 @@ class FactCheckAnswer(BaseModel):
 
 def _structured(model_name):
     # Structured output per model, then the fallback: the fallback wrapper itself has no
-    # with_structured_output (plan P7). Same thinking level, timeout and attempts as the views.
-    return rag._chat_model(model_name).with_structured_output(FactCheckAnswer, method="json_schema")
+    # with_structured_output (plan P7). Same thinking level, timeout and attempts as the views;
+    # the retries wrap the structured model, because a retry wrapper has no with_structured_output
+    # either. Only busy answers are retried: an answer that can't be parsed is not.
+    return rag._retrying(rag._chat_model(model_name).with_structured_output(FactCheckAnswer, method="json_schema"))
 
 try:
     fact_check_llm = _structured(rag.CHAT_MODEL).with_fallbacks([_structured(rag.FALLBACK_CHAT_MODEL)])
@@ -186,18 +188,29 @@ async def run_fact_check(query, stories, known_stories, told) -> dict:
     prompt, excerpts = build_prompt(query, stories, known_stories, told)
     articles = sum(len(s["articles"]) for s in stories)
     new_count = sum(1 for s in stories if s["kind"] == "new")
-    try:
-        answer = await asyncio.wait_for(fact_check_llm.ainvoke(prompt), rag.CHAT_DEADLINE_SECONDS)
-        if not isinstance(answer, FactCheckAnswer):
-            raise OutputParserException(f"expected FactCheckAnswer, got {type(answer).__name__}")
-    except OutputParserException as e:
-        print(f"[WARN] UPDATE: the fact check's answer couldn't be read ({str(e)[:200]}). Every story unjudged.")
-        answer = None
-    except Exception as e:                    # a missed deadline is a TimeoutError -> 504
-        raise errors.report_failed(e, "update") from e
+    async with observability.span("fact_check", inputs={"query": query, "stories": [s["id"] for s in stories]},
+                                  metadata={"new": new_count, "known": len(stories) - new_count, "articles": articles,
+                                            "chunks": excerpts, "prompt_chars": len(prompt)}, tags=["answer"]) as run:
+        try:
+            answer = await asyncio.wait_for(fact_check_llm.ainvoke(prompt, config={"run_name": "generate", "tags": ["update"]}),
+                                            rag.CHAT_DEADLINE_SECONDS)
+            if not isinstance(answer, FactCheckAnswer):
+                raise OutputParserException(f"expected FactCheckAnswer, got {type(answer).__name__}")
+        except OutputParserException as e:
+            print(f"[WARN] UPDATE: the fact check's answer couldn't be read ({str(e)[:200]}). Every story unjudged.")
+            # The whole reply is in the LLM run below this span; the start of it is kept here (#27)
+            raw = getattr(e, "llm_output", None) or ""
+            run.add_tags(["unreadable_answer"])
+            run.add_metadata({"parse_error": str(e)[:500], "raw_reply_chars": len(raw), "raw_reply_start": raw[:1000]})
+            answer = None
+        except Exception as e:                    # a missed deadline is a TimeoutError -> 504
+            if isinstance(e, TimeoutError):
+                run.add_tags(["timeout"])
+            raise errors.report_failed(e, "update") from e
 
-    result = read_answer(answer, stories)
-    counts = {kind: sum(1 for story_id, o in result["outcomes"].items() if o == kind) for kind in (SHOWN, NOTHING_NEW, UNJUDGED)}
+        result = read_answer(answer, stories)
+        counts = {kind: sum(1 for story_id, o in result["outcomes"].items() if o == kind) for kind in (SHOWN, NOTHING_NEW, UNJUDGED)}
+        run.add_outputs({"usable": result["usable"], **counts})
     print(f"[INFO] UPDATE: judged {articles} articles in {len(stories)} stories ({new_count} new, {len(stories) - new_count} known), "
           f"{excerpts} chunks, {len(prompt):,} characters; result: {counts[SHOWN]} shown, "
           f"{counts[NOTHING_NEW]} nothing new, {counts[UNJUDGED]} unjudged")

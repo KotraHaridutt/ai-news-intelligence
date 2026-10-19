@@ -1,7 +1,7 @@
 import asyncio
 from datetime import datetime
 
-from services import cache_service, errors
+from services import cache_service, errors, observability
 from services import novelty_service as nov
 from services.cache_service import WatchStoreUnavailable
 from services.fact_check_service import run_fact_check
@@ -20,6 +20,8 @@ REUSE_MINUTES = 30
 
 # One check per followed topic at a time; a second request joins the first
 _checks_inflight: dict[str, asyncio.Task] = {}
+# Which trace started each running check: a request that joins it links to that trace (feature 2, #24)
+_checks_started_by: dict[str, dict | None] = {}
 
 RETRY_MESSAGE = "Couldn't check the new articles on stories you've seen. Check again to retry."
 
@@ -83,7 +85,9 @@ async def follow(query: str, answer_ids: dict) -> dict:
     told = [{"at": r["created_at"], "kind": r["view"], "text": r["text"]}
             for r in (records.get(aid) for aid in answer_ids.values()) if r is not None and r.get("text")]
     now = build_time()
-    snapshot = nov.baseline(search_query, with_text, vectors, told, entry["built_at"], now)
+    with observability.span("novelty.baseline", inputs={"articles": len(with_text), "told": [t["kind"] for t in told]}) as run:
+        snapshot = nov.baseline(search_query, with_text, vectors, told, entry["built_at"], now)
+        run.add_outputs({"stories": len(snapshot["stories"]), "seen_urls": len(snapshot["seen_urls"])})
     # Articles whose page can't be read any more have no vector, so they can't be a story,
     # but they were in V1's build: seen all the same
     snapshot["seen_urls"] = nov._add_unique(snapshot["seen_urls"], [a["url"] for a in articles])[-nov.MAX_SEEN_URLS:]
@@ -136,18 +140,28 @@ async def check(watch_id: str, render) -> dict:
     "Check for updates". render: markdown -> safe HTML (server.render_markdown).
     One check per followed topic at a time; a second request gets the first one's result.
     """
-    task = _checks_inflight.get(watch_id)
-    if task is None:
-        task = asyncio.create_task(_check(watch_id, render))
-        _checks_inflight[watch_id] = task
-        task.add_done_callback(lambda t: _on_check_done(watch_id, t))
-    else:
-        print(f"[INFO] Joining the check already running for {watch_id}")
-    return await asyncio.shield(task)
+    async with observability.span("check", inputs={"watch": observability.short_hash(watch_id)}) as run:
+        task = _checks_inflight.get(watch_id)
+        if task is None:
+            # Created inside this span, so the check's own spans are traced under this request
+            task = asyncio.create_task(_check(watch_id, render))
+            _checks_inflight[watch_id] = task
+            _checks_started_by[watch_id] = observability.current_trace()
+            task.add_done_callback(lambda t: _on_check_done(watch_id, t))
+        else:
+            print(f"[INFO] Joining the check already running for {watch_id}")
+            started = _checks_started_by.get(watch_id) or {}
+            run.add_tags(["joined_running_check"])
+            run.add_metadata({"joined": True, "check_trace_id": started.get("trace_id"), "check_ref": started.get("ref")})
+        result = await asyncio.shield(task)
+        run.add_outputs({key: len(result[key]) for key in ("new_stories", "updates", "hidden_repeats", "unreadable")}
+                        | {"nothing_new": result["nothing_new"], "reused": result["reused"]})
+        return result
 
 def _on_check_done(watch_id, task):
     if _checks_inflight.get(watch_id) is task:
         del _checks_inflight[watch_id]
+        _checks_started_by.pop(watch_id, None)
     if not task.cancelled():
         task.exception()
 
@@ -226,21 +240,32 @@ async def _check(watch_id: str, render) -> dict:
 
     last = snapshot.get("last_result")
     if last and _minutes_between(snapshot["last_checked_at"], now) < REUSE_MINUTES:
+        observability.add_tags("reused_result")
         print(f"[INFO] CHECK {watch_id}: last check {snapshot['last_checked_at']} is under {REUSE_MINUTES} min old, its result reused")
         return {**last, "reused": True}
 
     # GNews and Gemini errors (AppError) go straight to the page; nothing is saved
     data = await get_pipeline_data(snapshot["query"], since=snapshot["last_fetch_at"])
     articles, vectors = data["articles"], data["article_vectors"]
-    classified = nov.classify(snapshot, articles, vectors)
+    with observability.span("novelty.classify", inputs={"articles": len(articles), "known_stories": len(snapshot["stories"]),
+                                                       "seen_urls": len(snapshot["seen_urls"])}) as run:
+        classified = nov.classify(snapshot, articles, vectors)
+        # Each article's decision and distance: the numbers the thresholds were tuned on
+        run.add_outputs({"seen": len(classified["seen"]), "updates": len(classified["updates"]), "new": len(classified["new"]),
+                         "related": sum(1 for n in classified["new"] if n["related_to"]),
+                         "decisions": [{k: d[k] for k in ("outcome", "story_id", "distance")} for d in classified["decisions"]]})
     stories = _stories_to_judge(snapshot, articles, classified)
     known = [{"id": s["id"], "title": s["title"]} for s in snapshot["stories"]]
     result = await run_fact_check(snapshot["query"], stories, known, snapshot["told"])
 
     ids = {}
-    merged = nov.merge(snapshot, articles, vectors, classified, result["outcomes"], result["texts"],
-                       data["built_at"] or now, now, ids_out=ids)
-    response = _response(watch_id, snapshot, merged, data, articles, classified, result, ids, render, now)
+    with observability.span("novelty.merge", inputs={"stories_judged": len(stories)}) as run:
+        merged = nov.merge(snapshot, articles, vectors, classified, result["outcomes"], result["texts"],
+                           data["built_at"] or now, now, ids_out=ids)
+        response = _response(watch_id, snapshot, merged, data, articles, classified, result, ids, render, now)
+        run.add_outputs({"new_stories": len(response["new_stories"]), "updates": len(response["updates"]),
+                         "hidden_repeats": len(response["hidden_repeats"]), "unreadable": len(response["unreadable"]),
+                         "known_stories_after": len(merged["stories"])})
     merged["last_result"] = response
 
     # Saved before anything is shown: a result that isn't saved would be "new" again next time

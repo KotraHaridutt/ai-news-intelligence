@@ -3,7 +3,7 @@ import asyncio
 import time
 from datetime import datetime, timezone
 
-from services import cache_service, errors
+from services import cache_service, errors, observability
 from services.news_fetcher import fetch_news, scrape_pages, check_window
 from services.clustering_service import group_by_theme
 from services.rag_service import build_vector_store, get_vectors, get_query_vector
@@ -24,6 +24,8 @@ UNREADABLE_FIELDS = ("url", "title", "source_name", "published_at")
 # requests await the same task instead of starting their own build.
 # Keys: the normalized query for a report build, ("since", from_hour, query) for a check.
 _inflight: dict[str | tuple, asyncio.Task] = {}
+# Which trace started each running build: a request that joins it links to that trace (#24)
+_started_by: dict[str | tuple, dict | None] = {}
 
 # --- Build limit ---
 # At most this many full builds (GNews + scrape + embed + index) run at once.
@@ -31,6 +33,26 @@ _inflight: dict[str | tuple, asyncio.Task] = {}
 # 512 MB instance and the burst of Gemini embedding calls. Cache hits don't wait.
 MAX_CONCURRENT_BUILDS = max(1, int(os.getenv("MAX_CONCURRENT_BUILDS", "3")))
 _build_slots = asyncio.Semaphore(MAX_CONCURRENT_BUILDS)
+
+
+# --- Span summaries (feature 2, Section C) ---
+# What a span records of a build: counts and names, never page text, vectors or the index.
+
+def _summary(data) -> dict:
+    if data is None:
+        return {"result": None}
+    out = {"articles": len(data.get("articles", []))}
+    if "vector_store" in data:
+        out["indexed"] = sum(1 for a in data["articles"] if a.get("indexed", True))
+        out["chunks"] = data["vector_store"].index.ntotal if data["vector_store"] is not None else 0
+        out["related_links"] = len(data.get("related_links", []))
+    if "unreadable" in data:
+        out.update(found=data.get("articles_found"), unreadable=len(data["unreadable"]), window=data.get("window"))
+    out["built_at"] = data.get("built_at")
+    return out
+
+def _articles_in(args, name="articles"):
+    return {"articles": len(args.get(name) or [])}
 
 
 def build_time() -> str:
@@ -68,31 +90,48 @@ async def get_pipeline_data(query: str, since=None):
         flight, label = ("since", window["from_hour"], key), f"'{key}' since {window['from']}"
         start = lambda: _load_or_build_since(key, search_query, window)
 
-    task = _inflight.get(flight)
-    if task is None:
-        task = asyncio.create_task(start())
-        _inflight[flight] = task
-        task.add_done_callback(lambda t: _on_task_done(flight, t))
-    else:
-        print(f"[INFO] Joining in-flight build for {label}")
+    async with observability.span("pipeline", inputs={"query": key, "since": since},
+                                  metadata={"kind": "report" if since is None else "check"}) as run:
+        task = _inflight.get(flight)
+        if task is None:
+            # Created inside this span, so the build's own spans are traced under this request
+            task = asyncio.create_task(start())
+            _inflight[flight] = task
+            _started_by[flight] = observability.current_trace()
+            task.add_done_callback(lambda t: _on_task_done(flight, t))
+        else:
+            print(f"[INFO] Joining in-flight build for {label}")
+            # The build's spans are in the trace of the request that started it: link to it (#24)
+            started = _started_by.get(flight) or {}
+            run.add_tags(["joined_shared_build"])
+            run.add_metadata({"joined": True, "build_trace_id": started.get("trace_id"), "build_ref": started.get("ref")})
 
-    # shield: if this request is cancelled, the build keeps running for the others
-    data = await asyncio.shield(task)
-    if since is not None:
-        # Requests in the same hour share the fetch, but the part a long gap couldn't
-        # search depends on each request's own `since`
-        data = {**data, "window": {**data["window"], "gap_not_covered": window["gap_not_covered"]}}
-    return data
+        # shield: if this request is cancelled, the build keeps running for the others
+        wait_start = time.time()
+        try:
+            data = await asyncio.shield(task)
+        except asyncio.CancelledError:
+            run.add_metadata({"note": "this request was cancelled; the shared build kept running for the others"})
+            raise
+        run.add_metadata({"waited_s": round(time.time() - wait_start, 2)})
+        if since is not None:
+            # Requests in the same hour share the fetch, but the part a long gap couldn't
+            # search depends on each request's own `since`
+            data = {**data, "window": {**data["window"], "gap_not_covered": window["gap_not_covered"]}}
+        run.add_outputs(_summary(data))
+        return data
 
 
 def _on_task_done(key, task: asyncio.Task):
     if _inflight.get(key) is task:
         del _inflight[key]
+        _started_by.pop(key, None)
     # Mark the exception as retrieved so an error with no waiters left isn't logged as "never retrieved"
     if not task.cancelled():
         task.exception()
 
 
+@observability.traced("cache_or_build", outputs=_summary)
 async def _load_or_build(key: str, search_query: str):
     start_time = time.time()
 
@@ -106,10 +145,13 @@ async def _load_or_build(key: str, search_query: str):
     if cached is not None:
         data = await _rebuild_from_cache(cached)
         if data is not None:
+            observability.annotate(path="cache_hit")
             print(f"[INFO] Cache HIT for '{key}': index rebuilt in {time.time() - start_time:.2f}s")
             return data
+        observability.annotate(path="cache_unusable_full_build")
         print(f"[WARN] Cache entry for '{key}' couldn't be rebuilt. Running the full pipeline.")
     else:
+        observability.annotate(path="cache_miss_full_build")
         print(f"[INFO] Cache MISS for '{key}'. Running the full pipeline.")
 
     if _build_slots.locked():
@@ -117,11 +159,13 @@ async def _load_or_build(key: str, search_query: str):
     wait_start = time.time()
     async with _build_slots:
         waited = time.time() - wait_start
+        observability.annotate(waited_for_build_slot_s=round(waited, 2))
         data = await _build(key, search_query)
     print(f"[INFO] Pipeline for '{key}' finished in {time.time() - start_time:.2f}s (waited {waited:.2f}s for a build slot)")
     return data
 
 
+@observability.traced("pages", inputs=_articles_in, outputs=lambda with_text: {"with_text": len(with_text)})
 async def _attach_pages(articles):
     """
     Reads page texts from the cache, scrapes only the URLs that aren't cached,
@@ -136,12 +180,15 @@ async def _attach_pages(articles):
         scraped = await scrape_pages(to_scrape)
         await cache_service.set_pages(scraped)
         pages.update(scraped)
+    observability.annotate(urls=len(urls), from_cache=len(urls) - len(to_scrape), scraped=len(to_scrape), scrape_ok=len(scraped))
     print(f"[INFO] Pages: {len(urls)} URLs, {len(urls) - len(to_scrape)} from cache, "
           f"{len(to_scrape)} to scrape, {len(scraped)} succeeded.")
 
     return [{**article, 'full_text': pages[article['url']]} for article in articles if article['url'] in pages]
 
 
+@observability.traced("rebuild_from_cache", inputs=lambda a: {"articles": len(a["cached"].get("articles", []))},
+                      outputs=_summary)
 async def _rebuild_from_cache(cached):
     """
     Hit path: cached article list -> page texts -> chunk -> cached vectors -> FAISS.
@@ -169,6 +216,7 @@ async def _rebuild_from_cache(cached):
     }
 
 
+@observability.traced("full_build", outputs=_summary)
 async def _build(key: str, search_query: str):
     """
     Miss path: GNews -> page texts (cache, then scrape) -> article vectors -> group
@@ -233,6 +281,8 @@ def _unique_by_url(found):
     return list(unique.values())
 
 
+@observability.traced("group_and_choose", inputs=lambda a: {"articles": len(a["articles"]), "have_vectors": a["article_vectors"] is not None},
+                      outputs=lambda r: {"clustering_ok": r[0], "ranking_ok": r[1], "related_links": len(r[2])})
 async def _group_and_choose(key: str, label: str, articles, article_vectors):
     """
     Steps 3-4 of a build, shared by report builds and checks: group duplicates (DBSCAN),
@@ -262,6 +312,9 @@ async def _group_and_choose(key: str, label: str, articles, article_vectors):
         related_links = []
     for i, article in enumerate(articles):
         article['similarity'] = round(similarities[i], 4) if similarities else None
+    observability.annotate(groups=len({a.get('theme_id') for a in articles if a.get('theme_id', -1) != -1}),
+                           indexed=sum(1 for a in articles if a.get('indexed')),
+                           unique=sum(1 for a in articles if a.get('unique')))
     return clustering_ok, ranking_ok, related_links
 
 
@@ -285,11 +338,13 @@ async def _article_vectors(articles):
         raise errors.analysis_failed(e) from e
 
 
+@observability.traced("check_cache_or_build", inputs=lambda a: {"key": a["key"], "from": a["window"]["from"]}, outputs=_summary)
 async def _load_or_build_since(key: str, search_query: str, window: dict):
     start_time = time.time()
     label = f"'{key}' since {window['from']}"
 
     cached = await cache_service.get_since_articles(key, window["from_hour"])
+    observability.annotate(path="cache_hit" if cached is not None else "cache_miss_build")
     if cached is not None:
         data = await _since_from_cache(cached)
         print(f"[INFO] Check cache HIT for {label}: {len(data['articles'])} articles in {time.time() - start_time:.2f}s")
@@ -305,6 +360,7 @@ async def _load_or_build_since(key: str, search_query: str, window: dict):
     return data
 
 
+@observability.traced("check_from_cache", inputs=lambda a: {"articles": len(a["cached"].get("articles", []))}, outputs=_summary)
 async def _since_from_cache(cached):
     """Hit path: the cached article list -> page texts (scraping any that expired) -> article vectors."""
     articles = cached.get("articles", [])
@@ -323,6 +379,7 @@ async def _since_from_cache(cached):
     }
 
 
+@observability.traced("check_build", inputs=lambda a: {"key": a["key"], "from": a["window"]["from"]}, outputs=_summary)
 async def _build_since(key: str, search_query: str, window: dict):
     """
     Miss path of a check: GNews from window['from'] -> page texts -> article vectors -> group
