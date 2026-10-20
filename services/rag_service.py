@@ -242,11 +242,20 @@ async def call_with_retry(label, fn, *args, **kwargs):
     for attempt in range(RETRY_ATTEMPTS + 1):
         try:
             tags = [f"retry:attempt:{attempt + 1}"] if attempt else None
+            # ls_provider / ls_model_name and usage_metadata let LangSmith count and price these tokens
+            # like a chat call's (checked in feature 2, Section K: 1,200 tokens -> $0.00018). The
+            # embeddings API returns no count, so they are our estimate (tokens_estimated).
             async with observability.span(EMBEDDING_MODEL, run_type="embedding", inputs=_embedding_inputs(args, kwargs),
                                           metadata={"label": label, "attempt": attempt + 1, "waited_before_s": round(waited, 1),
-                                                    "estimated_tokens": usage.estimate_tokens(characters)},
-                                          tags=tags):
+                                                    "estimated_tokens": usage.estimate_tokens(characters), "tokens_estimated": True,
+                                                    "ls_provider": "google_genai", "ls_model_name": EMBEDDING_MODEL},
+                                          tags=tags) as run:
                 result = await fn(*args, **kwargs)
+                tokens = usage.estimate_tokens(characters)
+                # a batch is a list of vectors; one query's result is a single vector (a list of floats)
+                batch = isinstance(result, list) and bool(result) and isinstance(result[0], (list, tuple))
+                run.add_outputs({"vectors": len(result) if batch else 1,
+                                 "usage_metadata": {"input_tokens": tokens, "output_tokens": 0, "total_tokens": tokens}})
             usage.record_embedding(EMBEDDING_MODEL, characters, len(texts))
             return result
         except Exception as e:
