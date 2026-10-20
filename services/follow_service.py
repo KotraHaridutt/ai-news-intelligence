@@ -176,6 +176,21 @@ def _stories_to_judge(snapshot, articles, classified) -> list[dict]:
     return stories
 
 
+async def _rating_record(query: str, now: str) -> dict:
+    """
+    The check's update can be rated like the three views (feature 2, Section J): it gets an
+    answer record of its own ("update", no text: it's never "already told" on Follow), holding
+    the trace that wrote it. A reused result keeps its id, so a rating goes to the check that ran.
+    """
+    trace = observability.sent_trace()
+    if trace is None:
+        return {"answer_id": None, "can_rate": False}
+    answer_id = cache_service.new_id()
+    saved = await cache_service.set_answer(answer_id, {"query": cache_service.normalize_query(query), "view": "update",
+                                                       "created_at": now, **trace})
+    return {"answer_id": answer_id if saved else None, "can_rate": saved}
+
+
 def _response(watch_id, snapshot, merged, data, articles, classified, result, ids, render, now) -> dict:
     """The check's answer for the page: what's new, what was hidden as a repeat, what couldn't be read."""
     outcomes, texts = result["outcomes"], result["texts"]
@@ -266,6 +281,7 @@ async def _check(watch_id: str, render) -> dict:
         run.add_outputs({"new_stories": len(response["new_stories"]), "updates": len(response["updates"]),
                          "hidden_repeats": len(response["hidden_repeats"]), "unreadable": len(response["unreadable"]),
                          "known_stories_after": len(merged["stories"])})
+    response.update(await _rating_record(snapshot["query"], now))
     merged["last_result"] = response
 
     # Saved before anything is shown: a result that isn't saved would be "new" again next time

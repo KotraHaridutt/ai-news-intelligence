@@ -81,7 +81,7 @@ async def prepare():
         items.append({"id": f"gap4-stock_market-{view}", "kind": "answer", "query": saved["topic"], "view": view,
                       "context": _context_from_prompt(t["prompt"]), "answer": t["answer"], "source": "gap 4 after-B (2026-10-11)"})
     topics = {t["slug"]: t for t in data.topics()}
-    missing = []
+    missing, stopped = [], False
     for slug, view in NEW:
         item_id = f"new-{slug}-{view}"
         if item_id in done:
@@ -89,11 +89,19 @@ async def prepare():
             continue
         topic = data.injection() if slug == "injection" else topics[slug]
         context = data.context(topic, view)
+        if stopped or not await _budget_left():
+            stopped = True
+            missing.append(item_id)
+            continue
         try:
             result = await targets.generate_answer(topic["query"], view, context)
         except Exception as e:
-            print(f"[G] {slug}/{view}: not generated ({type(e).__name__}); run prepare again later")
+            # Each failure already includes the retries and the fallback model: Gemini is down or
+            # overloaded, and every further item would spend calls the same way (2026-10-20: 5 items,
+            # 10 calls, nothing written). Stop; what's done is saved.
+            print(f"[G] {slug}/{view}: not generated ({type(e).__name__}); stopped to save quota, run prepare again later")
             missing.append(item_id)
+            stopped = True
             continue
         items.append({"id": item_id, "kind": "answer", "query": topic["query"], "view": view, "context": context,
                       "answer": result["answer"], "source": f"generated {datetime.now(timezone.utc).date()} (prompt {result['prompt_version']})",
@@ -107,6 +115,16 @@ async def prepare():
     _save_items(_with_units(items, judges))
     print(f"[G] calibration set: {len(items)} items, {sum(len(i['units']) for i in items)} units"
           + (f"; still missing: {', '.join(missing)}" if missing else ""))
+
+
+async def _budget_left(reserve: int = 2) -> bool:
+    """The experiment runner's budget guard (Section H): today's counter, keeping `reserve` for the app."""
+    from evals import run_evals
+    left = await run_evals.calls_left(reserve)
+    if left is not None and left <= 0:
+        print("[G] today's chat budget is used up: stopped, run again after midnight Pacific time")
+        return False
+    return True
 
 
 def _with_units(items, judges):
@@ -125,10 +143,17 @@ async def judge():
         if path.exists():
             print(f"[G] {item['id']}: already judged")
             continue
-        if item["kind"] == "answer":
-            result = await judges.judge_answer(item["query"], item["view"], item["answer"], item["context"])
-        else:
-            result = await judges.judge_fact_check(item["query"], item["stories"], item["texts"], item["told"])
+        if not await _budget_left():
+            return
+        try:
+            if item["kind"] == "answer":
+                result = await judges.judge_answer(item["query"], item["view"], item["answer"], item["context"])
+            else:
+                result = await judges.judge_fact_check(item["query"], item["stories"], item["texts"], item["told"])
+        except Exception as e:
+            # Was an unhandled traceback (2026-10-20, Gemini 504). Verdicts so far are saved.
+            print(f"[G] {item['id']}: not judged ({type(e).__name__}: {str(e)[:120]}); stopped to save quota, run judge again later")
+            return
         path.write_text(json.dumps(result, indent=1, ensure_ascii=False), encoding="utf-8")
         print(f"[G] {item['id']}: {result['scores']}")
 

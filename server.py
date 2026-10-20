@@ -21,7 +21,7 @@ import markdown2
 # --- Our Services ---
 # observability first: it decides whether traces are sent before any model is called
 from services import observability
-from services import cache_service, errors, follow_service
+from services import cache_service, errors, feedback_service, follow_service
 from services.errors import AppError
 from services.pipeline_service import get_pipeline_data, build_time
 from services.rag_service import run_rag_query_with_store
@@ -55,6 +55,12 @@ class FollowRequest(BaseModel):
     # The answers on the page: {"report": id, "timeline": id, "contradictions": id}
     answer_ids: dict[str, str | None] = {}
 
+class FeedbackRequest(BaseModel):
+    # A reader's rating of one answer (feature 2, Section J): 1 for 👍, -1 for 👎
+    answer_id: str
+    score: int
+    comment: str | None = None
+
 # --- Errors ---
 # Every failure reaches the page as {"detail": "<message for the user>"} with a real error
 # status, never as 200 with error text. The page shows `detail` in its error box.
@@ -75,7 +81,10 @@ async def app_error_handler(request: Request, exc: AppError):
 
 @app.exception_handler(RequestValidationError)
 async def validation_error_handler(request: Request, exc: RequestValidationError):
-    return await app_error_handler(request, errors.invalid_request(str(exc.errors())[:300]))
+    log = str(exc.errors())[:300]
+    # The generic message asks for a topic, which makes no sense next to a 👍 / 👎
+    error = errors.rating_invalid(log) if request.url.path == "/api/feedback" else errors.invalid_request(log)
+    return await app_error_handler(request, error)
 
 @app.exception_handler(Exception)
 async def unexpected_error_handler(request: Request, exc: Exception):
@@ -97,16 +106,18 @@ def render_markdown(text) -> str:
     """
     return markdown2.markdown(text or "", safe_mode="escape")
 
-async def remember_answer(query: str, view: str, text: str, built_at) -> str | None:
+async def remember_answer(query: str, view: str, text: str, built_at) -> dict:
     """
     Saves an answer the user is shown, so that following the topic later can store what it
     said as "already told" (feature 1). The page gets the id and sends it back on Follow; ids,
     not the topic, so two people reading the same topic never get each other's answer.
-    Returns None if it couldn't be saved (no Redis, or a failed write): the answer is still
-    shown, it just can't be followed. The record also keeps which model, prompt version and
-    settings wrote it (feature 2 #40), from this request's totals.
+    answer_id is None if it couldn't be saved (no Redis, or a failed write): the answer is still
+    shown, it just can't be followed or rated. The record also keeps which model, prompt version
+    and settings wrote it (feature 2 #40), from this request's totals, and the trace that wrote
+    it (#68), so a rating can go on that trace. The page never sees the trace id, only can_rate.
     """
     totals = observability.current_totals() or {}
+    trace = observability.sent_trace()
     answer_id = cache_service.new_id()
     saved = await cache_service.set_answer(answer_id, {
         "query": cache_service.normalize_query(query),
@@ -115,8 +126,9 @@ async def remember_answer(query: str, view: str, text: str, built_at) -> str | N
         "built_at": built_at,
         "created_at": build_time(),
         **{key: totals[key] for key in ("answered_by", "prompt_version", "config_version") if key in totals},
+        **(trace or {}),
     })
-    return answer_id if saved else None
+    return {"answer_id": answer_id if saved else None, "can_rate": bool(saved and trace)}
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -139,7 +151,7 @@ async def query_endpoint(req: QueryRequest):
         "cited_sources": rag_data["sources"],
         "related_links": data["related_links"],
         "total_articles_found": len(data["articles"]),
-        "answer_id": await remember_answer(query, "report", rag_data["answer"], data.get("built_at")),
+        **await remember_answer(query, "report", rag_data["answer"], data.get("built_at")),
         "time_taken": f"{time.time() - start_time:.2f}s"
     }
     
@@ -158,7 +170,7 @@ async def api_timeline(req: QueryRequest):
         "query": query,
         "timeline_html": render_markdown(rag_data["answer"]),
         "cited_sources": rag_data["sources"],
-        "answer_id": await remember_answer(query, "timeline", rag_data["answer"], data.get("built_at")),
+        **await remember_answer(query, "timeline", rag_data["answer"], data.get("built_at")),
         "time_taken": f"{time.time() - start_time:.2f}s"
     }
 
@@ -175,7 +187,7 @@ async def api_contradictions(req: QueryRequest):
         "query": query,
         "analysis_html": render_markdown(rag_data["answer"]),
         "cited_sources": rag_data["sources"],
-        "answer_id": await remember_answer(query, "contradictions", rag_data["answer"], data.get("built_at")),
+        **await remember_answer(query, "contradictions", rag_data["answer"], data.get("built_at")),
         "time_taken": f"{time.time() - start_time:.2f}s"
     }
 
@@ -207,6 +219,14 @@ async def api_follow_log(watch_id: str):
 @app.delete("/api/follow/{watch_id}")
 async def api_unfollow(watch_id: str):
     return await follow_service.unfollow(watch_id)
+
+# --- Rating an answer (feature 2, Section J): services/feedback_service.py ---
+
+@app.post("/api/feedback")
+@observability.request_span("POST /api/feedback")
+async def api_feedback(req: FeedbackRequest):
+    """👍 / 👎 (and an optional comment) on an answer the page is showing, saved on its trace."""
+    return await feedback_service.rate(req.answer_id, req.score, req.comment)
 
 if __name__ == "__main__":
     import uvicorn

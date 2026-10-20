@@ -9,6 +9,7 @@ import subprocess
 import threading
 import time
 from contextvars import ContextVar
+from datetime import datetime, timezone
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -308,7 +309,7 @@ _feedback_lock = threading.Lock()
 _project_ids: dict[str, str] = {}
 
 
-def _project_id(name: str | None) -> str | None:
+def project_id(name: str | None) -> str | None:
     """The project's id, for session_id (feedback without it is deprecated by the SDK). Cached."""
     if not name:
         return None
@@ -324,7 +325,7 @@ def _send_feedback():
     while True:
         item = _feedback_queue.get()
         try:
-            _client.create_feedback(**item, session_id=_project_id(item.pop("project", None)),
+            _client.create_feedback(**item, session_id=project_id(item.pop("project", None)),
                                     extend_trace_retention=False, stop_after_attempt=FEEDBACK_ATTEMPTS)
         except Exception as e:
             print(f"[WARN] Couldn't record feedback {item.get('key')}: {type(e).__name__}: {e}")
@@ -356,6 +357,59 @@ def feedback(key: str, score, comment: str | None = None):
                                     "project": run.session_name})
     except queue.Full:
         print(f"[WARN] Couldn't record feedback {key}: {FEEDBACK_QUEUE_SIZE} scores waiting (is LangSmith down?)")
+
+
+def client():
+    """The LangSmith client while tracing is on, else None (Section J: saving a reader's rating)."""
+    return _client if status["enabled"] else None
+
+
+def sent_trace() -> dict | None:
+    """
+    {"trace_id", "project"} of the current request, if its trace is sent to LangSmith; else None
+    (tracing off, outside a request, or sampled out). Kept with an answer so a reader's rating
+    can go on its trace later (Section J). A sampled-out trace never reaches LangSmith, and the
+    SDK silently drops feedback for it, so a rating there would look saved and be lost.
+    """
+    run = get_current_run_tree()
+    if _client is None or run is None or not status["enabled"]:
+        return None
+    try:
+        if not _client._should_sample(run.trace_id):
+            return None
+    except Exception:
+        return None
+    return {"trace_id": str(run.trace_id), "project": run.session_name, "trace_start": _root_start(run)}
+
+
+def _root_start(run) -> str | None:
+    """
+    The root run's start time (ISO), which LangSmith needs with the id to find a run directly
+    (annotation queues, Section J). The current run is usually a child, but its dotted_order
+    starts with the root's: "20261020T125901346888Z<root id>.<...>".
+    """
+    try:
+        stamp = run.dotted_order.split(".", 1)[0][:22]
+        return datetime.strptime(stamp, "%Y%m%dT%H%M%S%fZ").replace(tzinfo=timezone.utc).isoformat()
+    except Exception:
+        return None
+
+
+# Where answers to look at go: every 👎 (added by the rating endpoint) and every answer that
+# failed a code check (added by a LangSmith rule, scripts/setup_review_queue.py). Section J #71.
+REVIEW_QUEUE = "ai-news-review"
+_review_queue_id: str | None = None
+
+
+def review_queue_id() -> str:
+    """The review queue's id, created if it doesn't exist yet. Cached. Blocking; raises on failure."""
+    global _review_queue_id
+    if _review_queue_id is None:
+        found = list(_client.list_annotation_queues(name=REVIEW_QUEUE))
+        queue = found[0] if found else _client.create_annotation_queue(
+            name=REVIEW_QUEUE, description="Answers to review: every 👎 from a reader and every answer that failed a code check.")
+        _review_queue_id = str(queue.id)
+    return _review_queue_id
 
 
 def current_trace() -> dict | None:
@@ -437,6 +491,8 @@ def _request_inputs(kwargs: dict, view: str | None) -> tuple[dict, dict]:
     answer_ids = getattr(req, "answer_ids", None)
     if answer_ids:
         inputs["answers"] = sorted(view for view, answer_id in answer_ids.items() if answer_id)
+    if req is not None and getattr(req, "score", None) is not None:      # POST /api/feedback (Section J)
+        inputs.update(score=req.score, answer=short_hash(str(req.answer_id)), comment_chars=len(req.comment or ""))
     watch_id = kwargs.get("watch_id")
     if watch_id:
         inputs["watch"] = short_hash(watch_id)

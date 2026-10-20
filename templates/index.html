@@ -47,8 +47,10 @@
                     <button id="tab-contradictions" role="tab" aria-selected="false" onclick="showView('contradictions')" class="px-4 py-2 -mb-px">Contradictions</button>
                 </div>
                 <h2 id="view-title" class="text-xl font-semibold mb-3">Intelligence Report</h2>
-                <div id="summary" class="mb-6 p-4 border rounded-lg bg-white shadow-sm">
+                <div id="summary" class="p-4 border rounded-lg bg-white shadow-sm">
                     </div>
+                <!-- 👍 / 👎 on the answer above (feature 2, Section J) -->
+                <div id="rating" class="mb-6"></div>
 
                 <h3 class="font-semibold mb-2">Cited Sources</h3>
                 <ul id="cited-sources" class="list-disc ml-5 space-y-1 text-sm">
@@ -175,6 +177,7 @@
         let answers = {};          // view -> {html, sources, answerId}, kept until the next Analyze
         let activeView = "report";
         let currentUpdate = null;  // the check result on screen (its watch_id opens the story log)
+        // answers[view] and the check on screen also keep their rating: {answerId, canRate, rating}
 
         // An error whose message is meant for the user. Any other error is a bug in this page.
         // status: the HTTP status, when the server sent one (a 404 on a check means the topic expired)
@@ -307,6 +310,9 @@
                     ${html}
                 </div>
             `;
+            const ratingEl = document.getElementById("rating");
+            ratingEl.innerHTML = "";
+            if (answers[view].answerId && answers[view].canRate) ratingEl.appendChild(ratingBar(answers[view]));
             const citedSourcesEl = document.getElementById("cited-sources");
             citedSourcesEl.innerHTML = "";
             if (sources && sources.length > 0) {
@@ -366,6 +372,7 @@
             answers = {};
             shownQuery = null;
             document.getElementById("summary").innerHTML = "";
+            document.getElementById("rating").innerHTML = "";
             document.getElementById("cited-sources").innerHTML = "";
             document.getElementById("related-links").innerHTML = "";
 
@@ -375,7 +382,8 @@
                 // The server reports an empty answer as an error, so this shouldn't happen
                 if (!data.summary_html) throw new ShownError(VIEWS.report.empty);
 
-                answers.report = { html: data.summary_html, sources: data.cited_sources, answerId: data.answer_id || null };
+                answers.report = { html: data.summary_html, sources: data.cited_sources, answerId: data.answer_id || null,
+                                   canRate: data.can_rate === true };
                 renderView("report");
                 renderRelatedLinks(data.related_links);
                 // Only a fully drawn report makes this the topic the tabs ask about
@@ -404,7 +412,7 @@
                 const data = await postQuery(VIEWS[view].endpoint, shownQuery);
                 const html = data[VIEWS[view].field];
                 if (!html) throw new ShownError(VIEWS[view].empty);
-                answers[view] = { html, sources: data.cited_sources, answerId: data.answer_id || null };
+                answers[view] = { html, sources: data.cited_sources, answerId: data.answer_id || null, canRate: data.can_rate === true };
                 renderView(view);
             } catch (error) {
                 // The view that was on screen stays (or is drawn again, if this one failed halfway
@@ -754,6 +762,107 @@
             if (newStories.some(s => s.summary_html) || updates.length) {
                 body.appendChild(textEl("p", "Summaries are AI-written from the linked articles.", "text-xs text-gray-500"));
             }
+            if (data.answer_id && data.can_rate === true) {
+                data.ratingTarget = data.ratingTarget || { answerId: data.answer_id };
+                body.appendChild(ratingBar(data.ratingTarget));
+            }
+        }
+
+        // ===================== Rating an answer (feature 2, Section J) =====================
+        // 👍 / 👎 under each view and under a check's update. The page sends the answer_id it already
+        // has (never a trace id); the server puts the rating on the trace that wrote the answer. 👎
+        // opens an optional comment box. Clicking again changes the rating: the server keeps one per
+        // answer. Saving a rating doesn't block the rest of the page (no setBusy).
+        const MAX_COMMENT = 1000;
+
+        // target: the answer being rated, {answerId, rating}. rating ({score, comment}) is kept on it,
+        // so switching tabs and back shows what was already sent.
+        function ratingBar(target) {
+            const state = target.rating || (target.rating = { score: null, comment: "" });
+            const bar = document.createElement("div");
+            bar.className = "mt-3 flex flex-wrap items-center gap-2 text-sm";
+            bar.setAttribute("role", "group");
+            bar.setAttribute("aria-label", "Rate this answer");
+            bar.appendChild(textEl("span", "Was this useful?", "text-gray-600"));
+
+            const choice = (emoji, label, score) => {
+                // The chosen one is shown (blue) as well as announced (aria-pressed)
+                const b = textEl("button", emoji, "px-2 py-1 border rounded hover:bg-gray-100 disabled:opacity-50 "
+                    + "aria-pressed:bg-blue-100 aria-pressed:border-blue-600 aria-pressed:ring-1 aria-pressed:ring-blue-600");
+                b.setAttribute("type", "button");
+                b.setAttribute("aria-label", label);
+                b.onclick = () => send(score, score === -1 ? state.comment : null);
+                return b;
+            };
+            const up = choice("👍", "Useful", 1);
+            const down = choice("👎", "Not useful", -1);
+            bar.appendChild(up);
+            bar.appendChild(down);
+
+            // Announced by screen readers; the error is an alert, next to the buttons it belongs to
+            const status = textEl("span", "", "text-green-700");
+            status.setAttribute("role", "status");
+            const error = textEl("span", "", "hidden text-red-700");
+            error.setAttribute("role", "alert");
+            bar.appendChild(status);
+            bar.appendChild(error);
+
+            // The comment box, after 👎
+            const form = document.createElement("div");
+            form.className = "hidden w-full flex flex-wrap items-start gap-2";
+            const box = document.createElement("textarea");
+            box.className = "flex-1 min-w-[16rem] border rounded p-2";
+            box.setAttribute("rows", "2");
+            box.setAttribute("maxlength", String(MAX_COMMENT));
+            box.setAttribute("aria-label", "What was wrong? (optional)");
+            box.setAttribute("placeholder", "What was wrong? (optional)");
+            box.value = state.comment || "";
+            const sendComment = textEl("button", "Send comment", "border border-blue-600 text-blue-700 px-3 py-1 rounded hover:bg-blue-50 disabled:opacity-50");
+            sendComment.setAttribute("type", "button");
+            sendComment.onclick = () => send(-1, box.value);
+            form.appendChild(box);
+            form.appendChild(sendComment);
+            bar.appendChild(form);
+
+            const show = () => {
+                up.setAttribute("aria-pressed", state.score === 1 ? "true" : "false");
+                down.setAttribute("aria-pressed", state.score === -1 ? "true" : "false");
+                if (state.score === -1) form.classList.remove("hidden"); else form.classList.add("hidden");
+                status.textContent = state.score === null ? "" : (state.comment ? "Thanks, your feedback and comment were saved." : "Thanks, your feedback was saved.");
+            };
+
+            let sending = false;
+            async function send(score, comment) {
+                if (sending) return;
+                const text = (comment || "").trim();
+                if (text.length > MAX_COMMENT) {
+                    error.textContent = `Your comment is too long. Please keep it under ${MAX_COMMENT.toLocaleString("en-US")} characters.`;
+                    return error.classList.remove("hidden");
+                }
+                sending = true;
+                for (const b of [up, down, sendComment]) b.disabled = true;
+                error.classList.add("hidden");
+                status.textContent = "Saving...";
+                const firstDown = score === -1 && state.score !== -1;
+                try {
+                    await apiRequest("POST", "/api/feedback", { answer_id: target.answerId, score, comment: text || null });
+                    state.score = score;
+                    state.comment = text;
+                    show();
+                    // 👎 saved: offer the comment box, with the keyboard focus in it
+                    if (firstDown && box.focus) box.focus();
+                } catch (e) {
+                    show();
+                    error.textContent = messageFor(e);
+                    error.classList.remove("hidden");
+                } finally {
+                    sending = false;
+                    for (const b of [up, down, sendComment]) b.disabled = false;
+                }
+            }
+
+            show();
+            return bar;
         }
 
         // --- The story log: every story this topic has had ---

@@ -219,3 +219,35 @@ def watch_not_found(log=""):
 def check_not_saved(log=""):
     """The check worked but its result couldn't be saved: showing it would show the same news again next time."""
     return AppError(503, "Couldn't save this check, so its results aren't shown. Please check again in a minute.", log)
+
+
+# --- Rating an answer (feature 2, Section J) ---
+# The page shows these next to the 👍 / 👎 buttons, not in the main error box.
+
+def rating_invalid(log=""):
+    """A score other than 1 / -1, or a body that isn't {answer_id, score, comment?}."""
+    return AppError(422, "Your rating couldn't be read. Please click 👍 or 👎 again.", log)
+
+def comment_too_long(limit: int, log=""):
+    return AppError(422, f"Your comment is too long. Please keep it under {limit:,} characters.", log)
+
+def rating_expired(log=""):
+    """Unknown, malformed or expired answer id: answers are kept for 2 hours (cache_service.ANSWER_TTL)."""
+    return AppError(404, "This answer can't be rated any more: answers can be rated for 2 hours. "
+                         "Analyze the topic again to rate a new one.", log)
+
+def rating_not_collected(log=""):
+    """The answer exists but its trace wasn't sent to LangSmith (tracing off or sampled out then)."""
+    return AppError(409, "Ratings aren't collected for this answer.", log)
+
+def rating_store_unavailable(log=""):
+    """Redis is down: the answer can't be looked up."""
+    return AppError(503, "Ratings can't be saved right now. Please try again in a minute.", log)
+
+def ratings_off(log=""):
+    """Tracing is off on the server now (no LangSmith client), so there's nowhere to save the rating."""
+    return AppError(503, "Ratings are switched off on the server right now.", log)
+
+def rating_not_saved(log=""):
+    """LangSmith refused, failed or didn't answer in time."""
+    return AppError(503, "Couldn't save your feedback right now. Please try again in a minute.", log)
