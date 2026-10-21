@@ -5,17 +5,17 @@ Everything is defined here, so it can be rebuilt exactly; running it again repla
   .local/venv/Scripts/python.exe scripts/setup_monitoring.py --project ai-news-dev --dry-run    what it would do
   .local/venv/Scripts/python.exe scripts/setup_monitoring.py --project ai-news-dev --preview    every series' filter and grouping
                                                                                                run on the last 14 days, nothing created
-  .local/venv/Scripts/python.exe scripts/setup_monitoring.py --project ai-news-dev              prices, dashboards, alerts
-  .local/venv/Scripts/python.exe scripts/setup_monitoring.py --project ai-news-dev --test-alert one test notification
+  .local/venv/Scripts/python.exe scripts/setup_monitoring.py --project ai-news-dev              prices and dashboards, then
+                                                                                               the alert settings to enter in the UI
   .local/venv/Scripts/python.exe scripts/setup_monitoring.py --markdown                         the doc's chart and alert tables
 
 1. Prices (#73): services/usage.MODEL_PRICES mirrored into the workspace's model price map, so
    LangSmith's own cost numbers match ours, including the dated price change (2027-01-01).
 2. Dashboards (#73-#75, #77): three custom dashboards, "ai-news · Usage and cost", "· Speed and
    errors", "· Quality", for this project. The charts are below; the doc lists them all.
-3. Alerts (#76): three alert rules on the project, sent to ntfy.sh (NTFY_ALERT_TOPIC in .env),
-   which turns LangSmith's alert JSON into a phone notification. The alert ids are kept in
-   .local/monitoring/<project>.json (LangSmith has no API to list them), so a rerun replaces them.
+3. Alerts (#76): three alert rules, sent to ntfy.sh (NTFY_ALERT_TOPIC in .env), which turns
+   LangSmith's alert JSON into a phone notification. They are made in the LangSmith UI: the API
+   answered 200 to every create but kept none (2026-10-20), so this prints the exact settings.
 
 How LangSmith's chart API behaves (found in Section K): saved charts must use its "V2" definitions
 (metric_definition, filter_definition), but its public API returns data only for "V1" series
@@ -35,7 +35,6 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 os.environ.setdefault("LANGSMITH_TRACING", "false")       # this script's own calls aren't traced
-STATE = ROOT / ".local" / "monitoring"
 PREFIX = "ai-news"
 
 # --- What the app records (the names the filters below rely on) ---
@@ -242,37 +241,46 @@ def dashboards(project: str) -> list[dict]:
 
 
 # --- Alerts (#76) ---
-# Plan: error rate over 20% in an hour, p95 latency over 60 s, any unreadable_answer. Alert rules
-# can average latency but not take a percentile, so "slow" is the average over 30 min.
+# Plan: error rate over 20% in an hour, p95 latency over 60 s, any unreadable answer. Made in the UI,
+# which offers only 5- or 15-minute windows and averages latency (no percentile): all three use 15 min.
+# Each was checked with the UI's Test button (2026-10-20), and the unreadable one with a real alert.
 
 def alert_rules() -> list[dict]:
-    answers = f"and({ROOT_FILTER}, {name_in(ANSWER_ROUTES)})"
     return [
-        {"name": f"{PREFIX}: error rate over 20% (1 h)", "description": "More than 20% of requests failed in the last hour.",
-         "type": "threshold", "attribute": "error_count", "aggregation": "pct", "operator": "gt", "threshold": 20,
-         "window_minutes": 60, "filter": ROOT_FILTER},
-        {"name": f"{PREFIX}: answers slower than 60 s (30 min average)", "description": "Report, timeline and contradictions requests averaged over 60 s.",
-         "type": "threshold", "attribute": "latency", "aggregation": "avg", "operator": "gt", "threshold": 60,
-         "window_minutes": 30, "filter": answers},
-        # Alert filters refuse has(tags, ...) ("Unsupported comparator"): an unreadable answer is
-        # found by the parse_error metadata the fact check records with that tag
-        {"name": f"{PREFIX}: unreadable fact-check answer", "description": "The fact check's JSON couldn't be read (every story left unjudged).",
-         "type": "threshold", "attribute": "run_count", "aggregation": "sum", "operator": "gte", "threshold": 1,
-         "window_minutes": 60, "filter": 'and(eq(name, "fact_check"), eq(metadata_key, "parse_error"))'},
+        {"name": f"{PREFIX}: error rate over 20%", "metric": "Errors", "aggregation": "Percentage", "condition": "greater than 20",
+         "window_minutes": 15, "filter": "Is Trace = true (whole requests)"},
+        {"name": f"{PREFIX}: answers slower than 60 s", "metric": "Latency", "aggregation": "Average", "condition": "greater than 60 s",
+         "window_minutes": 15, "filter": "Is Trace = true (whole requests)"},
+        # NOT "Is Trace": the tag is on the fact_check step inside the request, so the two filters together
+        # can never match (a real unreadable run fired nothing until it was removed, 2026-10-20)
+        {"name": f"{PREFIX}: unreadable fact-check answer", "metric": "Run Count", "aggregation": "Count", "condition": "at least 1",
+         "window_minutes": 15, "filter": "Tag = unreadable_answer only (no Is Trace)"},
     ]
 
 
-def ntfy_action(topic: str, project: str) -> dict:
-    """LangSmith posts its alert JSON (alert_rule_name, triggered_metric_value, ...) to ntfy, whose
-    templates (tpl=yes) turn it into a readable notification. LangSmith itself doesn't substitute.
-    The API takes the action's config as JSON *text* with a project_name (an object is refused:
-    "cannot unmarshal object into Go value of type string"; found in Section K)."""
-    params = {"tpl": "yes", "t": "ai-news: {{.alert_rule_name}}",
+def ntfy_url(topic: str) -> str:
+    """LangSmith posts its alert JSON (alert_rule_name, triggered_metric_value, ...) and appends its own
+    keys; it substitutes nothing. ntfy's templates (tpl=yes) read those keys into the notification.
+    The title is the rule's name alone: the names already start with "ai-news:"."""
+    params = {"tpl": "yes", "t": "{{.alert_rule_name}}",
               "m": "{{.alert_rule_attribute}} = {{.triggered_metric_value}} (threshold {{.triggered_threshold}}) in {{.project_name}}\n{{.runs_url}}",
               "p": "high"}
-    return {"target": "webhook", "config": json.dumps({"url": f"https://ntfy.sh/{topic}?" + urllib.parse.urlencode(params),
-                                                       "headers": {"Content-Type": "application/json"}, "body": {},
-                                                       "project_name": project})}
+    return f"https://ntfy.sh/{topic}?" + urllib.parse.urlencode(params)
+
+
+def alert_settings(project: str, topic: str | None) -> str:
+    """What to enter in the LangSmith UI: <project> -> Alerts (top right) -> + Alert, once per rule."""
+    if not topic:
+        return "[K] alerts: NTFY_ALERT_TOPIC isn't set in .env, so there's no webhook URL to give"
+    lines = [f"[K] alerts: make these 3 in the UI: {project} -> Alerts icon (top right) -> + Alert. For each:",
+             "      Channel: Webhook",
+             f"      URL:     {ntfy_url(topic)}",
+             '      Headers: {"Content-Type": "application/json"}',
+             "      Body:    {}",
+             "      Press Test before saving: the phone gets a notification titled with the rule's name."]
+    for r in alert_rules():
+        lines.append(f"    - {r['name']}: {r['metric']} / {r['aggregation']}, {r['condition']}, {r['window_minutes']} min, filter: {r['filter']}")
+    return "\n".join(lines)
 
 
 # --- Prices (#73) ---
@@ -377,56 +385,6 @@ def setup_dashboards(api, project: str, project_id: str, dry_run: bool) -> list[
     return ids
 
 
-def listed_alerts(api, project_id: str) -> dict[str, str]:
-    """{name: id} of the project's alert rules, from an endpoint the API spec doesn't list. On 2026-10-20 it
-    answered {"session_alert_rules": null} even after a create returned 200, so it isn't relied on alone."""
-    try:
-        listed = api.call("GET", f"/api/v1/platform/alerts/{project_id}") or {}
-    except RuntimeError:
-        return {}
-    rules = listed.get("session_alert_rules") or []
-    return {(r.get("rule") or r).get("name"): (r.get("rule") or r).get("id") for r in rules}
-
-
-def setup_alerts(api, project: str, project_id: str, topic: str | None, dry_run: bool) -> list[str]:
-    """
-    A create answers 200 with an empty body (no id), so ids can't be kept. A rule is replaced when
-    the list shows it (by name), and otherwise created only once: the names created are kept in
-    .local/monitoring/<project>.json, so a rerun doesn't add duplicates LangSmith wouldn't list.
-    """
-    if not topic:
-        print("[K] alerts: NTFY_ALERT_TOPIC isn't set in .env; skipped")
-        return []
-    state_file = STATE / f"{project}.json"
-    state = json.loads(state_file.read_text(encoding="utf-8")) if state_file.exists() else {}
-    created_before = set(state.get("alerts_created", []))
-    listed = listed_alerts(api, project_id)
-    done = []
-    for rule in alert_rules():
-        name = rule["name"]
-        if name in listed:
-            action = "replace (listed)"
-        elif name in created_before:
-            print(f"[K] alert '{name}': created on an earlier run (LangSmith doesn't list it); change or delete it in the UI")
-            continue
-        else:
-            action = "create"
-        if dry_run:
-            print(f"[K] alert '{name}': would {action}")
-            continue
-        if name in listed:
-            api.call("DELETE", f"/api/v1/platform/alerts/{project_id}/{listed[name]}")
-        api.call("POST", f"/api/v1/platform/alerts/{project_id}", json={"rule": rule, "actions": [ntfy_action(topic, project)]})
-        done.append(name)
-        print(f"[K] alert '{name}': {'replaced' if name in listed else 'created'} (200; LangSmith returns no id)")
-    if done:
-        STATE.mkdir(parents=True, exist_ok=True)
-        state_file.write_text(json.dumps({**state, "alerts_created": sorted(created_before | set(done)),
-                                          "alerts_updated_at": datetime.now(timezone.utc).isoformat(timespec="seconds")}, indent=1),
-                              encoding="utf-8")
-    return done
-
-
 def describe(s: dict) -> str:
     kind = s["kind"]
     return {"count": "runs", "sum": f"sum of {s.get('field')}", "percentile": f"p{round(s.get('p', 0) * 100)} latency",
@@ -447,14 +405,13 @@ def markdown() -> str:
                 lines.append(f"| {n if i == 0 else ''} | {cell(ch['title']) if i == 0 else ''} | {ch['chart_type'] if i == 0 else ''} | "
                              f"{cell(s['name'])}: {describe(s)} | `{cell(s['filter'] or ROOT_FILTER)}` | {group} |")
         lines.append("")
-    lines += ["#### Alerts", "", "| Alert | Metric | Over | Fires when | Filter |", "|---|---|---|---|---|"]
+    lines += ["#### Alerts (made in the UI)", "", "| Alert | Metric / aggregation | Fires when | Window | Filter |", "|---|---|---|---|---|"]
     for r in alert_rules():
-        lines.append(f"| {r['name']} | {r['aggregation']} of {r['attribute']} | {r['window_minutes']} min | "
-                     f"{r['operator']} {r['threshold']} | `{cell(r['filter'])}` |")
+        lines.append(f"| {r['name']} | {r['metric']} / {r['aggregation']} | {r['condition']} | {r['window_minutes']} min | {cell(r['filter'])} |")
     return "\n".join(lines)
 
 
-def main(project: str, dry_run: bool, do_preview: bool, test_alert: bool):
+def main(project: str, dry_run: bool, do_preview: bool):
     from dotenv import load_dotenv
     load_dotenv(ROOT / ".env")
     from langsmith import Client
@@ -466,17 +423,9 @@ def main(project: str, dry_run: bool, do_preview: bool, test_alert: bool):
         sys.exit(f"[K] project {project} not found ({type(e).__name__}): it's created by its first trace. Run this after that.")
     if do_preview:
         sys.exit(1 if preview(api, project_id) else 0)
-    if test_alert:
-        listed = listed_alerts(api, project_id)
-        if not listed:
-            sys.exit("[K] LangSmith lists no alert rules for this project, so there's no id to test: use Test on the rule in the UI")
-        name, rule_id = next(iter(listed.items()))
-        api.call("POST", f"/api/v1/platform/alerts/{project_id}/{rule_id}/test")
-        print(f"[K] test notification sent for '{name}': check the ntfy app")
-        return
     setup_prices(api, dry_run)
     setup_dashboards(api, project, project_id, dry_run)
-    setup_alerts(api, project, project_id, os.getenv("NTFY_ALERT_TOPIC"), dry_run)
+    print(alert_settings(project, os.getenv("NTFY_ALERT_TOPIC")))
 
 
 if __name__ == "__main__":
@@ -485,11 +434,10 @@ if __name__ == "__main__":
     parser.add_argument("--markdown", action="store_true", help="print the doc's chart and alert tables; no API calls")
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--preview", action="store_true", help="run every series' filter and grouping on recent data; create nothing")
-    parser.add_argument("--test-alert", action="store_true", help="send one test notification through the first alert")
     a = parser.parse_args()
     if a.markdown:
         print(markdown())
     elif not a.project:
         parser.error("--project is required")
     else:
-        main(a.project, a.dry_run, a.preview, a.test_alert)
+        main(a.project, a.dry_run, a.preview)
