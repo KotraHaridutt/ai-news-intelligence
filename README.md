@@ -28,6 +28,7 @@ This project automates that work:
 | **Related links** | The biggest stories first (with how many articles covered each), then the most relevant unique stories, one link per story |
 | **Source citations** | Every response lists the articles its answer was generated from, with their dates |
 | **Follow a topic** | "Check for updates" shows only what the report you read (and every check since) didn't contain: new stories with short summaries, new facts on known stories, or "Nothing new". Repeats are hidden but listed, blocked pages are listed, and a story log keeps every story the topic has had |
+| **Rate an answer** | 👍 / 👎 under each view and each check, with an optional comment after 👎. The rating goes onto the trace that wrote the answer, and every 👎 lands in a review queue |
 
 In the page, the report, timeline and contradictions are three tabs over the same topic. Timeline and Contradictions load on their first click and are kept until the next search, so switching between views costs nothing. **Follow this topic** under the report adds it to a Following list kept in your browser (no account); a link moves a followed topic to another browser.
 
@@ -122,6 +123,7 @@ All three endpoints share the cache, so switching from the report to the timelin
 | Caching | Upstash Redis (`redis` asyncio client) |
 | LLM | Google Gemini Flash (`gemini-3.8-flash`, falling back to `gemini-3.6-flash`), thinking level `low`, default temperature, 45 s timeout per attempt, 75 s deadline for the whole answer step; the follow check uses structured output (JSON schema, Pydantic) |
 | Frontend | Jinja2 template, Tailwind CSS, vanilla JavaScript; followed topics in `localStorage` |
+| Observability | LangSmith: traces and spans, tokens and cost, prompt versions, eval datasets and experiments, online checks, user feedback, dashboards; alerts to ntfy.sh |
 | Deployment | Render (free tier) |
 
 ---
@@ -147,7 +149,7 @@ The three views accept a JSON body `{"query": "<topic>"}`. Interactive documenta
 }
 ```
 
-`answer_id` names this answer for **Follow** (`null` if it couldn't be saved; the answer is still shown).
+`answer_id` names this answer for **Follow** and for rating it (`null` if it couldn't be saved; the answer is still shown). `can_rate` says whether 👍 / 👎 can be saved for it (only when its trace was sent to LangSmith).
 
 ### `POST /api/timeline`: chronological events
 
@@ -165,6 +167,10 @@ Returns `query`, `analysis_html`, `cited_sources`, `answer_id` and `time_taken`.
 | `POST /api/follow/{watch_id}/check` | What's new since the last check (the stored result within 30 min) | 1 request (0 if shared or reused) / 0 or 1 call |
 | `GET /api/follow/{watch_id}` | The story log and the last result | no / no |
 | `DELETE /api/follow/{watch_id}` | Stop following | no / no |
+
+### `POST /api/feedback`: rate an answer
+
+`{"answer_id": "<from the answer>", "score": 1 or -1, "comment": "optional, up to 1,000 characters"}` returns `{"saved": true, "score": 1}`. One rating per answer: rating again replaces it. Answers can be rated for 2 hours. A check's update has its own `answer_id`.
 
 A check returns:
 
@@ -196,6 +202,9 @@ A check returns:
 | `409` | Follow: the report's article list expired or was rebuilt since the report (or the answer belongs to another topic) | This report is more than 2 hours old. Analyze the topic again, then follow it. |
 | `404` | A followed topic that expired (30 days without a check) or an incomplete link | This followed topic has expired after 30 days without a check, or the link is incomplete. Follow it again to start a new history. |
 | `503` | Following without Redis; or a check that worked but couldn't be saved (it isn't shown) | Following topics is unavailable right now. You can still analyze topics as usual. |
+| `422` / `404` / `409` / `503` | Rating: an unreadable rating or a comment over 1,000 characters; an answer older than 2 hours; an answer whose trace wasn't sent; Redis, tracing or LangSmith unavailable | Couldn't save your feedback right now. Please try again in a minute. |
+
+With tracing on, every error also carries `"ref"`: the end of its trace id, shown on the page as "(Ref: 1a2b3c4d)" so a reported error can be found in LangSmith.
 
 All messages live in [`services/errors.py`](services/errors.py). The page has its own messages for what the server can't answer: no connection, a proxy error while the server wakes up, and no answer after 120 s.
 
@@ -230,7 +239,7 @@ REDIS_URL=rediss://default:your_password@your-db.upstash.io:6379
 
 `REDIS_URL` is optional. Without it the app runs with caching disabled, so every request runs the full pipeline. Upstash shows the URL as `redis://...`; use `rediss://` (TLS), which Upstash requires.
 
-Optional: `MAX_CONCURRENT_BUILDS` (default `3`) limits how many new queries are built at the same time, and `GEMINI_CHAT_MODEL` (default `gemini-3.8-flash`) and `GEMINI_FALLBACK_MODEL` (default `gemini-3.6-flash`) switch the answer models without a code change (Gemini 3+ models are required). The fallback is used only when the main model is overloaded or times out.
+Optional: `MAX_CONCURRENT_BUILDS` (default `3`) limits how many new queries are built at the same time, and `GEMINI_CHAT_MODEL` (default `gemini-3.8-flash`) and `GEMINI_FALLBACK_MODEL` (default `gemini-3.6-flash`) switch the answer models without a code change (Gemini 3+ models are required). The fallback is used only when the main model is overloaded or times out. Tracing to LangSmith is optional too: see [Observability](#observability) and `.env.example`.
 
 ### Run
 
@@ -252,6 +261,38 @@ uvicorn server:app --host 0.0.0.0 --port $PORT
 
 The free tier has 512 MB of RAM, so embeddings come from the Gemini API instead of a local Sentence-Transformers model. PyTorch alone would use most of the available memory.
 
+For tracing in production, also set `LANGSMITH_API_KEY` (`render.yaml` asks for it and sets `LANGSMITH_TRACING=true`, `APP_ENV=prod`, project `ai-news-prod`). After the first traced request, run `scripts/setup_review_queue.py --project ai-news-prod` and `scripts/setup_monitoring.py --project ai-news-prod`, then create the three alerts it prints in the LangSmith UI.
+
+---
+
+## Observability
+
+The app is traced end to end with [LangSmith](https://smith.langchain.com) (feature 2; how each part was built and measured is in `implemented/features/feature-2/docs/`, sections A-L).
+
+| What | How |
+|---|---|
+| **Traces** | One trace per request, named after its route (`POST /query`, ...), with spans for each step: GNews search, scraping, grouping, indexing, retrieval, every chat attempt (retries and fallback visible), the follow check's novelty steps and fact check. A followed topic's checks share a thread. Errors carry their status, the user's message and a `ref`. |
+| **Privacy** | API keys, tokens and Redis passwords are masked before anything leaves the process; long texts are trimmed; watch ids and answer ids leave the server only as hashes. Tracing runs on background threads and never fails or slows a request (measured in prod: +1 ms median). |
+| **Tokens and cost** | Every chat attempt's input, output and thinking tokens and its cost; embeddings with estimated tokens. Per request: `cost_usd`, `chat_calls`, `answered_by` (primary or fallback). A Redis counter per model per Pacific day mirrors Gemini's free quota (20 a day), and a model out of quota is skipped until midnight Pacific. |
+| **Versions** | Every prompt has a version (a hash of its text) and the settings a `config_version`; both are on every trace and saved answer. Prompts are mirrored to the LangSmith Prompt Hub (`scripts/push_prompts.py`). |
+| **Evals** | Frozen eval data and 4 private datasets (retrieval, answers, fact check, prompt injection), free code checks, retrieval scores, per-sentence LLM judges with calibration against reviewed labels, and a resumable experiment runner inside the daily budget (`evals/run_evals.py`: run, compare, pairwise, thresholds). |
+| **Online checks** | The free code checks run on every live answer and every fact check, as feedback on its trace; `evals/judge_yesterday.py` runs the LLM judge on a day's real answers by hand. |
+| **User feedback** | 👍 / 👎 on the answer's trace (`user_rating`); 👎 and failed checks go to the `ai-news-review` annotation queue. |
+| **Dashboards and alerts** | Three dashboards (usage and cost, speed and errors, quality: 27 charts) built by `scripts/setup_monitoring.py`, which also keeps LangSmith's price map equal to ours. Alerts (error rate, slow answers, unreadable fact check) go to a phone through ntfy.sh. |
+
+Turn it on locally with `LANGSMITH_API_KEY` and `LANGSMITH_TRACING=true` in `.env` (project `ai-news-dev`). Without them the app runs exactly the same, untraced.
+
+```bash
+# evals (each counts against the daily Gemini budget; the runner stops before it runs out)
+python evals/run_evals.py status
+python evals/run_evals.py run retrieval                  # no chat calls
+python evals/run_evals.py run answers --judge --set-baseline
+python evals/run_evals.py compare <experiment-a> <experiment-b> --pairwise
+python evals/judge_yesterday.py --dry-run                # what yesterday's real answers would cost to judge
+```
+
+**Free-plan limits that shape it:** Gemini allows 20 chat calls a day per model, so evals are resumable across days and LLM judging of live traffic is run by hand. LangSmith keeps traces 14 days on the free plan; worth-keeping examples go to datasets. LangSmith alerts can't email, so they go to ntfy.sh.
+
 ---
 
 ## Project structure
@@ -269,7 +310,15 @@ ai-news-intelligence/
 │   ├── rag_service.py           # Chunking, cached embeddings, FAISS index, prompts, retrieval per view
 │   ├── novelty_service.py       # Following: a topic's snapshot; seen / update / related / new; merge; story log
 │   ├── fact_check_service.py    # Following: the one structured LLM call that keeps only facts not already told
-│   └── follow_service.py        # Following: Follow, Check, story log, unfollow
+│   ├── follow_service.py        # Following: Follow, Check, story log, unfollow
+│   ├── observability.py         # LangSmith: setup, redaction, spans, request totals, feedback queue
+│   ├── usage.py                 # Tokens, cost, the daily Gemini quota counter
+│   ├── prompts.py               # The prompts, their versions, the Prompt Hub mirror
+│   ├── checks.py                # Free code checks on answers, retrieval and fact checks
+│   ├── online_checks.py         # Those checks on every live answer, as trace feedback
+│   └── feedback_service.py      # 👍 / 👎 on an answer's trace, the review queue
+├── evals/                       # Eval data, datasets, judges, calibration, the experiment runner, judge_yesterday
+├── scripts/                     # Prompt Hub mirror, review queue, dashboards and alerts setup
 ├── templates/index.html         # Web UI: report / timeline / contradictions tabs, Following list, update view
 ├── static/style.css
 ├── render.yaml                  # Render deployment blueprint
@@ -305,7 +354,9 @@ ai-news-intelligence/
 - [x] Make embedding, indexing and LLM calls fully non-blocking (`ainvoke`, `asyncio.to_thread`)
 - [x] Replace the in-process cache with a shared cache (Redis) that survives restarts
 - [x] Follow a topic and see only what changed since the last look
-- [ ] Add inline per-claim citations and an automated faithfulness check
+- [x] Observability: traces, cost, versions, evals, online checks, user feedback, dashboards and alerts (LangSmith)
+- [x] Automated faithfulness check: per-sentence LLM judges with calibration (the calibration run waits for a healthy Gemini quota day)
+- [ ] Add inline per-claim citations
 
 Limits of following, on the free plans:
 

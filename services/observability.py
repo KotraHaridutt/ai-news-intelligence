@@ -325,10 +325,14 @@ def _send_feedback():
     while True:
         item = _feedback_queue.get()
         try:
-            _client.create_feedback(**item, session_id=project_id(item.pop("project", None)),
-                                    extend_trace_retention=False, stop_after_attempt=FEEDBACK_ATTEMPTS)
+            if callable(item):            # other background work for LangSmith (close_open_llm_runs)
+                item()
+            else:
+                _client.create_feedback(**item, session_id=project_id(item.pop("project", None)),
+                                        extend_trace_retention=False, stop_after_attempt=FEEDBACK_ATTEMPTS)
         except Exception as e:
-            print(f"[WARN] Couldn't record feedback {item.get('key')}: {type(e).__name__}: {e}")
+            what = f"feedback {item.get('key')}" if isinstance(item, dict) else "an update to LangSmith"
+            print(f"[WARN] Couldn't send {what}: {type(e).__name__}: {e}")
         finally:
             _feedback_queue.task_done()
 
@@ -339,19 +343,62 @@ def _wait_for_feedback(timeout: float):
         _feedback_queue.all_tasks_done.wait_for(lambda: _feedback_queue.unfinished_tasks == 0, timeout)
 
 
+# --- Chat runs cut off by a deadline (Section L) ---
+# asyncio.wait_for cancels the answer step at its deadline while a chat attempt is still running.
+# LangChain is then interrupted inside asyncio.gather and never calls on_llm_error, so the attempt's
+# run is never closed: LangSmith showed it "pending" for good (live run, 2026-10-21). The usage
+# callback registers each chat run here while it runs, and the deadline handlers close what's left.
+_open_llm_runs: ContextVar[dict | None] = ContextVar("open_llm_runs", default=None)
+
+
+def llm_run_started(run_id):
+    runs = _open_llm_runs.get()
+    if runs is not None:
+        runs[run_id] = time.time()
+
+
+def llm_run_ended(run_id):
+    runs = _open_llm_runs.get()
+    if runs is not None:
+        runs.pop(run_id, None)
+
+
+def close_open_llm_runs(reason: str) -> list:
+    """Ends the request's chat runs that are still open, with `reason` as their error. Returns their ids."""
+    runs = _open_llm_runs.get()
+    if not runs:
+        return []
+    ids = list(runs)
+    runs.clear()
+    if _client is None or not status["enabled"]:
+        return ids
+    ended = datetime.now(timezone.utc)
+    _start_feedback_thread()
+    for run_id in ids:
+        try:
+            _feedback_queue.put_nowait(lambda run_id=run_id: _client.update_run(run_id, end_time=ended, error=reason))
+        except queue.Full:
+            print(f"[WARN] Couldn't close chat run {run_id}: {FEEDBACK_QUEUE_SIZE} updates waiting (is LangSmith down?)")
+    return ids
+
+
+def _start_feedback_thread():
+    global _feedback_thread
+    with _feedback_lock:
+        if _feedback_thread is None:
+            _feedback_thread = threading.Thread(target=_send_feedback, name="langsmith-feedback", daemon=True)
+            _feedback_thread.start()
+
+
 def feedback(key: str, score, comment: str | None = None):
     """
     A feedback score on the current request's trace. Queued and sent in the background, so the
     request never waits for it. No-op with tracing off or outside a traced request; never raises.
     """
-    global _feedback_thread
     run = get_current_run_tree()
     if _client is None or run is None or not status["enabled"]:
         return
-    with _feedback_lock:
-        if _feedback_thread is None:
-            _feedback_thread = threading.Thread(target=_send_feedback, name="langsmith-feedback", daemon=True)
-            _feedback_thread.start()
+    _start_feedback_thread()
     try:
         _feedback_queue.put_nowait({"trace_id": run.trace_id, "key": key, "score": score, "comment": comment,
                                     "project": run.session_name})
@@ -534,6 +581,7 @@ def request_span(name: str, view: str | None = None):
             inputs, metadata = _request_inputs(kwargs, view)
             totals = {}
             token = _totals.set(totals)
+            open_runs_token = _open_llm_runs.set({})
             try:
                 # LangSmith passes a span's tags and metadata down to the runs started inside it, so
                 # the view tag marks every run of that answer ("all report runs"); requests themselves
@@ -557,6 +605,7 @@ def request_span(name: str, view: str | None = None):
                     return result
             finally:
                 _totals.reset(token)
+                _open_llm_runs.reset(open_runs_token)
         return wrapper
     return decorate
 

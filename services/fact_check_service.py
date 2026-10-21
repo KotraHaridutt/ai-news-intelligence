@@ -6,7 +6,7 @@ from datetime import datetime
 from pydantic import BaseModel, Field
 from langchain_core.exceptions import OutputParserException
 
-from services import errors, observability, online_checks, prompts
+from services import errors, observability, online_checks, prompts, usage
 from services import rag_service as rag
 from services.novelty_service import SHOWN, NOTHING_NEW, UNJUDGED
 
@@ -190,6 +190,8 @@ async def run_fact_check(query, stories, known_stories, told) -> dict:
         except Exception as e:                    # a missed deadline is a TimeoutError -> 504
             if isinstance(e, TimeoutError):
                 run.add_tags(["timeout"])
+                # The attempt the deadline cut off would stay "pending" in LangSmith (Section L)
+                usage.forget(observability.close_open_llm_runs(rag.DEADLINE_CANCELLED))
             raise errors.report_failed(e, "update") from e
 
         result = read_answer(answer, stories)

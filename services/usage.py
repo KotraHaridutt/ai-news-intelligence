@@ -181,21 +181,26 @@ class UsageHandler(AsyncCallbackHandler):
     `role` is "primary" or "fallback", for the log line.
     """
 
+    _all: list = []          # every handler, so a cancelled run's entry can be forgotten (forget)
+
     def __init__(self, role: str):
         self.role = role
         self._started: dict = {}
+        UsageHandler._all.append(self)
 
     async def on_chat_model_start(self, serialized, messages, *, run_id, tags=None, metadata=None, **kwargs):
         model = (metadata or {}).get("ls_model_name") or ((serialized or {}).get("kwargs") or {}).get("model") or "?"
         view = next((tag for tag in (tags or []) if tag in VIEWS), "chat")
         model = str(model).removeprefix("models/")
         self._started[run_id] = (time.perf_counter(), model, view)
+        observability.llm_run_started(run_id)
         # Counted when it's sent, not when it ends: an attempt the 75 s deadline cuts off never
         # ends normally (no on_llm_end / on_llm_error), but Google has received it (Section G)
         observability.add_totals(chat_calls=1)
         _background(_count(model, {"attempts": 1}))
 
     async def on_llm_end(self, response, *, run_id, **kwargs):
+        observability.llm_run_ended(run_id)
         started, model, view = self._started.pop(run_id, (time.perf_counter(), "?", "chat"))
         seconds = time.perf_counter() - started
         try:
@@ -216,6 +221,7 @@ class UsageHandler(AsyncCallbackHandler):
                                            "output_tokens": output_tokens, "thinking_tokens": thinking}, line, chat=True))
 
     async def on_llm_error(self, error, *, run_id, **kwargs):
+        observability.llm_run_ended(run_id)
         started, model, view = self._started.pop(run_id, (time.perf_counter(), "?", "chat"))
         kind = _error_kind(error)
         if kind == "daily_limit":
@@ -223,6 +229,13 @@ class UsageHandler(AsyncCallbackHandler):
         observability.add_totals(chat_errors=1)
         line = f"[WARN] LLM {view}: {model} attempt failed ({kind}) after {time.perf_counter() - started:.1f} s"
         _background(_count_and_log(model, {kind: 1}, line, chat=True))
+
+
+def forget(run_ids):
+    """Attempts a deadline cancelled: no end callback will come, so their start entries are dropped."""
+    for handler in UsageHandler._all:
+        for run_id in run_ids:
+            handler._started.pop(run_id, None)
 
 
 # --- Embedding calls (#35) ---

@@ -62,6 +62,7 @@ CHAT_ATTEMPTS = 2             # per model, including the first try
 # and the user would see "took too long" from the page instead of the real reason. A fast
 # failure such as a 429 still falls back within seconds; a model that hangs uses up the deadline.
 CHAT_DEADLINE_SECONDS = 75
+DEADLINE_CANCELLED = "cancelled: the answer step's deadline passed while this attempt was still running"
 
 # --- Retrieval (gap_4 Section D) ---
 # Measured on 8 topics: indexes hold 7-60 chunks, and with k=15 a third of them were sent whole.
@@ -578,6 +579,8 @@ async def run_rag_query_with_store(query, vector_store, prompt_type):
         except Exception as e:   # a missed deadline is a TimeoutError -> "took too long" (504)
             if isinstance(e, TimeoutError):
                 run.add_tags(["timeout"])
+                # The attempt the deadline cut off would stay "pending" in LangSmith (Section L)
+                usage.forget(observability.close_open_llm_runs(DEADLINE_CANCELLED))
             raise errors.report_failed(e, prompt_type) from e
 
         summary = _retrieval_summary(documents, vector_store.index.ntotal, RETRIEVAL_K, STORY_CAP)
