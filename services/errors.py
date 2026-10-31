@@ -12,13 +12,15 @@ from google.genai import errors as genai_errors
 class AppError(Exception):
     """
     A failure the user should see. `message` is shown in the UI; `log` is the
-    technical reason for the server log (never sent to the user).
+    technical reason for the server log (never sent to the user). `headers` go on the
+    response (Retry-After on a 429).
     """
-    def __init__(self, status: int, message: str, log: str = ""):
+    def __init__(self, status: int, message: str, log: str = "", headers: dict | None = None):
         super().__init__(message)
         self.status = status
         self.message = message
         self.log = log or message
+        self.headers = headers
 
 
 def _topic(topic: str) -> str:
@@ -196,6 +198,76 @@ def report_failed(e: Exception, prompt_type: str):
 def empty_report(prompt_type: str):
     name = _OUTPUT_NAMES.get(prompt_type, "answer")
     return AppError(502, f"The AI returned an empty {name}. Please try again.", f"{prompt_type}: empty answer")
+
+
+# --- Safety (feature 3) ---
+# The 11 messages approved in Section A (A3 §4.1, 2026-10-31). Statuses: 400 for a request we
+# won't serve (the same query gets the same answer, so they never say "try again"), 422 when
+# Gemini declined the prompt, 502 when the answer failed, 429 with Retry-After for every limit.
+# A query with "?", "!" or "-" is never refused: Section C removes them and searches (#22).
+
+def _a(name: str) -> str:
+    """'a report', 'an analysis of conflicting reports', 'an update'."""
+    return f"an {name}" if name[:1] in "aeiou" else f"a {name}"
+
+def _retry_after(seconds) -> dict | None:
+    return {"Retry-After": str(max(1, int(seconds)))} if seconds else None
+
+def query_refused(log=""):
+    """C #25: the intent check put the query in the block band (enforce mode). One wording for
+    off-topic, harmful, probing and jailbreak: Clef mixes off_topic and harmful_request up (A2 §5.1)."""
+    return AppError(400, "This app analyses news topics, so it can't help with that. "
+                         'Try a topic such as "climate change" or "stock market".', log)
+
+def query_too_long(limit: int, log=""):
+    """C #21: GNews accepts at most 200 characters (A2 §4)."""
+    return AppError(400, f"Your topic is too long. Please keep it under {limit:,} characters.", log)
+
+def answer_withheld(log=""):
+    """D #36 (the canary showed up in the answer), K #83 (very insulting wording by the model)."""
+    return AppError(502, "The answer couldn't be shown because it failed a safety check. "
+                         "Please try again, or try another view.", log)
+
+def prompt_blocked(log=""):
+    """F #47: Gemini blocked the prompt (prompt_feedback.block_reason)."""
+    return AppError(422, "The AI service declined to analyse the articles found for this topic. "
+                         "Please try a different topic.", log)
+
+def answer_blocked(prompt_type: str, log=""):
+    """F #47: Gemini stopped the answer (finish_reason SAFETY, PROHIBITED_CONTENT, BLOCKLIST, SPII)."""
+    name = _OUTPUT_NAMES.get(prompt_type, "answer")
+    return AppError(502, f"The AI stopped writing this {name} for safety reasons. "
+                         "Please try another view or a different topic.", log)
+
+def rate_limited(seconds: int, log=""):
+    """L #87: per-IP limit per minute."""
+    seconds = max(1, int(seconds))
+    return AppError(429, f"You're sending requests too quickly. Please wait {seconds} second{'s' if seconds != 1 else ''} "
+                         "and try again.", log, _retry_after(seconds))
+
+def daily_share_used(seconds_left=None, log=""):
+    """L #89: this visitor's share of the day's chat calls is used up."""
+    return AppError(429, "You've used today's share of analyses. It resets at midnight Pacific time"
+                         f"{_until_text(seconds_left)}.", log, _retry_after(seconds_left))
+
+def request_too_large(log=""):
+    """L #88: the request body is over the size limit (refused before it's parsed)."""
+    return AppError(413, "The request is too large. Please enter a shorter topic.", log)
+
+def not_enough_coverage(topic: str, prompt_type: str, log=""):
+    """J #79 / G #52a: none of the retrieved chunks is about the query."""
+    name = _OUTPUT_NAMES.get(prompt_type, "answer")
+    return AppError(404, f'The articles found don\'t cover "{_topic(topic)}" closely enough for {_a(name)}. '
+                         "Try a more specific topic.", log)
+
+def server_busy(log=""):
+    """L #90: the build queue is over its cap."""
+    return AppError(503, "Many people are using the app right now. Please try again in a minute.", log)
+
+def follow_limit(seconds_left=None, log=""):
+    """L #94: this visitor's new watches for today are used up."""
+    return AppError(429, "You've followed the maximum number of topics for today. Please try again tomorrow.",
+                    log, _retry_after(seconds_left))
 
 
 # --- Following a topic (feature 1) ---

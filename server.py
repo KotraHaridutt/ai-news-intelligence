@@ -21,7 +21,7 @@ import markdown2
 # --- Our Services ---
 # observability first: it decides whether traces are sent before any model is called
 from services import observability
-from services import cache_service, errors, feedback_service, follow_service
+from services import cache_service, errors, feedback_service, follow_service, safety
 from services.errors import AppError
 from services.pipeline_service import get_pipeline_data, build_time
 from services.rag_service import run_rag_query_with_store
@@ -30,6 +30,8 @@ BASE_DIR = Path(__file__).resolve().parent
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # Safety (feature 3): loads the fallback classifiers, reads today's Clef neurons, one log line
+    await safety.startup()
     yield
     # Shutdown: send the traces still queued. Render's free plan stops an idle app, and
     # traces queued at that moment would be lost. Waits at most 5 s; never raises.
@@ -77,7 +79,7 @@ def error_content(message: str, exc: Exception) -> dict:
 @app.exception_handler(AppError)
 async def app_error_handler(request: Request, exc: AppError):
     print(f"[WARN] {request.url.path} -> {exc.status}: {exc.log}")
-    return JSONResponse(status_code=exc.status, content=error_content(exc.message, exc))
+    return JSONResponse(status_code=exc.status, content=error_content(exc.message, exc), headers=exc.headers)
 
 @app.exception_handler(RequestValidationError)
 async def validation_error_handler(request: Request, exc: RequestValidationError):

@@ -41,7 +41,8 @@ _TRUE = {"1", "true", "yes", "on"}
 # Nothing leaked when measured (Section A), but the GNews key travels in the request URL
 # (?token=...), and an httpx error keeps that URL on its request object. These rules catch it
 # wherever it ends up, and the exact values below catch every key whatever its shape.
-SECRET_ENV_VARS = ("GOOGLE_API_KEY", "GEMINI_API_KEY", "GNEWS_API_KEY", "LANGSMITH_API_KEY", "LANGCHAIN_API_KEY")
+SECRET_ENV_VARS = ("GOOGLE_API_KEY", "GEMINI_API_KEY", "GNEWS_API_KEY", "LANGSMITH_API_KEY", "LANGCHAIN_API_KEY",
+                   "CLOUDFLARE_API_TOKEN")
 SECRET_PATTERNS = [
     # A key or token in a URL query
     (re.compile(r"(?i)([?&](?:token|key|api_key|apikey|access_token)=)[^&\s'\"<>]+"), r"\1[redacted]"),
@@ -282,6 +283,11 @@ def add_tags(*tags: str):
     run = get_current_run_tree()
     if run is not None:
         run.add_tags(list(tags))
+
+
+def current_run():
+    """The current span, or None outside one (feature 3: safety events read what's already on it)."""
+    return get_current_run_tree()
 
 
 def ref_of(run) -> str | None:

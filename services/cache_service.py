@@ -89,6 +89,10 @@ def usage_key(model: str, day: str) -> str:
     """One model's Gemini usage on one day (feature 2 #33); day is the Pacific date, '2026-10-19'."""
     return f"{KEY_VERSION}:usage:{model}:{day}"
 
+def verdict_key(question_version: str, content_hash: str) -> str:
+    """A Clef verdict (feature 3 #15d): one question's version + a hash of the text it judged."""
+    return f"{KEY_VERSION}:safety:{question_version}:{content_hash}"
+
 def ttl_with_jitter(base_ttl: int) -> int:
     return int(base_ttl * random.uniform(1 - TTL_JITTER, 1 + TTL_JITTER))
 
@@ -295,6 +299,25 @@ async def set_cached_vectors(model: str, texts: list[str], vectors):
         for text, vector in zip(texts, vectors)
     ]
     await _mset_with_ttl(items, EMB_TTL)
+
+
+# --- Clef verdicts (feature 3, Section B #15d) ---
+# The same text asked the same question gives the same answer (measured twice in Section A:
+# identical), so a query or chunk that was already checked costs no neurons and no time. The key
+# holds the question's version, so a change of wording never reads an old answer.
+VERDICT_TTL = EMB_TTL
+
+async def get_verdicts(keys: list[str]) -> list[dict | None]:
+    verdicts = []
+    for raw in await _mget(keys):
+        try:
+            verdicts.append(json.loads(raw) if raw is not None else None)
+        except ValueError:
+            verdicts.append(None)
+    return verdicts
+
+async def set_verdicts(items: dict[str, dict]):
+    await _mset_with_ttl([(key, json.dumps(value)) for key, value in items.items()], VERDICT_TTL)
 
 
 # --- Daily Gemini usage (feature 2, #33) ---
