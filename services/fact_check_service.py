@@ -5,6 +5,7 @@ from datetime import datetime
 
 from pydantic import BaseModel, Field
 from langchain_core.exceptions import OutputParserException
+from langchain_core.messages import HumanMessage, SystemMessage
 
 from services import errors, observability, online_checks, prompts, usage
 from services import rag_service as rag
@@ -57,8 +58,9 @@ except Exception as e:
     fact_check_fallback_only = None
 
 
-# The prompt is in services/prompts.py (FACT_CHECK), with its version (feature 2 E)
-UPDATE_PROMPT_TEMPLATE = prompts.get("fact_check").template
+# The prompt is in services/prompts.py (FACT_CHECK), with its version (feature 2 E): a system part
+# (the rules) and a user part (the blocks), feature 3 E. An experiment may put a one-part text here.
+UPDATE_PROMPT = prompts.get("fact_check")
 
 # Scraped text and earlier answers go inside the two blocks. rag._as_data already rewrites
 # <articles> tags and "[Source:" headers; <already_told> tags are rewritten the same way, so
@@ -110,18 +112,27 @@ def _excerpts(stories):
                 blocks.append(f"{header}\n{_as_data(chunk)}")
     return blocks
 
-def build_prompt(query, stories, known_stories, told, marker=None) -> tuple[str, int]:
-    """The fact-check prompt and the number of excerpts in it. marker: the request's canary
-    (feature 3 #36); a fresh one when not given (evals build prompts too)."""
+def build_messages(query, stories, known_stories, told, marker=None) -> tuple[list, int]:
+    """
+    The fact check's messages and the number of excerpts in them: the system part as a system
+    message (Gemini's system_instruction, feature 3 #39), the user part as the user's message.
+    A one-part prompt (an experiment's older text) is one user message, as before.
+    marker: the request's canary (feature 3 #36); a fresh one when not given.
+    """
     blocks = _excerpts(stories)
-    prompt = UPDATE_PROMPT_TEMPLATE.format(
-        query=_line(query),
-        stories="\n".join(_story_line(s) for s in stories),
-        already_told=_already_told(known_stories, told),
-        context="\n\n".join(blocks),
-        canary=marker or canary.new(),
-    )
-    return prompt, len(blocks)
+    prompt = rag.as_prompt("fact_check", UPDATE_PROMPT)
+    values = dict(query=rag.as_query(_line(query)), stories="\n".join(_story_line(s) for s in stories),
+                  already_told=_already_told(known_stories, told), context="\n\n".join(blocks), canary=marker or canary.new())
+    messages = [HumanMessage(prompt.template.format(**values))]
+    if prompt.system:
+        messages.insert(0, SystemMessage(prompt.system.format(**values)))
+    return messages, len(blocks)
+
+def build_prompt(query, stories, known_stories, told, marker=None) -> tuple[str, int]:
+    """The whole prompt as one text (system part, then user part) and the number of excerpts:
+    for the evals, which store its size and show it."""
+    messages, excerpts = build_messages(query, stories, known_stories, told, marker)
+    return "\n\n".join(m.content for m in messages), excerpts
 
 
 async def _cleaned_stories(stories) -> list:
@@ -183,20 +194,21 @@ async def run_fact_check(query, stories, known_stories, told) -> dict:
         raise errors.ai_not_configured("fact-check model not loaded")
 
     stories = await _cleaned_stories(stories)
-    marker = canary.new() if "canary" in prompts.variables_of(UPDATE_PROMPT_TEMPLATE) else None
-    prompt, excerpts = build_prompt(query, stories, known_stories, told, marker)
+    marker = canary.new() if "canary" in rag.as_prompt("fact_check", UPDATE_PROMPT).variables else None
+    messages, excerpts = build_messages(query, stories, known_stories, told, marker)
+    prompt_chars = sum(len(m.content) for m in messages)
     articles = sum(len(s["articles"]) for s in stories)
     new_count = sum(1 for s in stories if s["kind"] == "new")
-    versions = {**rag.prompt_metadata("fact_check", UPDATE_PROMPT_TEMPLATE), "config_version": FACT_CHECK_CONFIG_VERSION}
+    versions = {**rag.prompt_metadata("fact_check", UPDATE_PROMPT), "config_version": FACT_CHECK_CONFIG_VERSION}
     observability.add_totals(prompt_version=versions["prompt_version"], config_version=FACT_CHECK_CONFIG_VERSION)
     async with observability.span("fact_check", inputs={"query": query, "stories": [s["id"] for s in stories]},
                                   metadata={**versions, "new": new_count, "known": len(stories) - new_count, "articles": articles,
-                                            "chunks": excerpts, "prompt_chars": len(prompt), "chunks_per_article": CHUNKS_PER_ARTICLE,
+                                            "chunks": excerpts, "prompt_chars": prompt_chars, "chunks_per_article": CHUNKS_PER_ARTICLE,
                                             "chat_model": rag.CHAT_MODEL, "fallback_model": rag.FALLBACK_CHAT_MODEL},
                                   tags=["answer"]) as run:
         model = rag.pick_chat_model(fact_check_llm, fact_check_fallback_only)
         try:
-            answer = await asyncio.wait_for(model.ainvoke(prompt, config={"run_name": "generate", "tags": ["update"]}),
+            answer = await asyncio.wait_for(model.ainvoke(messages, config={"run_name": "generate", "tags": ["update"]}),
                                             rag.CHAT_DEADLINE_SECONDS)
             if not isinstance(answer, FactCheckAnswer):
                 raise OutputParserException(f"expected FactCheckAnswer, got {type(answer).__name__}")
@@ -224,6 +236,6 @@ async def run_fact_check(query, stories, known_stories, told) -> dict:
         # The fact check's health on this check (Section I #66): feedback on the trace, never an error
         online_checks.fact_check(answer, result["outcomes"], [s["id"] for s in stories])
     print(f"[INFO] UPDATE: judged {articles} articles in {len(stories)} stories ({new_count} new, {len(stories) - new_count} known), "
-          f"{excerpts} chunks, {len(prompt):,} characters; result: {counts[SHOWN]} shown, "
+          f"{excerpts} chunks, {prompt_chars:,} characters; result: {counts[SHOWN]} shown, "
           f"{counts[NOTHING_NEW]} nothing new, {counts[UNJUDGED]} unjudged")
     return result

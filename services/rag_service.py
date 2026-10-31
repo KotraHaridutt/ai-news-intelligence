@@ -20,7 +20,7 @@ from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_google_genai import ChatGoogleGenerativeAI, GoogleGenerativeAIEmbeddings
 from langchain_community.vectorstores import FAISS
 from langchain_core.documents import Document
-from langchain_core.prompts import PromptTemplate
+from langchain_core.prompts import ChatPromptTemplate, PromptTemplate
 from langchain_classic.chains.combine_documents import create_stuff_documents_chain
 
 load_dotenv()
@@ -155,8 +155,9 @@ def pick_chat_model(full, fallback_only):
     return fallback_only
 
 # PROMPTS: in services/prompts.py (feature 2 E), each with a version. The views read them from
-# PROMPT_TEMPLATES at call time, and the version recorded on a trace is that of the text used.
-PROMPT_TEMPLATES = {name: prompts.get(name).template for name in ("report", "timeline", "contradictions")}
+# ANSWER_PROMPTS at call time, and the version recorded on a trace is that of the prompt used. Each
+# has a system part and a user part (feature 3 E); an experiment may put a one-part prompt here.
+ANSWER_PROMPTS = {name: prompts.get(name) for name in ("report", "timeline", "contradictions")}
 
 # How each retrieved chunk appears in {context} (see prompts.DOCUMENT)
 DOCUMENT_PROMPT = PromptTemplate.from_template(prompts.get("document").template)
@@ -179,21 +180,30 @@ ANSWER_CONFIG = {
 CONFIG_VERSION = prompts.version_of(json.dumps(ANSWER_CONFIG, sort_keys=True))
 
 
-def prompt_metadata(name: str, template: str) -> dict:
-    """The prompt on a trace: its name, the version of the text actually sent, and where it came
-    from ("code", "hub:<tag>", or "patched" when something replaced the registry's text)."""
-    registered = prompts.get(name)
-    return {"prompt_name": name, "prompt_version": prompts.version_of(template),
-            "prompt_source": registered.source if template == registered.template else "patched"}
+def as_prompt(name: str, prompt) -> prompts.Prompt:
+    """A Prompt from a Prompt, or from one text (an older one-part prompt in an experiment)."""
+    return prompt if isinstance(prompt, prompts.Prompt) else prompts.Prompt(name, prompt, source="patched")
 
-def answer_prompt(template: str) -> tuple[PromptTemplate, str | None]:
+def prompt_metadata(name: str, prompt) -> dict:
+    """The prompt on a trace: its name, the version of the prompt actually sent, and where it came
+    from ("code", "hub:<tag>", or "patched" when something replaced the registry's prompt)."""
+    prompt, registered = as_prompt(name, prompt), prompts.get(name)
+    same = (prompt.system, prompt.template) == (registered.system, registered.template)
+    return {"prompt_name": name, "prompt_version": prompt.version, "prompt_source": registered.source if same else "patched",
+            "prompt_parts": 2 if prompt.system else 1}
+
+def answer_prompt(prompt) -> tuple:
     """
-    The answer prompt and this request's canary marker (feature 3 #36), or None when the
-    template has no {canary} (a Hub version from before D, or an older prompt in an experiment).
-    The variables come from the template, so both kinds work.
+    The answer prompt to run and this request's canary marker (feature 3 #36). With a system part
+    it's a chat prompt: the system part goes to Gemini as its system_instruction, the user part as
+    the user's message (feature 3 #39). A one-part prompt (older ones, in experiments) is sent as
+    before. The marker is None when the prompt has no {canary}.
     """
-    variables = prompts.variables_of(template)
-    return PromptTemplate(template=template, input_variables=sorted(variables)), (canary.new() if "canary" in variables else None)
+    prompt = as_prompt("answer", prompt)
+    marker = canary.new() if "canary" in prompt.variables else None
+    if prompt.system:
+        return ChatPromptTemplate.from_messages([("system", prompt.system), ("human", prompt.template)]), marker
+    return PromptTemplate(template=prompt.template, input_variables=sorted(prompt.variables)), marker
 
 def chunk_articles(articles):
     """
@@ -438,6 +448,13 @@ def _as_data(text):
     text = _ARTICLES_TAG.sub(lambda m: f"[{m.group(1)}articles]", text)
     return _SOURCE_HEADER.sub(r"(\1", text)
 
+# The query sits in its own <query> block (feature 3 #40). It's escaped like the articles, and a
+# <query> tag in it is rewritten too, so the query can't close its block and add text after it.
+_QUERY_TAG = re.compile(r"<\s*(/?)\s*query\s*>", re.IGNORECASE)
+
+def as_query(text):
+    return _QUERY_TAG.sub(lambda m: f"[{m.group(1)}query]", _as_data(" ".join(str(text or "").split())))
+
 def _header_text(value):
     # One line: a title with a line break would split the [Source: ...] header
     return " ".join(str(value or "").split())
@@ -567,18 +584,18 @@ async def run_rag_query_with_store(query, vector_store, prompt_type):
     # Both of these are programming errors, not something the user can fix (-> 500)
     if vector_store is None:
         raise ValueError("run_rag_query_with_store called without a vector store")
-    prompt_template = PROMPT_TEMPLATES.get(prompt_type)
-    if prompt_template is None or prompt_type not in RETRIEVAL_SETTINGS:
+    answer = ANSWER_PROMPTS.get(prompt_type)
+    if answer is None or prompt_type not in RETRIEVAL_SETTINGS:
         raise ValueError(f"Unknown prompt type: {prompt_type!r}")
 
-    prompt, marker = answer_prompt(prompt_template)
+    prompt, marker = answer_prompt(answer)
 
     async def retrieve_and_answer():
         documents = await _retrieve(vector_store, query, prompt_type)
         # The prompt gets copies with header values; the answer's sources come from the originals.
         # run_name: the chain is traced as "generate" under its view's span, not as an unnamed
         # stuff_documents_chain (the report and timeline traces looked the same, Section A2)
-        inputs = {"input": query, "context": _with_source_headers(documents), **({"canary": marker} if marker else {})}
+        inputs = {"input": as_query(query), "context": _with_source_headers(documents), **({"canary": marker} if marker else {})}
         answer = await qa_chain.ainvoke(inputs, config={"run_name": "generate", "tags": [prompt_type]})
         return documents, answer
 
@@ -586,7 +603,7 @@ async def run_rag_query_with_store(query, vector_store, prompt_type):
     print(f"[INFO] RAG: Invoking chain with query: '{query}' for type: '{prompt_type}' ({search} search)")
     # The view's span: retrieval and the answer, under the request (#19, #22). Its metadata names
     # the prompt and settings (#39); LangSmith passes it down, so the LLM run carries it too.
-    versions = {**prompt_metadata(prompt_type, prompt_template),
+    versions = {**prompt_metadata(prompt_type, answer),
                 "document_prompt_version": prompts.version_of(DOCUMENT_PROMPT.template), "config_version": CONFIG_VERSION}
     observability.add_totals(prompt_version=versions["prompt_version"], config_version=CONFIG_VERSION)
     async with observability.span(prompt_type, inputs={"query": query, "view": prompt_type},

@@ -73,8 +73,22 @@ class Variant:
 
     def __init__(self, k=None, cap=None, prompt_files=None, retrieve=False, prompt_texts=None):
         self.k, self.cap, self.retrieve = k, cap, retrieve
-        self.prompts = {view: Path(path).read_text(encoding="utf-8") for view, path in (prompt_files or {}).items()}
+        # A prompt file is one text (a one-part prompt, as before feature 3 E) or, as .json,
+        # {"system": ..., "user": ...} (a two-part prompt). Kept as a str or a dict either way.
+        self.prompts = {view: self._read(Path(path)) for view, path in (prompt_files or {}).items()}
         self.prompts.update(prompt_texts or {})
+
+    @staticmethod
+    def _read(path: Path):
+        text = path.read_text(encoding="utf-8")
+        return json.loads(text) if path.suffix == ".json" else text
+
+    @staticmethod
+    def as_prompt(view: str, value):
+        from services import prompts
+        if isinstance(value, dict):
+            return prompts.Prompt(view, value["user"], source="patched", system=value.get("system", ""))
+        return prompts.Prompt(view, value, source="patched")
 
     def to_dict(self) -> dict:
         """Saved in the experiment's manifest, so rescore can rebuild exactly this variant."""
@@ -91,21 +105,21 @@ class Variant:
             rag.RETRIEVAL_K = self.k
         if self.cap:
             rag.STORY_CAP = self.cap
-        for view, text in self.prompts.items():
+        for view, value in self.prompts.items():
             if view == "update":
-                fcs.UPDATE_PROMPT_TEMPLATE = text
+                fcs.UPDATE_PROMPT = self.as_prompt("fact_check", value)
             else:
-                rag.PROMPT_TEMPLATES[view] = text
+                rag.ANSWER_PROMPTS[view] = self.as_prompt(view, value)
 
     def fingerprint(self, dataset: str) -> dict:
         from services import prompts, rag_service as rag, fact_check_service as fcs
         config = {**rag.ANSWER_CONFIG, "retrieval_k": self.k or rag.RETRIEVAL_K, "story_cap": self.cap or rag.STORY_CAP}
         details = {"config_version": prompts.version_of(json.dumps(config, sort_keys=True)), "retrieve": self.retrieve}
         if dataset in ("answers", "injection"):
-            details["prompt_versions"] = {v: prompts.version_of(rag.PROMPT_TEMPLATES[v]) for v in data.VIEWS}
+            details["prompt_versions"] = {v: rag.as_prompt(v, rag.ANSWER_PROMPTS[v]).version for v in data.VIEWS}
             details["document_prompt"] = prompts.version_of(rag.DOCUMENT_PROMPT.template)
         if dataset == "fact_check":
-            details["prompt_versions"] = {"update": prompts.version_of(fcs.UPDATE_PROMPT_TEMPLATE)}
+            details["prompt_versions"] = {"update": rag.as_prompt("fact_check", fcs.UPDATE_PROMPT).version}
             details["config_version"] = prompts.version_of(json.dumps({**config, "chunks_per_article": fcs.CHUNKS_PER_ARTICLE}, sort_keys=True))
         if dataset in CHAT_DATASETS:
             details["models"] = [rag.CHAT_MODEL, rag.FALLBACK_CHAT_MODEL]
@@ -168,7 +182,7 @@ async def generate(dataset: str, inputs: dict, variant: Variant) -> dict:
             context = [{"chunk_id": d.metadata["chunk_id"], "title": d.metadata.get("title"), "source_name": d.metadata.get("source_name"),
                         "published_at": d.metadata.get("published_at"), "theme_id": d.metadata.get("theme_id"), "page_content": d.page_content}
                        for d in docs]
-        result = await targets.generate_answer(inputs["query"], inputs["view"], context, template=rag.PROMPT_TEMPLATES[inputs["view"]])
+        result = await targets.generate_answer(inputs["query"], inputs["view"], context, template=rag.ANSWER_PROMPTS[inputs["view"]])
         return {**result, "context": context if variant.retrieve else None}
     if dataset == "fact_check":
         from services import fact_check_service as fcs
@@ -557,7 +571,8 @@ def main(argv=None) -> int:
     p.add_argument("--judge", action="store_true", help="also run the LLM judges (1 call per example)")
     p.add_argument("--k", type=int)
     p.add_argument("--cap", type=int)
-    p.add_argument("--prompt", action="append", default=[], help="VIEW=FILE: try this prompt for a view (report, timeline, contradictions, update)")
+    p.add_argument("--prompt", action="append", default=[], help="VIEW=FILE: try this prompt for a view (report, timeline, contradictions, update); "
+                                                                   "a .json file holds {\"system\": ..., \"user\": ...}")
     p.add_argument("--retrieve", action="store_true", help="answers: retrieve again with the variant's settings instead of the frozen context")
     p.add_argument("--max-calls", type=int)
     p.add_argument("--reserve", type=int, default=2, help="chat calls to leave for the live app today (default 2)")

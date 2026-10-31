@@ -25,15 +25,16 @@ def documents(context: list[dict]) -> list[Document]:
             for c in context]
 
 
-async def generate_answer(query: str, view: str, context: list[dict], template: str | None = None) -> dict:
-    """One chat call. template: a prompt to try instead of the app's (an experiment); default the app's."""
-    template = template or rag.PROMPT_TEMPLATES[view]
-    prompt, marker = rag.answer_prompt(template)        # the canary too, when the template has one
+async def generate_answer(query: str, view: str, context: list[dict], template=None) -> dict:
+    """One chat call. template: a prompt to try instead of the app's (an experiment: a Prompt, or one
+    older text); default the app's. Sent as the app sends it (system + user parts, feature 3 E)."""
+    template = rag.as_prompt(view, template or rag.ANSWER_PROMPTS[view])
+    prompt, marker = rag.answer_prompt(template)        # the canary too, when the prompt has one
     chain = create_stuff_documents_chain(rag.pick_chat_model(rag.llm, rag.llm_fallback_only), prompt, document_prompt=rag.DOCUMENT_PROMPT)
     answer = await asyncio.wait_for(
-        chain.ainvoke({"input": query, "context": rag._with_source_headers(documents(context)),
+        chain.ainvoke({"input": rag.as_query(query), "context": rag._with_source_headers(documents(context)),
                        **({"canary": marker} if marker else {})},
                       config={"run_name": "generate", "tags": [view, "eval"],
                               "metadata": {**rag.prompt_metadata(view, template), "config_version": rag.CONFIG_VERSION}}),
         rag.CHAT_DEADLINE_SECONDS)
-    return {"answer": answer.strip(), "prompt_version": prompts.version_of(template), "config_version": rag.CONFIG_VERSION}
+    return {"answer": answer.strip(), "prompt_version": template.version, "config_version": rag.CONFIG_VERSION}

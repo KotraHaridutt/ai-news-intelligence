@@ -31,10 +31,11 @@ def _git_commit() -> str:
         return "unknown"
 
 
-def hub_text(client, hub_name: str) -> str | None:
-    """The text of the Hub's latest commit of a prompt, or None if it doesn't exist yet."""
+def hub_text(client, hub_name: str) -> tuple[str, str] | None:
+    """(system, user) of the Hub's latest commit of a prompt, or None if it doesn't exist yet."""
+    from services.prompts import parts_of
     try:
-        return client.pull_prompt(hub_name, skip_cache=True).template
+        return parts_of(client.pull_prompt(hub_name, skip_cache=True))
     except Exception as e:
         if "404" in str(e) or "not found" in str(e).lower():
             return None
@@ -46,7 +47,7 @@ def plan(client, prompts) -> list[dict]:
     actions = []
     for prompt in prompts:
         current = hub_text(client, prompt.hub_name)
-        action = "create" if current is None else ("unchanged" if current == prompt.template else "update")
+        action = "create" if current is None else ("unchanged" if current == (prompt.system, prompt.template) else "update")
         actions.append({"prompt": prompt, "action": action})
     return actions
 
@@ -68,13 +69,16 @@ def set_tag(client, hub_name: str, tag: str, commit_id: str):
 
 
 def push(client, actions, tag: str | None, commit: str) -> list[dict]:
-    from langchain_core.prompts import PromptTemplate
-    from services.prompts import variables_of
+    from langchain_core.prompts import ChatPromptTemplate, PromptTemplate
     results = []
     for item in actions:
         prompt = item["prompt"]
         if item["action"] != "unchanged":
-            template = PromptTemplate(template=prompt.template, input_variables=sorted(variables_of(prompt.template)))
+            # A two-part prompt goes up as a chat prompt (system + human messages), as the app sends it
+            if prompt.system:
+                template = ChatPromptTemplate.from_messages([("system", prompt.system), ("human", prompt.template)])
+            else:
+                template = PromptTemplate(template=prompt.template, input_variables=sorted(prompt.variables))
             client.push_prompt(prompt.hub_name, object=template, is_public=False,
                                description=f"AI News Intelligence: the {prompt.name} prompt (services/prompts.py)",
                                commit_tags=[f"v-{prompt.version}"],
