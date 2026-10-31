@@ -24,6 +24,10 @@ _checks_inflight: dict[str, asyncio.Task] = {}
 _checks_started_by: dict[str, dict | None] = {}
 
 RETRY_MESSAGE = "Couldn't check the new articles on stories you've seen. Check again to retry."
+# Gemini's filter blocked the fact check (feature 3 #48): new stories are listed without a summary,
+# and the articles on stories you've seen are tried again on the next check
+BLOCKED_MESSAGE = ("The AI service declined to summarise these articles, so new stories are listed without a summary. "
+                   "New articles on stories you've seen will be checked again next time.")
 
 
 def _minutes_between(earlier: str, later: str) -> float:
@@ -244,7 +248,7 @@ def _response(watch_id, snapshot, merged, data, articles, classified, result, id
         "hidden_repeats": hidden,
         "unreadable": [{k: a.get(k) for k in nov.LINK_FIELDS} for a in data["unreadable"]],
         "nothing_new": not new_stories and not updates,
-        "message": RETRY_MESSAGE if retry else None,
+        "message": BLOCKED_MESSAGE if result.get("blocked") else RETRY_MESSAGE if retry else None,
         "reused": False,
     }
 

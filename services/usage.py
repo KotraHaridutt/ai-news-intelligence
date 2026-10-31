@@ -7,6 +7,7 @@ from zoneinfo import ZoneInfo
 from langchain_core.callbacks import AsyncCallbackHandler
 
 from services import cache_service, errors, observability
+from services.safety import gemini
 
 # --- Tokens, cost and the daily quota (feature 2, Section D) ---
 # Every Gemini attempt is counted here: chat calls through a LangChain callback on both chat
@@ -208,17 +209,40 @@ class UsageHandler(AsyncCallbackHandler):
         except (AttributeError, IndexError):
             message = None
         usage = getattr(message, "usage_metadata", None) or {}
-        answered = (getattr(message, "response_metadata", None) or {}).get("model_name") or model
+        metadata = getattr(message, "response_metadata", None) or {}
+        answered = metadata.get("model_name") or model
         input_tokens, output_tokens = usage.get("input_tokens", 0), usage.get("output_tokens", 0)
         thinking = (usage.get("output_token_details") or {}).get("reasoning", 0)
         cost = cost_usd(model, input_tokens, output_tokens)
         observability.add_totals(input_tokens=input_tokens, output_tokens=output_tokens,
                                  thinking_tokens=thinking, cost_usd=cost or 0, answered_by=answered)
-        line = (f"[INFO] LLM {view}: {answered} in {input_tokens:,} · thinking {thinking:,} · out {output_tokens:,} tokens, "
-                f"{seconds:.1f} s, " + (f"~${cost:.4f}" if cost is not None else "price unknown")
-                + f", fallback {'yes' if self.role == 'fallback' else 'no'}")
-        _background(_count_and_log(model, {"ok": 1, "input_tokens": input_tokens,
-                                           "output_tokens": output_tokens, "thinking_tokens": thinking}, line, chat=True))
+        # Gemini's safety signals (feature 3 #46, A1 §3.2): finish_reason and the ratings on the message,
+        # a blocked prompt's feedback in llm_output. Gemini 3 sends no ratings unless something is
+        # blocked, so they're recorded only when there are some. The LLM run in LangSmith shows the
+        # whole response_metadata already; these go on the request's totals (and the root's metadata).
+        finish = metadata.get("finish_reason")
+        block = gemini.block_of(message, getattr(response, "llm_output", None))
+        ratings = gemini.ratings_text(metadata.get("safety_ratings"))
+        if finish:
+            observability.add_totals(finish_reason=finish)
+        if ratings:
+            observability.add_totals(gemini_ratings=ratings)
+        counts = {"ok": 1, "input_tokens": input_tokens, "output_tokens": output_tokens, "thinking_tokens": thinking}
+        if block is not None:
+            observability.add_totals(gemini_blocks=1, gemini_block=block.label())
+            counts["blocked"] = 1
+            # LangChain reads usage only from the candidates, so a blocked prompt (no candidates) has
+            # no token counts at all, though Google counted its input (A1 §3.2)
+            tokens = ("in ? (not reported for a blocked prompt)" if block.stage == "prompt" and not input_tokens
+                      else f"in {input_tokens:,} · out {output_tokens:,} tokens")
+            line = (f"[WARN] LLM {view}: {answered} BLOCKED by Gemini's filter ({block.label()}), {tokens}, {seconds:.1f} s, "
+                    f"fallback {'yes' if self.role == 'fallback' else 'no'}")
+        else:
+            line = (f"[INFO] LLM {view}: {answered} in {input_tokens:,} · thinking {thinking:,} · out {output_tokens:,} tokens, "
+                    f"{seconds:.1f} s, " + (f"~${cost:.4f}" if cost is not None else "price unknown")
+                    + f", fallback {'yes' if self.role == 'fallback' else 'no'}"
+                    + (f", finish {finish}" if finish and finish != "STOP" else ""))
+        _background(_count_and_log(model, counts, line, chat=True))
 
     async def on_llm_error(self, error, *, run_id, **kwargs):
         observability.llm_run_ended(run_id)

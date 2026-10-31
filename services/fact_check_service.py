@@ -6,11 +6,12 @@ from datetime import datetime
 from pydantic import BaseModel, Field
 from langchain_core.exceptions import OutputParserException
 from langchain_core.messages import HumanMessage, SystemMessage
+from langchain_core.runnables import RunnableLambda
 
 from services import errors, observability, online_checks, prompts, usage
 from services import rag_service as rag
 from services.novelty_service import SHOWN, NOTHING_NEW, UNJUDGED
-from services.safety import articles as safety_articles, canary
+from services.safety import articles as safety_articles, canary, gemini
 
 # --- feature 1: the fact check of a "Check for updates" ---
 # One LLM call per check (only when the check found unseen articles). novelty_service has
@@ -46,7 +47,11 @@ def _structured(model_name, role="primary"):
     # with_structured_output (plan P7). Same thinking level, timeout and attempts as the views;
     # the retries wrap the structured model, because a retry wrapper has no with_structured_output
     # either. Only busy answers are retried: an answer that can't be parsed is not.
-    return rag._retrying(rag._chat_model(model_name, role).with_structured_output(FactCheckAnswer, method="json_schema"))
+    # include_raw (feature 3 #48): the reply comes back with its parse result, so a reply Gemini's
+    # filter blocked is returned as it is and never reaches the fallback (it used to fail the parser
+    # and spend a second call, A1 §3.3). An unreadable reply still raises and goes to the fallback.
+    structured = rag._chat_model(model_name, role).with_structured_output(FactCheckAnswer, method="json_schema", include_raw=True)
+    return rag._retrying(structured | RunnableLambda(gemini.structured_raw_or_raise, name="parse_or_blocked"))
 
 try:
     fact_check_llm = _structured(rag.CHAT_MODEL).with_fallbacks([_structured(rag.FALLBACK_CHAT_MODEL, "fallback")])
@@ -184,16 +189,18 @@ async def run_fact_check(query, stories, known_stories, told) -> dict:
     One LLM call for a check. stories: [{id, kind: "new" | "update", title (known story),
     related_to: {id, title} | None, articles: [article dicts with full_text]}], in display
     order; known_stories: [{id, title}]; told: the snapshot's "already told" texts.
-    Returns {"outcomes", "texts", "usable"} (see read_answer). An answer that isn't valid JSON
-    for the schema is unusable, not an error: the check still shows its new stories.
+    Returns {"outcomes", "texts", "usable", "blocked"} (see read_answer). An answer that isn't valid
+    JSON for the schema is unusable, not an error: the check still shows its new stories. The same
+    when Gemini's filter blocked it: "blocked" is then "prompt" or "answer" (else None), feature 3 #48.
     Raises AppError (503 busy / 504 too long / 502 other / 500 not set up) if the call fails.
     """
     if not stories:
-        return {"outcomes": {}, "texts": {}, "usable": True}
+        return {"outcomes": {}, "texts": {}, "usable": True, "blocked": None}
     if fact_check_llm is None:
         raise errors.ai_not_configured("fact-check model not loaded")
 
     stories = await _cleaned_stories(stories)
+    blocked = None       # "prompt" / "answer" when Gemini's filter blocked the check (#48)
     marker = canary.new() if "canary" in rag.as_prompt("fact_check", UPDATE_PROMPT).variables else None
     messages, excerpts = build_messages(query, stories, known_stories, told, marker)
     prompt_chars = sum(len(m.content) for m in messages)
@@ -210,8 +217,17 @@ async def run_fact_check(query, stories, known_stories, told) -> dict:
         try:
             answer = await asyncio.wait_for(model.ainvoke(messages, config={"run_name": "generate", "tags": ["update"]}),
                                             rag.CHAT_DEADLINE_SECONDS)
+            # The parsed answer, or GeminiBlocked when the filter blocked the prompt or the reply
+            answer = gemini.structured_answer(answer)
             if not isinstance(answer, FactCheckAnswer):
                 raise OutputParserException(f"expected FactCheckAnswer, got {type(answer).__name__}")
+        except gemini.GeminiBlocked as e:
+            # Feature 3 #48: like an unreadable answer, every story is unjudged (new stories are listed
+            # without a summary, known ones are tried again next check), with its own message
+            print(f"[WARN] UPDATE: Gemini's filter blocked the fact check ({e.block.label()}). Every story unjudged.")
+            run.add_tags(["gemini_blocked"])
+            gemini.record_block(e, where="update")
+            answer, blocked = None, e.block.stage
         except OutputParserException as e:
             print(f"[WARN] UPDATE: the fact check's answer couldn't be read ({str(e)[:200]}). Every story unjudged.")
             # The whole reply is in the LLM run below this span; the start of it is kept here (#27)
@@ -226,13 +242,13 @@ async def run_fact_check(query, stories, known_stories, told) -> dict:
                 usage.forget(observability.close_open_llm_runs(rag.DEADLINE_CANCELLED))
             raise errors.report_failed(e, "update") from e
 
-        result = read_answer(answer, stories)
+        result = {**read_answer(answer, stories), "blocked": blocked}
         # The canary in any story's text: the whole check is withheld in enforce mode (D #36)
         if marker and result["texts"]:
             await canary.check_text("\n".join(result["texts"].values()), marker, where="update", prompt_type="update")
             result["texts"] = {k: canary.strip(v, marker) for k, v in result["texts"].items()}
         counts = {kind: sum(1 for story_id, o in result["outcomes"].items() if o == kind) for kind in (SHOWN, NOTHING_NEW, UNJUDGED)}
-        run.add_outputs({"usable": result["usable"], **counts})
+        run.add_outputs({"usable": result["usable"], "blocked": blocked, **counts})
         # The fact check's health on this check (Section I #66): feedback on the trace, never an error
         online_checks.fact_check(answer, result["outcomes"], [s["id"] for s in stories])
     print(f"[INFO] UPDATE: judged {articles} articles in {len(stories)} stories ({new_count} new, {len(stories) - new_count} known), "

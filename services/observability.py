@@ -504,7 +504,8 @@ _totals: ContextVar[dict | None] = ContextVar("request_totals", default=None)
 
 # Totals worth filtering or grouping by in LangSmith: copied onto the root as metadata too
 _TOTALS_AS_METADATA = ("answered_by", "cost_usd", "chat_calls", "chat_errors", "skipped_model",
-                       "prompt_version", "config_version", "check_score", "checks_failed")
+                       "prompt_version", "config_version", "check_score", "checks_failed",
+                       "finish_reason", "gemini_blocks", "gemini_block")
 
 
 def add_totals(**amounts):

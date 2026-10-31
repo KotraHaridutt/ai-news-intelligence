@@ -11,16 +11,17 @@ from dotenv import load_dotenv
 # also when a script imports this module without server.py
 from services import cache_service, errors, observability, online_checks, prompts, usage  # noqa: F401
 from services.news_fetcher import has_enough_text
-from services.safety import articles as safety_articles, canary
+from services.safety import articles as safety_articles, canary, gemini
 from services.safety.text import strip_invisible
 
 # --- LangChain Imports ---
 from langchain_core.embeddings import Embeddings
 from langchain_text_splitters import RecursiveCharacterTextSplitter
-from langchain_google_genai import ChatGoogleGenerativeAI, GoogleGenerativeAIEmbeddings
+from langchain_google_genai import ChatGoogleGenerativeAI, GoogleGenerativeAIEmbeddings  # noqa: F401 (old probes use rag.ChatGoogleGenerativeAI)
 from langchain_community.vectorstores import FAISS
 from langchain_core.documents import Document
 from langchain_core.prompts import ChatPromptTemplate, PromptTemplate
+from langchain_core.runnables import RunnableLambda
 from langchain_classic.chains.combine_documents import create_stuff_documents_chain
 
 load_dotenv()
@@ -106,14 +107,21 @@ def _is_chat_retryable(e):
 
 def _chat_model(model_name, role="primary"):
     """One chat model without retries (1 = no retries in this SDK; 0 would mean its default).
-    The usage callback sees every attempt: tokens, cost, the daily count, one log line (#31)."""
-    return ChatGoogleGenerativeAI(
+    The usage callback sees every attempt: tokens, cost, the daily count, one log line (#31).
+    Gemini's safety thresholds are set explicitly (feature 3 #45, safety/gemini.py), and a block
+    comes back as a blocked reply, not an exception (GeminiChat, #47): raise_if_blocked turns it
+    into GeminiBlocked after the fallback wrapper, so a block never reaches the fallback model."""
+    return gemini.GeminiChat(
         model=model_name,
         thinking_level=THINKING_LEVEL,
         timeout=CHAT_TIMEOUT_SECONDS,
         max_retries=1,
+        safety_settings=gemini.SETTINGS,
         callbacks=[usage.UsageHandler(role)],
     )
+
+# After the chat model and its fallback (#47): a blocked reply raises GeminiBlocked here, once
+BLOCK_CHECK = RunnableLambda(gemini.raise_if_blocked, name="gemini_block_check")
 
 def _retrying(runnable):
     """CHAT_ATTEMPTS attempts on a busy answer, waiting ~1-2 s, ~2-3 s between them (exponential,
@@ -175,7 +183,7 @@ ANSWER_CONFIG = {
     "chunk_size": text_splitter._chunk_size, "chunk_overlap": text_splitter._chunk_overlap,
     "retrieval_k": RETRIEVAL_K, "story_cap": STORY_CAP, "retrieval": RETRIEVAL_SETTINGS,
     "thinking_level": THINKING_LEVEL, "timeout_s": CHAT_TIMEOUT_SECONDS, "attempts": CHAT_ATTEMPTS,
-    "deadline_s": CHAT_DEADLINE_SECONDS,
+    "deadline_s": CHAT_DEADLINE_SECONDS, "gemini_safety": gemini.settings_summary(gemini.SETTINGS),
 }
 CONFIG_VERSION = prompts.version_of(json.dumps(ANSWER_CONFIG, sort_keys=True))
 
@@ -612,10 +620,17 @@ async def run_rag_query_with_store(query, vector_store, prompt_type):
                                             "attempts": CHAT_ATTEMPTS, "deadline_s": CHAT_DEADLINE_SECONDS},
                                   tags=["answer"]) as run:
         # Raises "today's AI limit" (503) at once when both models' daily quota is used up (#34)
-        qa_chain = create_stuff_documents_chain(pick_chat_model(llm, llm_fallback_only), prompt, document_prompt=DOCUMENT_PROMPT)
+        qa_chain = create_stuff_documents_chain(pick_chat_model(llm, llm_fallback_only) | BLOCK_CHECK, prompt,
+                                                document_prompt=DOCUMENT_PROMPT)
         try:
             # One deadline for retrieval and the answer, as before
             documents, answer = await asyncio.wait_for(retrieve_and_answer(), CHAT_DEADLINE_SECONDS)
+        except gemini.GeminiBlocked as e:
+            # Gemini's filter blocked the prompt (422) or the answer (502), feature 3 #47. Not retried,
+            # not sent to the fallback: the same articles would be blocked again.
+            run.add_tags(["gemini_blocked"])
+            gemini.record_block(e, where=prompt_type)
+            raise e.app_error(prompt_type) from e
         except Exception as e:   # a missed deadline is a TimeoutError -> "took too long" (504)
             if isinstance(e, TimeoutError):
                 run.add_tags(["timeout"])
