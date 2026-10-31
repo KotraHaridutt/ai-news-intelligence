@@ -44,6 +44,11 @@ PARALLEL_CALLS = 6             # per process, as measured in Section A
 # connection after 5 s by default, so with a few requests a minute nearly every check would start
 # cold: connections are kept 5 minutes, and startup opens one (warm_up, free: no Clef call).
 KEEPALIVE_SECONDS = 300
+# After this many failed calls in a row (timeout or busy), Clef is skipped for BACKOFF_SECONDS:
+# every check goes to its fallback at once instead of each waiting out its own timeout. Without it,
+# a hung Clef would hold a 60-chunk scan for 10 rounds of 3 s (D1 §4). Like cache_service's back-off.
+BACKOFF_AFTER_FAILURES = 3
+BACKOFF_SECONDS = 30
 
 # Daily neurons (B #19; L #93a adds the warning alert and the gateway's spending limit). Counted
 # per UTC day from every response's cf-ai-neurons, in Redis (v1:usage:clef:<day>) and in process.
@@ -56,7 +61,8 @@ class ClefError(Exception):
     A call that gave no usable answer. `kind` says why: not_configured, timeout, busy (429 or 5xx
     after the retry), auth (401/403), billing (402), bad_request (400/413/422), too_large (one
     question's state can't fit the window), cut (the reply says the window was full),
-    over_budget, bad_response. Every kind makes a check fall back to the embedding classifier.
+    over_budget, backoff (skipped after repeated failures), bad_response. Every kind makes a check
+    fall back to the embedding classifier.
     """
     def __init__(self, kind: str, detail: str = ""):
         super().__init__(f"{kind}: {detail}" if detail else kind)
@@ -109,6 +115,27 @@ async def warm_up():
 
 def _url() -> str:
     return f"https://api.cloudflare.com/client/v4/accounts/{ACCOUNT_ID}/ai/run"
+
+
+# --- Back-off ---
+_trouble = {"failures": 0, "skip_until": 0.0}
+
+
+def _call_failed(kind: str):
+    if kind in ("timeout", "busy"):
+        _trouble["failures"] += 1
+        if _trouble["failures"] >= BACKOFF_AFTER_FAILURES and time.monotonic() >= _trouble["skip_until"]:
+            _trouble["skip_until"] = time.monotonic() + BACKOFF_SECONDS
+            print(f"[WARN] Safety: Clef failed {_trouble['failures']} times in a row ({kind}). "
+                  f"Skipping it for {BACKOFF_SECONDS}s: checks use their fallback.")
+
+
+def _call_worked():
+    _trouble["failures"] = 0
+
+
+def backing_off() -> bool:
+    return time.monotonic() < _trouble["skip_until"]
 
 
 # --- Neurons used today ---
@@ -247,8 +274,20 @@ def _error_of(response: httpx.Response) -> ClefError:
     return ClefError("bad_request", detail)
 
 
-async def _call(questions: dict, state: dict, deadline: float, label: str) -> dict:
-    """One call, retried once on a 429 / 5xx if time is left. Returns the parsed reply."""
+async def _call(questions: dict, state: dict, timeout: float, label: str) -> dict:
+    """
+    One call, retried once on a 429 / 5xx if time is left. Returns the parsed reply. `timeout`
+    starts when the call gets one of the PARALLEL_CALLS slots, not while it waits for one: a chunk
+    queued behind 30 others still gets its full time (D1 §4).
+    """
+    try:
+        return await _call_once(questions, state, timeout, label)
+    except ClefError as e:
+        _call_failed(e.kind)
+        raise
+
+
+async def _call_once(questions: dict, state: dict, timeout: float, label: str) -> dict:
     payload = {"model": WORKERS_MODEL, "input": {"model": MODEL, "state": state, "questions": questions}}
     headers = {"Authorization": f"Bearer {API_TOKEN}", "cf-aig-gateway-id": GATEWAY_ID}
     estimated = sum(estimate_tokens(v) for v in state.values())
@@ -257,9 +296,13 @@ async def _call(questions: dict, state: dict, deadline: float, label: str) -> di
             "clef", run_type="tool",
             inputs={"label": label, "questions": list(questions), "state_chars": {k: len(v) for k, v in state.items()}},
             metadata={"ls_provider": "cloudflare", "ls_model_name": MODEL, "estimated_state_tokens": estimated}) as run:
+        deadline = None
         for attempt in (1, 2):
             try:
                 async with _semaphore:
+                    if backing_off():
+                        raise ClefError("backoff", f"skipped after {_trouble['failures']} failures in a row")
+                    deadline = deadline or time.monotonic() + timeout
                     left = deadline - time.monotonic()
                     if left <= 0:
                         raise ClefError("timeout", "no time left before the check's deadline")
@@ -287,6 +330,7 @@ async def _call(questions: dict, state: dict, deadline: float, label: str) -> di
         except (ValueError, KeyError, TypeError) as e:
             raise ClefError("bad_response", f"no result in the reply ({type(e).__name__})") from e
         answers = {name: _parse(name, raw_answers.get(name)) for name in questions}
+        _call_worked()
         input_tokens = int((result.get("usage") or {}).get("input_tokens") or 0)
         reply = {"answers": answers, "input_tokens": input_tokens, "neurons": neurons, "model": result.get("model"),
                  "log_id": response.headers.get("cf-aig-log-id")}
@@ -302,19 +346,20 @@ async def _call(questions: dict, state: dict, deadline: float, label: str) -> di
 async def ask(state: dict[str, str], questions: dict[str, dict], timeout: float, label: str = "") -> dict:
     """
     Asks Clef `questions` (name -> Clef question) about `state` (key -> text), split over as many
-    calls as needed (plan_calls), run in parallel, all within `timeout` seconds. Returns
+    calls as needed (plan_calls), run in parallel, each within `timeout` seconds of getting a slot. Returns
     {"answers": {name: typed answer}, "input_tokens", "neurons", "calls", "models", "log_ids"}.
     Raises ClefError when any call gives no usable answer: a check is decided by one engine.
     """
     if not available():
         raise ClefError("not_configured", status())
+    if backing_off():
+        raise ClefError("backoff", f"skipped for {BACKOFF_SECONDS}s after {_trouble['failures']} failures in a row")
     if over_budget():
         raise ClefError("over_budget", f"{neurons_today():.0f} neurons used today (fallback from {FALLBACK_AT_NEURONS})")
     if not questions:
         return {"answers": {}, "input_tokens": 0, "neurons": 0.0, "calls": 0, "models": [], "log_ids": []}
-    deadline = time.monotonic() + timeout
     calls = plan_calls(state, questions)
-    replies = await asyncio.gather(*(_call(q, s, deadline, label) for q, s in calls), return_exceptions=True)
+    replies = await asyncio.gather(*(_call(q, s, timeout, label) for q, s in calls), return_exceptions=True)
     for reply in replies:
         if isinstance(reply, BaseException):
             raise reply

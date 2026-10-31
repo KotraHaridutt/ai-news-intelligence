@@ -4,6 +4,8 @@ jinja2
 httpx
 certifi
 trafilatura
+# imported directly since feature 3 D #30 (hidden page text); trafilatura already installs it
+lxml
 python-dotenv
 markdown2
 beautifulsoup4

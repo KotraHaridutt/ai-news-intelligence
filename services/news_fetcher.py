@@ -1,6 +1,7 @@
 import asyncio
 import contextlib
 import os
+import re
 import time
 from collections import Counter
 from datetime import datetime, timedelta, timezone
@@ -9,6 +10,8 @@ import certifi
 import httpx
 from dotenv import load_dotenv
 import trafilatura
+import lxml.etree
+import lxml.html
 from bs4 import BeautifulSoup
 
 from services import errors, observability
@@ -192,19 +195,77 @@ async def fetch_news(query: str, window_from: str | None = None) -> list[dict]:
         })
     return articles
 
+# --- Hidden page text (feature 3, D #30) ---
+# A page can hide text from readers and still have it extracted: an instruction to the AI in a
+# display:none block or an aria-hidden element is invisible on the page and plain text to the
+# model. Such elements are dropped before extraction. Decided by the HTML's structure (attributes
+# and inline styles), never by the words: a reader can't see this text, so it isn't the news they read.
+#
+# Except a hidden ARTICLE: Indian Express sends its premium article to everyone inside a
+# display:none block and shows it with a script (D1 §3). An element with at least
+# KEEP_HIDDEN_PARAGRAPHS paragraphs and KEEP_HIDDEN_CHARS characters is kept: dropping it cut that
+# article from 1,664 to 340 characters, and its text still goes through the chunk scan (#32).
+_HIDDEN_STYLE = re.compile(r"display\s*:\s*none|visibility\s*:\s*hidden|font-size\s*:\s*0(?![.\d]*[1-9])|"
+                           r"opacity\s*:\s*0(?![.\d]*[1-9])", re.IGNORECASE)
+KEEP_HIDDEN_PARAGRAPHS = 2
+KEEP_HIDDEN_CHARS = 500
+
+
+def _is_hidden(element) -> bool:
+    return (element.tag == "template" or element.get("hidden") is not None or element.get("aria-hidden") == "true"
+            or bool(_HIDDEN_STYLE.search(element.get("style") or "")))
+
+
+def drop_hidden(doc) -> dict:
+    """
+    Removes hidden elements and comments from a parsed page (lxml), in place. Returns
+    {"dropped": elements, "chars": text removed, "kept_articles": hidden article blocks kept}.
+    """
+    stats = {"dropped": 0, "chars": 0, "kept_articles": 0}
+    for element in doc.xpath('//*[@hidden] | //*[@aria-hidden="true"] | //template | //*[@style]'):
+        if not _is_hidden(element) or element.getparent() is None:
+            continue                   # visible, the root, or already gone with a hidden parent
+        text = element.text_content() or ""
+        if len(element.findall(".//p")) >= KEEP_HIDDEN_PARAGRAPHS and len(text.strip()) >= KEEP_HIDDEN_CHARS:
+            stats["kept_articles"] += 1
+            continue
+        stats["dropped"] += 1
+        stats["chars"] += len(text)
+        element.drop_tree()
+    for comment in doc.xpath("//comment()"):
+        if comment.getparent() is not None:
+            stats["chars"] += len(comment.text or "")
+            comment.drop_tree()
+    return stats
+
+
+def _parse(html: str):
+    try:
+        return lxml.html.fromstring(html)
+    except (ValueError, lxml.etree.ParserError):
+        return None
+
+
 def extract_text(html: str):
     """
     Extracts the article body from a page's HTML. CPU-bound, so callers run it in a thread.
+    Hidden elements are dropped first (D #30); the cleaned tree goes to trafilatura as it is,
+    without being written back to HTML and parsed again.
     """
+    doc = _parse(html)
+    if doc is not None:
+        drop_hidden(doc)
     # 1. Try Trafilatura (Clean, Markdown-style extraction)
-    full_text = trafilatura.extract(html, include_comments=False, include_tables=False)
+    full_text = trafilatura.extract(doc if doc is not None else html, include_comments=False, include_tables=False)
 
-    # 2. Fallback to BeautifulSoup if Trafilatura fails
+    # 2. Fallback: the paragraphs, from the cleaned tree (BeautifulSoup if lxml couldn't parse the page)
     if not full_text:
-        soup = BeautifulSoup(html, 'html.parser')
-        # Try to get paragraphs specifically to avoid script/nav noise
-        paragraphs = soup.find_all('p')
-        full_text = " ".join([p.get_text(strip=True) for p in paragraphs])
+        if doc is not None:
+            paragraphs = [" ".join(p.text_content().split()) for p in doc.iter("p")]
+        else:
+            # Try to get paragraphs specifically to avoid script/nav noise
+            paragraphs = [p.get_text(strip=True) for p in BeautifulSoup(html, 'html.parser').find_all('p')]
+        full_text = " ".join(p for p in paragraphs if p)
     return full_text
 
 class ScrapeFailed(Exception):

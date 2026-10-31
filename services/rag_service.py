@@ -11,6 +11,8 @@ from dotenv import load_dotenv
 # also when a script imports this module without server.py
 from services import cache_service, errors, observability, online_checks, prompts, usage  # noqa: F401
 from services.news_fetcher import has_enough_text
+from services.safety import articles as safety_articles, canary
+from services.safety.text import strip_invisible
 
 # --- LangChain Imports ---
 from langchain_core.embeddings import Embeddings
@@ -184,6 +186,15 @@ def prompt_metadata(name: str, template: str) -> dict:
     return {"prompt_name": name, "prompt_version": prompts.version_of(template),
             "prompt_source": registered.source if template == registered.template else "patched"}
 
+def answer_prompt(template: str) -> tuple[PromptTemplate, str | None]:
+    """
+    The answer prompt and this request's canary marker (feature 3 #36), or None when the
+    template has no {canary} (a Hub version from before D, or an older prompt in an experiment).
+    The variables come from the template, so both kinds work.
+    """
+    variables = prompts.variables_of(template)
+    return PromptTemplate(template=template, input_variables=sorted(variables)), (canary.new() if "canary" in variables else None)
+
 def chunk_articles(articles):
     """
     Splits each article with enough text into chunks, tagged with its metadata and
@@ -192,13 +203,14 @@ def chunk_articles(articles):
     """
     all_chunks = []
     for article in articles:
-        text = article.get('full_text')
+        # Characters a reader can't see are removed from the text and the title (feature 3 #31)
+        text = strip_invisible(article.get('full_text') or '')
         if not has_enough_text(text):
             continue
 
         metadata = {
             "source": article.get('url', ''),
-            "title": article.get('title', 'No Title'),
+            "title": strip_invisible(title) if isinstance(title := article.get('title', 'No Title'), str) else title,
             "source_name": article.get('source_name') or '',   # the outlet; "source" is the URL
             "theme_id": article.get('theme_id', -1),
             "published_at": article.get('published_at', '')
@@ -358,10 +370,21 @@ async def build_vector_store(articles):
         return None
 
     texts = [chunk.page_content for chunk in all_chunks]
-    try:
-        vectors = await get_vectors(texts)
-    except Exception as e:
-        raise errors.analysis_failed(e) from e
+    # The injection scan (feature 3, D #32) runs alongside the embeddings. In enforce mode it may
+    # return cleaned copies: their chunks are cut again (no chunk holds the removed text, and the
+    # index fills k=10 from what's left, #34) and embedded; unchanged chunks come from the cache.
+    async def embed(texts):
+        try:
+            return await get_vectors(texts)
+        except Exception as e:
+            raise errors.analysis_failed(e) from e
+    vectors, cleaned = await asyncio.gather(embed(texts), safety_articles.clean_articles(articles, text_splitter, "index"))
+    if cleaned is not None:
+        all_chunks = await asyncio.to_thread(chunk_articles, cleaned)
+        if not all_chunks:
+            return None
+        texts = [chunk.page_content for chunk in all_chunks]
+        vectors = await embed(texts)
 
     # Vectors are precomputed, so FAISS only uses the embeddings client to embed the query at search time
     vector_store = await asyncio.to_thread(
@@ -548,15 +571,15 @@ async def run_rag_query_with_store(query, vector_store, prompt_type):
     if prompt_template is None or prompt_type not in RETRIEVAL_SETTINGS:
         raise ValueError(f"Unknown prompt type: {prompt_type!r}")
 
-    prompt = PromptTemplate(template=prompt_template, input_variables=["context", "input"])
+    prompt, marker = answer_prompt(prompt_template)
 
     async def retrieve_and_answer():
         documents = await _retrieve(vector_store, query, prompt_type)
         # The prompt gets copies with header values; the answer's sources come from the originals.
         # run_name: the chain is traced as "generate" under its view's span, not as an unnamed
         # stuff_documents_chain (the report and timeline traces looked the same, Section A2)
-        answer = await qa_chain.ainvoke({"input": query, "context": _with_source_headers(documents)},
-                                        config={"run_name": "generate", "tags": [prompt_type]})
+        inputs = {"input": query, "context": _with_source_headers(documents), **({"canary": marker} if marker else {})}
+        answer = await qa_chain.ainvoke(inputs, config={"run_name": "generate", "tags": [prompt_type]})
         return documents, answer
 
     search = RETRIEVAL_SETTINGS[prompt_type]["search"]
@@ -585,6 +608,8 @@ async def run_rag_query_with_store(query, vector_store, prompt_type):
 
         summary = _retrieval_summary(documents, vector_store.index.ntotal, RETRIEVAL_K, STORY_CAP)
         print(f"[INFO] RAG [{prompt_type}, {search}]: Retrieved {summary}")
+        # The request's canary in the answer: withheld in enforce mode, cut out in monitor (D #36)
+        answer = await canary.check_text(answer or "", marker, where="answer", prompt_type=prompt_type)
         result = _format_response({"answer": answer, "context": documents})
         run.add_outputs({"answer_chars": len(result["answer"]), "sources": len(result["sources"]), "chunks": len(documents)})
         if not result["answer"]:

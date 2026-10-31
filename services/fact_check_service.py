@@ -9,6 +9,7 @@ from langchain_core.exceptions import OutputParserException
 from services import errors, observability, online_checks, prompts, usage
 from services import rag_service as rag
 from services.novelty_service import SHOWN, NOTHING_NEW, UNJUDGED
+from services.safety import articles as safety_articles, canary
 
 # --- feature 1: the fact check of a "Check for updates" ---
 # One LLM call per check (only when the check found unseen articles). novelty_service has
@@ -100,7 +101,8 @@ def _excerpts(stories):
     blocks = []
     for story in stories:
         for article in story["articles"]:
-            for chunk in rag.text_splitter.split_text(article.get("full_text") or "")[:CHUNKS_PER_ARTICLE]:
+            # The same chunks the injection scan judged: invisible characters removed first (#31)
+            for chunk in safety_articles.article_chunks(article, rag.text_splitter, CHUNKS_PER_ARTICLE):
                 header = (f"[Source: {_line(article.get('title')) or 'untitled'} | "
                           f"{_line(article.get('source_name')) or 'unknown outlet'} | "
                           f"Published: {_as_data(rag._published_text(article.get('published_at')))} | "
@@ -108,16 +110,32 @@ def _excerpts(stories):
                 blocks.append(f"{header}\n{_as_data(chunk)}")
     return blocks
 
-def build_prompt(query, stories, known_stories, told) -> tuple[str, int]:
-    """The fact-check prompt and the number of excerpts in it."""
+def build_prompt(query, stories, known_stories, told, marker=None) -> tuple[str, int]:
+    """The fact-check prompt and the number of excerpts in it. marker: the request's canary
+    (feature 3 #36); a fresh one when not given (evals build prompts too)."""
     blocks = _excerpts(stories)
     prompt = UPDATE_PROMPT_TEMPLATE.format(
         query=_line(query),
         stories="\n".join(_story_line(s) for s in stories),
         already_told=_already_told(known_stories, told),
         context="\n\n".join(blocks),
+        canary=marker or canary.new(),
     )
     return prompt, len(blocks)
+
+
+async def _cleaned_stories(stories) -> list:
+    """The stories with their articles cleaned of text written for the AI (D #37), when the
+    injection check (enforce mode) removed any; the same stories otherwise."""
+    articles = [a for s in stories for a in s["articles"]]
+    cleaned = await safety_articles.clean_articles(articles, rag.text_splitter, "fact_check", max_chunks=CHUNKS_PER_ARTICLE)
+    if cleaned is None:
+        return stories
+    out, i = [], 0
+    for story in stories:
+        out.append({**story, "articles": cleaned[i:i + len(story["articles"])]})
+        i += len(story["articles"])
+    return out
 
 
 # --- Reading the answer ---
@@ -164,7 +182,9 @@ async def run_fact_check(query, stories, known_stories, told) -> dict:
     if fact_check_llm is None:
         raise errors.ai_not_configured("fact-check model not loaded")
 
-    prompt, excerpts = build_prompt(query, stories, known_stories, told)
+    stories = await _cleaned_stories(stories)
+    marker = canary.new() if "canary" in prompts.variables_of(UPDATE_PROMPT_TEMPLATE) else None
+    prompt, excerpts = build_prompt(query, stories, known_stories, told, marker)
     articles = sum(len(s["articles"]) for s in stories)
     new_count = sum(1 for s in stories if s["kind"] == "new")
     versions = {**rag.prompt_metadata("fact_check", UPDATE_PROMPT_TEMPLATE), "config_version": FACT_CHECK_CONFIG_VERSION}
@@ -195,6 +215,10 @@ async def run_fact_check(query, stories, known_stories, told) -> dict:
             raise errors.report_failed(e, "update") from e
 
         result = read_answer(answer, stories)
+        # The canary in any story's text: the whole check is withheld in enforce mode (D #36)
+        if marker and result["texts"]:
+            await canary.check_text("\n".join(result["texts"].values()), marker, where="update", prompt_type="update")
+            result["texts"] = {k: canary.strip(v, marker) for k, v in result["texts"].items()}
         counts = {kind: sum(1 for story_id, o in result["outcomes"].items() if o == kind) for kind in (SHOWN, NOTHING_NEW, UNJUDGED)}
         run.add_outputs({"usable": result["usable"], **counts})
         # The fact check's health on this check (Section I #66): feedback on the trace, never an error

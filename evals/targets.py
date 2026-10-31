@@ -14,7 +14,6 @@ sys.path.insert(0, str(ROOT))
 
 from langchain_classic.chains.combine_documents import create_stuff_documents_chain
 from langchain_core.documents import Document
-from langchain_core.prompts import PromptTemplate
 
 from services import prompts, rag_service as rag
 
@@ -29,10 +28,11 @@ def documents(context: list[dict]) -> list[Document]:
 async def generate_answer(query: str, view: str, context: list[dict], template: str | None = None) -> dict:
     """One chat call. template: a prompt to try instead of the app's (an experiment); default the app's."""
     template = template or rag.PROMPT_TEMPLATES[view]
-    prompt = PromptTemplate(template=template, input_variables=["context", "input"])
+    prompt, marker = rag.answer_prompt(template)        # the canary too, when the template has one
     chain = create_stuff_documents_chain(rag.pick_chat_model(rag.llm, rag.llm_fallback_only), prompt, document_prompt=rag.DOCUMENT_PROMPT)
     answer = await asyncio.wait_for(
-        chain.ainvoke({"input": query, "context": rag._with_source_headers(documents(context))},
+        chain.ainvoke({"input": query, "context": rag._with_source_headers(documents(context)),
+                       **({"canary": marker} if marker else {})},
                       config={"run_name": "generate", "tags": [view, "eval"],
                               "metadata": {**rag.prompt_metadata(view, template), "config_version": rag.CONFIG_VERSION}}),
         rag.CHAT_DEADLINE_SECONDS)

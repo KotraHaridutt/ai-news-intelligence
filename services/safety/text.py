@@ -68,6 +68,44 @@ def normalize(text: str, keep_newlines: bool = False) -> Normalized:
     return Normalized(text=cleaned, removed=removed, hidden=removed - joiners, changed=cleaned != original)
 
 
+def strip_invisible(text: str) -> str:
+    """
+    Article text (#31): only the invisible characters go (the same set normalize removes), nothing
+    else changes. No NFKC and no whitespace changes, so an ordinary article keeps its exact text,
+    its chunks keep their hashes and their cached vectors and verdicts stay valid.
+    """
+    text = text or ""
+    if text.isascii():
+        return text
+    text = _VARIATION_SELECTORS.sub("", text)
+    return "".join(ch for ch in text if unicodedata.category(ch) not in _REMOVE)
+
+
+# --- Sentences (D #33) ---
+# Where a flagged chunk is split to find the sentence that speaks to the AI. A sentence ends at
+# . ! ? or an ellipsis followed by a space and a capital, a digit, a quote or a bracket, or at a
+# line break. A short abbreviation before the period ("U.S.", "Mr.", "Jan.") doesn't end one, and
+# neither does a decimal (no space after its point). A wrong split only means a slightly shorter
+# or longer piece is judged.
+_CLOSERS = "\"'”’)]"
+_OPENERS = "\"'“‘(["
+_SENTENCE_END = re.compile(r"(?<=[.!?…])[" + re.escape(_CLOSERS) + r"]*\s+(?=[" + re.escape(_OPENERS) + r"]?[A-Z0-9])|\n+")
+_ABBREVIATION = re.compile(r"(?:\b[A-Za-z]|\b(?:Mr|Mrs|Ms|Dr|St|Jr|Sr|Inc|Corp|Ltd|Co|Gov|Sen|Rep|Gen|Lt|Col|"
+                           r"Capt|Prof|No|vs|etc|Jan|Feb|Mar|Apr|Jun|Jul|Aug|Sep|Sept|Oct|Nov|Dec))\.$")
+
+
+def sentences(text: str) -> list[str]:
+    """The text's sentences, in order, stripped; each exactly as it appears in the text."""
+    pieces, start = [], 0
+    for match in _SENTENCE_END.finditer(text):
+        candidate = text[start:match.start()]
+        if "\n" not in match.group() and _ABBREVIATION.search(candidate.rstrip(_CLOSERS)):
+            continue
+        pieces.append(candidate)
+        start = match.end()
+    pieces.append(text[start:])
+    return [p.strip() for p in pieces if p.strip()]
+
 # GNews answers 400 "syntax error" for "?", "!" and "-" outside quotes (A2 §4), so "what is happening
 # with the stock market?" failed. Decided 2026-10-31: remove them and search, never refuse.
 _SEARCH_DROP = re.compile(r"[?!¿¡]")
