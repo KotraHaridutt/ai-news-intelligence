@@ -25,6 +25,7 @@ from services import cache_service, errors, feedback_service, follow_service, sa
 from services.errors import AppError
 from services.pipeline_service import get_pipeline_data, build_time
 from services.rag_service import run_rag_query_with_store
+from services.safety.input_rails import check_query
 
 BASE_DIR = Path(__file__).resolve().parent
 
@@ -56,6 +57,8 @@ class FollowRequest(BaseModel):
     query: str
     # The answers on the page: {"report": id, "timeline": id, "contradictions": id}
     answer_ids: dict[str, str | None] = {}
+
+MAX_ANSWER_IDS = 3
 
 class FeedbackRequest(BaseModel):
     # A reader's rating of one answer (feature 2, Section J): 1 for 👍, -1 for 👎
@@ -94,11 +97,6 @@ async def unexpected_error_handler(request: Request, exc: Exception):
     # so uvicorn still logs the full traceback.
     print(f"[ERROR] {request.url.path} -> 500: unexpected {type(exc).__name__}: {exc}")
     return JSONResponse(status_code=500, content=error_content(errors.UNEXPECTED_MESSAGE, exc))
-
-def require_query(query: str) -> str:
-    if not query or not query.strip():
-        raise errors.empty_query()
-    return query
 
 def render_markdown(text) -> str:
     """
@@ -142,7 +140,9 @@ async def home(request: Request):
 @observability.request_span("POST /query", view="report")
 async def query_endpoint(req: QueryRequest):
     start_time = time.time()
-    query = require_query(req.query)
+    # Cleaned and checked before any GNews, scrape or chat call (feature 3, Section C): from here on
+    # `query` is the search form ("?" "!" removed, "-" a space, hidden characters out)
+    query = await check_query(req.query)
 
     # Both raise AppError on failure; the handler above turns it into the error response
     data = await get_pipeline_data(query)
@@ -163,7 +163,7 @@ async def query_endpoint(req: QueryRequest):
 @observability.request_span("POST /api/timeline", view="timeline")
 async def api_timeline(req: QueryRequest):
     start_time = time.time()
-    query = require_query(req.query)
+    query = await check_query(req.query)
 
     data = await get_pipeline_data(query)
     rag_data = await run_rag_query_with_store(query, data["vector_store"], "timeline")
@@ -180,7 +180,7 @@ async def api_timeline(req: QueryRequest):
 @observability.request_span("POST /api/contradictions", view="contradictions")
 async def api_contradictions(req: QueryRequest):
     start_time = time.time()
-    query = require_query(req.query)
+    query = await check_query(req.query)
 
     data = await get_pipeline_data(query)
     rag_data = await run_rag_query_with_store(query, data["vector_store"], "contradictions")
@@ -201,7 +201,11 @@ async def api_contradictions(req: QueryRequest):
 async def api_follow(req: FollowRequest):
     """Saves the report on the page (V1) as a followed topic. No GNews or chat call."""
     start_time = time.time()
-    query = require_query(req.query)
+    # The page sends at most one answer per view (feature 3 #21)
+    if len(req.answer_ids) > MAX_ANSWER_IDS:
+        raise errors.report_not_followable(f"{len(req.answer_ids)} answer ids (at most {MAX_ANSWER_IDS})")
+    # The same cleaning as the views, so the topic's key matches the report's (the check is cached)
+    query = await check_query(req.query)
     result = await follow_service.follow(query, req.answer_ids)
     return {**result, "time_taken": f"{time.time() - start_time:.2f}s"}
 

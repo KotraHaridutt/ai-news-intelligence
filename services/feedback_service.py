@@ -3,6 +3,7 @@ import uuid
 
 from services import cache_service, errors, observability
 from services.cache_service import WatchStoreUnavailable
+from services.safety import input_rails
 
 # --- A reader's 👍 / 👎 on an answer (feature 2, Section J) ---
 # The page sends the answer_id it already has (never a trace id). The answer's record in Redis
@@ -51,7 +52,8 @@ async def rate(answer_id: str, score: int, comment: str | None) -> dict:
     """Raises AppError: 422 bad rating / comment too long, 404 expired, 409 not collected, 503 store / LangSmith."""
     if score not in (1, -1):
         raise errors.rating_invalid(f"score {score!r}")
-    comment = (comment or "").strip() or None
+    # One line, without hidden characters (feature 3 #22); checked by Clef below, never refused for it
+    comment = input_rails.clean_comment(comment)
     if comment and len(comment) > MAX_COMMENT:
         raise errors.comment_too_long(MAX_COMMENT, f"comment of {len(comment)} characters")
     if not cache_service.is_valid_id(answer_id):
@@ -73,7 +75,10 @@ async def rate(answer_id: str, score: int, comment: str | None) -> dict:
     rated_ref = record["trace_id"].replace("-", "")[-8:]
     observability.annotate(rated_view=record.get("view"), rated_ref=rated_ref, rating=score, comment=bool(comment))
     try:
-        queued = await asyncio.wait_for(asyncio.to_thread(_save, client, record, answer_id, score, comment), SAVE_TIMEOUT_SECONDS)
+        # The comment's check (#27, monitor only) runs while LangSmith saves, so the rating doesn't wait for it
+        queued, _ = await asyncio.gather(
+            asyncio.wait_for(asyncio.to_thread(_save, client, record, answer_id, score, comment), SAVE_TIMEOUT_SECONDS),
+            input_rails.check_comment(comment))
     except asyncio.TimeoutError as e:
         raise errors.rating_not_saved(f"LangSmith didn't answer in {SAVE_TIMEOUT_SECONDS}s") from e
     except Exception as e:

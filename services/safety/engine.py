@@ -40,9 +40,18 @@ class Decision:
         return cls(verdict="flag", score=None, threshold=threshold, engine="none", reason=reason)
 
 
-def content_hash(question: Question, key: str, state: dict[str, str]) -> str:
+def _call_of(question: Question, key: str, items: dict[str, str], shared: dict[str, str]) -> tuple[dict, str]:
+    """The state and the key one item is asked about, as the question was calibrated (rule 6):
+    one item per call under the question's own state key, or, batched, under the item's key."""
+    if question.batch:
+        return {**shared, **items}, key
+    return {**shared, question.state_key: items[key]}, question.state_key
+
+
+def content_hash(question: Question, key: str, items: dict[str, str], shared: dict[str, str] | None = None) -> str:
     """What a verdict depends on: the question's version, the pinned model, and the texts it reads."""
-    texts = [state[k] for k in question.reads(key)]
+    state, asked = _call_of(question, key, items, shared or {})
+    texts = [state[k] for k in question.reads(asked)]
     raw = json.dumps([question.version, clef.MODEL, texts], ensure_ascii=False)
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
@@ -55,10 +64,23 @@ def _from_clef(question: Question, answer: dict, cached: bool) -> Decision:
                     label=label, probabilities=probabilities or {"noul": answer.get("noul")}, cached=cached)
 
 
-async def _ask_clef(question: Question, keys: list[str], state: dict[str, str], label: str) -> dict[str, Decision]:
-    """Cached verdicts first; Clef for the rest, whose answers are cached. Raises ClefError."""
-    hashes = {key: content_hash(question, key, state) for key in keys}
-    cache_keys = {key: cache_service.verdict_key(question.version, h) for key, h in hashes.items()}
+async def _ask_one(question: Question, key: str, items: dict[str, str], shared: dict[str, str], label: str) -> dict:
+    """One item, one call, named and keyed as calibrated. Returns Clef's answer; raises ClefError."""
+    state, asked = _call_of(question, key, items, shared)
+    reply = await clef.ask(state, {question.clef_name: question.payload(asked)}, timeout=question.timeout_s,
+                           label=label or question.name)
+    return reply["answers"][question.clef_name]
+
+
+async def _ask_clef(question: Question, keys: list[str], items: dict[str, str], shared: dict[str, str],
+                    label: str) -> tuple[dict[str, Decision], list[str], str | None]:
+    """
+    Cached verdicts first; Clef for the rest, whose answers are cached. Returns (decisions, the
+    keys Clef couldn't answer, why). A batched question is one set of calls: it all fails together.
+    Items asked one per call fail one by one, so one slow chunk doesn't send every chunk to the fallback.
+    """
+    cache_keys = {key: cache_service.verdict_key(question.version, content_hash(question, key, items, shared))
+                  for key in keys}
     cached = await cache_service.get_verdicts(list(cache_keys.values()))
     decisions, missing = {}, []
     for key, answer in zip(keys, cached):
@@ -69,13 +91,34 @@ async def _ask_clef(question: Question, keys: list[str], state: dict[str, str], 
         except (KeyError, TypeError, ValueError):
             pass                      # an entry in an old shape: ask again
         missing.append(key)
-    if missing:
-        reply = await clef.ask(state, {key: question.payload(key) for key in missing},
-                               timeout=question.timeout_s, label=label or question.name)
-        for key in missing:
-            decisions[key] = _from_clef(question, reply["answers"][key], cached=False)
-        await cache_service.set_verdicts({cache_keys[key]: reply["answers"][key] for key in missing})
-    return decisions
+    if not missing:
+        return decisions, [], None
+    if question.batch:
+        try:
+            reply = await clef.ask({**shared, **items}, {key: question.payload(key) for key in missing},
+                                   timeout=question.timeout_s, label=label or question.name)
+        except clef.ClefError as e:
+            return decisions, missing, f"clef {e.kind}"
+        answers = {key: reply["answers"][key] for key in missing}
+    else:
+        results = await asyncio.gather(*(_ask_one(question, key, items, shared, label) for key in missing),
+                                       return_exceptions=True)
+        answers, failed, why = {}, [], None
+        for key, result in zip(missing, results):
+            if isinstance(result, clef.ClefError):
+                failed.append(key)
+                why = why or f"clef {result.kind}"
+            elif isinstance(result, BaseException):
+                raise result
+            else:
+                answers[key] = result
+        if failed:
+            decisions.update({key: _from_clef(question, a, cached=False) for key, a in answers.items()})
+            await cache_service.set_verdicts({cache_keys[key]: a for key, a in answers.items()})
+            return decisions, failed, why
+    decisions.update({key: _from_clef(question, a, cached=False) for key, a in answers.items()})
+    await cache_service.set_verdicts({cache_keys[key]: a for key, a in answers.items()})
+    return decisions, [], None
 
 
 async def _ask_classifier(question: Question, keys: list[str], items: dict[str, str], vectors: dict | None,
@@ -115,17 +158,17 @@ async def judge(question: Question, items: dict[str, str], shared: dict[str, str
     """
     if not items:
         return {}
-    state = {**(shared or {}), **items}
+    shared = shared or {}
     keys = list(items)
-    reason = None
-    if settings.engine() == "clef":
-        try:
-            return await _ask_clef(question, keys, state, label)
-        except clef.ClefError as e:
-            reason = f"clef {e.kind}"
-    else:
-        reason = "SAFETY_ENGINE=embedding"
-    return await _ask_classifier(question, keys, items, vectors, reason)
+    if settings.engine() != "clef":
+        return await _ask_classifier(question, keys, items, vectors, "SAFETY_ENGINE=embedding")
+    try:
+        decisions, failed, reason = await _ask_clef(question, keys, items, shared, label)
+    except clef.ClefError as e:          # not configured / over budget: raised before any call
+        decisions, failed, reason = {}, keys, f"clef {e.kind}"
+    if failed:
+        decisions.update(await _ask_classifier(question, failed, items, vectors, reason))
+    return decisions
 
 
 async def judge_one(question: Question, text: str, key: str = "text", shared: dict[str, str] | None = None,

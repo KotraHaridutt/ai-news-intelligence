@@ -21,6 +21,7 @@ class SafetyEvent:
     threshold: float | None   # the score from which it blocks
     engine: str               # clef / embedding / code / none
     ms: float                 # time the check took
+    label: str | None = None              # what it saw: the likeliest class ("off_topic"), shape reasons
     text_hash: str | None = None          # observability.short_hash of the checked text
     questions_version: str | None = None  # the Clef question set's version (questions.VERSION)
     cached: bool = False                  # the verdict came from the Redis cache (no Clef call)
@@ -38,6 +39,8 @@ class SafetyEvent:
         score = "-" if self.score is None else f"{self.score:.3f}"
         line = (f"[SAFETY] {self.check} {self.verdict}{' (enforced)' if self.enforced else ''} "
                 f"score={score} engine={self.engine} mode={self.mode} where={self.where} {round(self.ms)}ms")
+        if self.label:
+            line += f" label={self.label}"
         if self.cached:
             line += " cached"
         if self.text_hash:

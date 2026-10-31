@@ -30,9 +30,9 @@ class Check:
 
 # Every guard of the plan, by the name its SAFETY_<NAME> setting and its events use
 CHECKS = {
-    "intent": Check("C", "what the query asks for: news, off-topic, harmful, probing, jailbreak"),
-    "text_shape": Check("C", "scrambled or encoded query text (leetspeak, base64)"),
-    "comment": Check("C", "feedback comments (a rating is never refused for its comment)", can_block=False),
+    "intent": Check("C", "what the query asks for: news, off-topic, harmful, probing, jailbreak", built=True),
+    "text_shape": Check("C", "scrambled or encoded query text (leetspeak, base64)", built=True),
+    "comment": Check("C", "feedback comments (a rating is never refused for its comment)", can_block=False, built=True),
     "injection": Check("D", "article text written to give the AI instructions"),
     "canary": Check("D", "the request's secret string showing up in an answer"),
     "relevance": Check("G", "retrieved chunks that aren't about the query"),

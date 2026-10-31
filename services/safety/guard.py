@@ -33,7 +33,7 @@ async def check(name: str, run: Callable[[], Awaitable[Decision]], *, where: str
     decision.enforced = decision.verdict == "block" and mode == "enforce"
     events.record(events.SafetyEvent(
         check=name, verdict=decision.verdict, mode=mode, where=where, score=decision.score,
-        threshold=decision.threshold, engine=decision.engine, ms=(time.perf_counter() - started) * 1000,
+        threshold=decision.threshold, engine=decision.engine, ms=(time.perf_counter() - started) * 1000, label=decision.label,
         text_hash=observability.short_hash(text) if text is not None else None,
         questions_version=questions.VERSION if decision.engine == "clef" else None,
         cached=decision.cached, reason=decision.reason, enforced=decision.enforced))

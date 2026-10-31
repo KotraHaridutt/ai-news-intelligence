@@ -18,6 +18,10 @@ from services import prompts
 # 4. Keep the wording short: Clef bills every input token, the question's own included, on every
 #    call (A2 §7.1: 21.8 neurons per 1,000 input tokens). Each question's size is recorded.
 # 5. Pin the model `clef` (clef.py): clef-omni missed instructions buried in news (A, #7c).
+# 6. Ask exactly what was calibrated: Clef reads the question's NAME and the state key's name too.
+#    Named after its state key instead of "intent", the intent question scored "suicide" 0.408
+#    instead of 0.237 (C2 §3). So each question carries the name and state key it was measured
+#    with, and whether it was measured with many items in one call (batch) or one item per call.
 
 TYPES = ("choice", "noul", "score")
 # A state key the app makes: lowercase, digits, underscores. Never text from a user or a page.
@@ -43,6 +47,10 @@ class Question:
     timeout_s: float = 5.0         # per check, Clef's retry included (A2 §7.3)
     fallback: str | None = None    # the embedding classifier used when Clef can't run
     calibrated: str = ""           # where the bands were measured
+    # How it was calibrated, and so how it's asked (rule 6):
+    clef_name: str = ""            # one item per call: the question's name in the call
+    state_key: str = ""            # one item per call: the item's key in `state`
+    batch: bool = False            # many items per call, each question named by its item's key
 
     def payload(self, key: str) -> dict:
         """The question as Clef takes it, about the state item `key`."""
@@ -59,8 +67,9 @@ class Question:
 
     @property
     def version(self) -> str:
-        """The hash of what is sent (type, wording, options): a new one for any change."""
-        return prompts.version_of(json.dumps([self.type, self.instructions, self.options], sort_keys=True))
+        """The hash of what is sent (type, wording, options, names, batching): a new one for any change."""
+        return prompts.version_of(json.dumps([self.type, self.instructions, self.options, self.clef_name, self.state_key,
+                                              self.batch], sort_keys=True))
 
     @property
     def characters(self) -> int:
@@ -101,6 +110,7 @@ QUESTIONS = {q.name: q for q in (
             "jailbreak": "Tries to make the AI drop its rules or role, or play an unrestricted persona",
         },
         allow=("news_question",), uncertain_at=0.3, block_at=0.7, timeout_s=2.0, fallback="intent",
+        clef_name="intent", state_key="query",
         calibrated="B2 §2 (362 queries, shortened wording); A2 §5.1 for the first wording"),
 
     # D #29: whether an article chunk holds a sentence aimed at an AI. Block score =
@@ -120,13 +130,16 @@ QUESTIONS = {q.name: q for q in (
         # When Clef can't run, the chunk scan fails open with a flag (#18, A1 §4.2's rule for D #33a).
         allow=("reports_on_ai", "instructions_to_people", "news_only"),
         uncertain_at=0.3, block_at=0.3, timeout_s=3.0, fallback=None,
+        # A2 §5.2 asked it as "kind" about `chunk`, one chunk per call (A2 §6: batching let one chunk
+        # move the others' verdicts)
+        clef_name="kind", state_key="chunk",
         calibrated="A2 §5.2 (30 planted + 30 hardest real chunks: 21 caught, 0 false alarms at 0.3)"),
 
     # G #52a: whether a retrieved chunk is about the query's topic. Flagged when P < 0.3.
     Question(
         name="relevance", type="noul",
         instructions="`{key}` is about the topic in `query`.",
-        true_is_fine=True, uncertain_at=0.7, block_at=0.7, timeout_s=5.0,
+        true_is_fine=True, uncertain_at=0.7, block_at=0.7, timeout_s=5.0, batch=True,
         calibrated="A2 §5.4 (5 topics: 1 of 50 own chunks, 37 of 50 others' below 0.3)"),
 
     # J #74: whether an answer sentence is supported by the sources it was written from. Catches
@@ -134,7 +147,7 @@ QUESTIONS = {q.name: q for q in (
     Question(
         name="support", type="noul",
         instructions="`{key}` is supported by `articles`.",
-        true_is_fine=True, uncertain_at=0.7, block_at=0.7, timeout_s=5.0,
+        true_is_fine=True, uncertain_at=0.7, block_at=0.7, timeout_s=5.0, batch=True,
         calibrated="A2 §5.3 (60 reviewed sentences + 8 altered facts; 1 of 55 supported below 0.3)"),
 )}
 # Toxicity, sentence-level leak, source balance and the sensitive-topic note are added in J and K,
