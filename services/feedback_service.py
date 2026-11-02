@@ -3,7 +3,7 @@ import uuid
 
 from services import cache_service, errors, observability
 from services.cache_service import WatchStoreUnavailable
-from services.safety import input_rails
+from services.safety import input_rails, privacy, settings
 
 # --- A reader's 👍 / 👎 on an answer (feature 2, Section J) ---
 # The page sends the answer_id it already has (never a trace id). The answer's record in Redis
@@ -74,11 +74,20 @@ async def rate(answer_id: str, score: int, comment: str | None) -> dict:
 
     rated_ref = record["trace_id"].replace("-", "")[-8:]
     observability.annotate(rated_view=record.get("view"), rated_ref=rated_ref, rating=score, comment=bool(comment))
+    # Feature 3 H: emails, phone numbers and the like are tagged before Clef reads the comment or
+    # LangSmith keeps it (#59). A private person's name (#64) is judged by Clef: in enforce mode the
+    # save waits for it, so the name is gone before the comment is saved; otherwise it runs alongside.
+    comment = await privacy.screen_comment(comment)
+    names = None
+    if settings.mode("names") == "enforce":
+        comment = await privacy.screen_names(comment)
+    else:
+        names = privacy.screen_names(comment)
     try:
-        # The comment's check (#27, monitor only) runs while LangSmith saves, so the rating doesn't wait for it
-        queued, _ = await asyncio.gather(
+        # The comment's checks (#27 injection, #64 names; monitor) run while LangSmith saves, so the rating doesn't wait
+        queued, *_ = await asyncio.gather(
             asyncio.wait_for(asyncio.to_thread(_save, client, record, answer_id, score, comment), SAVE_TIMEOUT_SECONDS),
-            input_rails.check_comment(comment))
+            input_rails.check_comment(comment), *([names] if names is not None else []))
     except asyncio.TimeoutError as e:
         raise errors.rating_not_saved(f"LangSmith didn't answer in {SAVE_TIMEOUT_SECONDS}s") from e
     except Exception as e:

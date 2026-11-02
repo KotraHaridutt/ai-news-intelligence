@@ -149,6 +149,8 @@ The three views accept a JSON body `{"query": "<topic>"}`. Interactive documenta
 }
 ```
 
+When personal data was taken out of the topic (`SAFETY_PII=enforce`), the response also has `query` (the topic as searched) and `query_notice` (what the page shows: "We removed a phone number from your topic before searching, to keep it private.").
+
 `answer_id` names this answer for **Follow** and for rating it (`null` if it couldn't be saved; the answer is still shown). `can_rate` says whether 👍 / 👎 can be saved for it (only when its trace was sent to LangSmith).
 
 ### `POST /api/timeline`: chronological events
@@ -193,6 +195,7 @@ A check returns:
 | Status | When | Example `detail` |
 |---|---|---|
 | `400` | Empty topic, or a search GNews can't parse (e.g. an unbalanced quote) | Please enter a topic first. |
+| `400` | The topic was only personal details (`SAFETY_PII=enforce`) | Your topic only had personal details in it (such as an email address or phone number), which aren't searched to keep them private. Please enter a news topic instead. |
 | `404` | No news in the last 48 hours, or none of the found pages could be read | No news from the last 2 days was found for "Tesla". Try a broader or different topic. |
 | `422` | Malformed request body | The request was invalid. Please enter a topic and try again. |
 | `500` | A missing or invalid GNews/Gemini key, or a bug | The news service isn't set up correctly on the server. Please contact the site owner. |
@@ -272,7 +275,7 @@ The app is traced end to end with [LangSmith](https://smith.langchain.com) (feat
 | What | How |
 |---|---|
 | **Traces** | One trace per request, named after its route (`POST /query`, ...), with spans for each step: GNews search, scraping, grouping, indexing, retrieval, every chat attempt (retries and fallback visible), the follow check's novelty steps and fact check. A followed topic's checks share a thread. Errors carry their status, the user's message and a `ref`. |
-| **Privacy** | API keys, tokens and Redis passwords are masked before anything leaves the process; long texts are trimmed; watch ids and answer ids leave the server only as hashes. Tracing runs on background threads and never fails or slows a request (measured in prod: +1 ms median). |
+| **Privacy** | API keys, tokens and Redis passwords, then personal data (emails, phone numbers, card and ID numbers), are masked before anything leaves the process; long texts are trimmed; watch ids and answer ids leave the server only as hashes. Tracing runs on background threads and never fails or slows a request (measured in prod: +1 ms median). |
 | **Tokens and cost** | Every chat attempt's input, output and thinking tokens and its cost; embeddings with estimated tokens. Per request: `cost_usd`, `chat_calls`, `answered_by` (primary or fallback). A Redis counter per model per Pacific day mirrors Gemini's free quota (20 a day), and a model out of quota is skipped until midnight Pacific. |
 | **Versions** | Every prompt has a version (a hash of its text) and the settings a `config_version`; both are on every trace and saved answer. Prompts are mirrored to the LangSmith Prompt Hub (`scripts/push_prompts.py`). |
 | **Evals** | Frozen eval data and 4 private datasets (retrieval, answers, fact check, prompt injection), free code checks, retrieval scores, per-sentence LLM judges with calibration against reviewed labels, and a resumable experiment runner inside the daily budget (`evals/run_evals.py`: run, compare, pairwise, thresholds). |
@@ -294,6 +297,37 @@ python evals/judge_yesterday.py --dry-run                # what yesterday's real
 **Free-plan limits that shape it:** Gemini allows 20 chat calls a day per model, so evals are resumable across days and LLM judging of live traffic is run by hand. LangSmith keeps traces 14 days on the free plan; worth-keeping examples go to datasets. LangSmith alerts can't email, so they go to ntfy.sh.
 
 ---
+
+## Personal data and retention
+
+Personal data is found by **format and checksum** (`services/safety/pii.py`): email addresses, phone numbers (India, North America, any number written with `+`), card numbers (Luhn), Aadhaar (Verhoeff), PAN, IBAN (mod-97) and IP addresses. A 12-digit price isn't an Aadhaar number and a 16-digit article id isn't a card: the checksum must hold. `SAFETY_PII` sets what happens (`monitor` by default):
+
+| Where | `monitor` | `enforce` |
+|---|---|---|
+| Your topic | Taken out of what the safety check (Clef, through Cloudflare's AI Gateway) reads; searched as typed | Also taken out of the search, the cache key, the prompt and the saved answer. The page says what was removed (`query_notice`) |
+| A rating's comment | Tagged (`[email]`) before Clef reads it and before LangSmith saves it | The same; and a comment naming a private person (Clef's `names` question, `SAFETY_NAMES`) has that sentence removed before saving |
+| An answer | Unchanged; what would be masked is recorded | Contact details **not in the articles** it was written from are masked (`[phone number removed]`). The articles' own helplines and tip lines stay: they are the news |
+| Traces and log lines | Tagged | Tagged |
+
+Names in topics and answers are never touched: public figures are what news is about.
+
+**What is kept, where, and for how long:**
+
+| Where | What | How long | How it's removed |
+|---|---|---|---|
+| Your browser (`localStorage`) | Your followed topics (topic, watch id) | Until you unfollow or clear site data | Unfollow, or clear the site's data |
+| Redis: article list per topic | The topic (as the key) and the articles found | 2 hours | Expires |
+| Redis: answers | The topic, the view, the answer text, which trace wrote it | 2 hours | Expires |
+| Redis: followed topic | The topic, the report and updates already shown, the story log | 30 days after the last check | **Unfollow** deletes it at once |
+| Redis: scraped pages | Article text from news sites, with its source and fetch time | 36 hours | Expires; `scripts/purge_url.py` removes one page everywhere |
+| Redis: embeddings and safety verdicts | Vectors of article chunks and topics; Clef's scores. Keyed by a hash of the text: no text is stored | 7 days | Expires |
+| Redis: usage counters | Calls and neurons per day: no text | 2 days | Expires |
+| LangSmith (traces) | Each request: the topic, the prompt (articles), the answer, timings, safety scores. Personal data tagged, keys masked, ids hashed | 14 days (free plan) | Expires |
+| LangSmith (ratings, review queue, datasets) | A rating and its comment (tagged) on the answer's trace; reviewed examples copied to datasets | Ratings: with the trace (14 days). Datasets: until deleted | Expires / deleted by the operator |
+| Cloudflare AI Gateway logs | Every Clef request and reply: the topic (personal data removed), comments (tagged), article chunks, answer sentences | No time limit: each gateway has a storage cap, and when it's full it either deletes the oldest logs or stops saving (set in the gateway) | Deleted in the gateway; `cf-aig-collect-log-payload: false` would keep only metadata |
+| Render logs | One line per request step: topics (personal data tagged), errors, `[SAFETY]` lines (scores and hashes, no text) | 7 days (Hobby workspace) | Expires |
+
+There are no accounts, and the app stores no IP address. Render's own request logs can show the visitor's address, for the same 7 days.
 
 ## Project structure
 

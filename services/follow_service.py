@@ -7,6 +7,7 @@ from services.cache_service import WatchStoreUnavailable
 from services.fact_check_service import run_fact_check
 from services.pipeline_service import get_pipeline_data, build_time, _attach_pages
 from services.rag_service import get_vectors
+from services.safety import privacy
 
 # --- feature 1: following a topic ---
 # Follow saves what report V1 contained; Check shows only what is new since the last look.
@@ -295,7 +296,7 @@ async def _check(watch_id: str, render) -> dict:
         raise errors.check_not_saved(str(e)) from e
 
     decisions = ", ".join(f"{d['outcome']}{'' if d['distance'] is None else ' %.3f' % d['distance']}" for d in classified["decisions"])
-    print(f"[INFO] CHECK {watch_id} '{snapshot['query']}' from {data['window']['from']}: {data['articles_found']} found, "
+    print(f"[INFO] CHECK {watch_id} '{privacy.for_log(snapshot['query'])}' from {data['window']['from']}: {data['articles_found']} found, "
           f"{len(articles)} readable; {len(response['new_stories'])} new, {len(response['updates'])} updates, "
           f"{len(response['hidden_repeats'])} hidden repeats, {len(response['unreadable'])} unreadable [{decisions}]")
     return response

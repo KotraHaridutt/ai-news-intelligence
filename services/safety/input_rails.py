@@ -1,7 +1,8 @@
 import asyncio
+from dataclasses import dataclass, field
 
 from services import errors, observability
-from services.safety import questions, text
+from services.safety import privacy, questions, text
 from services.safety.engine import Decision, judge_one
 from services.safety.guard import check
 
@@ -12,9 +13,10 @@ from services.safety.guard import check
 #
 #   1. size: a raw query over MAX_RAW_QUERY_CHARS isn't read at all (#21)
 #   2. normalize + search form: hidden characters out, "?" "!" removed, "-" a space (#22)
-#   3. size again on what is searched: GNews's 200 characters (#21)
-#   4. intent, by Clef or the fallback classifier: refused in enforce mode from 0.7 (#24, #25)
-#   5. text shape: scrambled text is flagged, and blocked when the intent score is also >= 0.2 (#23)
+#   3. personal data (H #58): taken out of what the checks read; in enforce mode, out of the search too
+#   4. size again on what is searched: GNews's 200 characters (#21)
+#   5. intent, by Clef or the fallback classifier: refused in enforce mode from 0.7 (#24, #25)
+#   6. text shape: scrambled text is flagged, and blocked when the intent score is also >= 0.2 (#23)
 #
 # Real news about dark events, and news ABOUT AI attacks, must pass: 0 of 118 news queries are
 # blocked by Clef at any band, none is called scrambled (B2 §2.2, C1 §5, C2 §7).
@@ -82,31 +84,57 @@ async def judge_intent(query: str) -> Decision:
     return worst
 
 
-async def check_query(raw: str | None) -> str:
+@dataclass
+class CheckedQuery:
+    text: str                                            # what is searched, cached, prompted and shown
+    removed: list[str] = field(default_factory=list)     # personal data kinds taken out (H #58, enforce)
+
+    @property
+    def notice(self) -> str | None:
+        """What the page tells the user when personal data was taken out of their topic."""
+        return privacy.notice(self.removed) if self.removed else None
+
+
+async def checked_query(raw: str | None) -> CheckedQuery:
     """
-    The query as it is searched, cached, prompted and shown from here on. Raises AppError:
-    400 empty, 400 too long, 400 refused (intent or scrambled, enforce mode only).
+    The query as it is searched, cached, prompted and shown from here on, and what was taken out of
+    it. Raises AppError: 400 empty, 400 too long, 400 only personal data (enforce mode), 400 refused
+    (intent or scrambled, enforce mode only).
     """
     if raw is None or not raw.strip():
         raise errors.empty_query()
     if len(raw) > MAX_RAW_QUERY_CHARS:
         raise errors.query_too_long(MAX_QUERY_CHARS, f"{len(raw)} characters before cleaning")
     normalized = text.normalize(raw)
-    query = text.search_query(raw)
-    if not query:
+    if not text.search_query(normalized.text):
         raise errors.empty_query()       # only hidden characters, "?" or "!"
+    # Personal data never reaches Clef; in enforce mode, not GNews or the cache key either (H #58)
+    screen = await privacy.screen_query(normalized.text)
+    query = text.search_query(screen.searched)
+    # What the checks read: the query without its personal data ("" when that's all it was)
+    checked = text.search_query(screen.checked)
+    if not query:
+        raise errors.query_only_personal_data(f"removed: {', '.join(screen.removed)}")
     if len(query) > MAX_QUERY_CHARS:
         raise errors.query_too_long(MAX_QUERY_CHARS, f"{len(query)} characters after cleaning")
     if query != " ".join(raw.split()):
         observability.annotate(query_cleaned=query, hidden_characters_removed=normalized.hidden)
 
-    intent = await check("intent", lambda: judge_intent(query), where="query", text=query, refuse=_refused)
-    shape = text.shape(query)
+    # Monitor mode with nothing but personal data: there's nothing left for Clef to judge, and the
+    # data itself mustn't be sent, so the intent check is skipped (enforce mode refused it above)
+    intent = await check("intent", lambda: judge_intent(checked), where="query", text=checked,
+                         refuse=_refused) if checked else None
+    shape = text.shape(checked)
 
     async def run_shape():
         return shape_decision(shape, normalized.hidden, intent)
-    await check("text_shape", run_shape, where="query", text=query, refuse=_refused_scrambled)
-    return query
+    await check("text_shape", run_shape, where="query", text=checked, refuse=_refused_scrambled)
+    return CheckedQuery(text=query, removed=screen.removed)
+
+
+async def check_query(raw: str | None) -> str:
+    """The query as it is searched, cached, prompted and shown from here on (checked_query's text)."""
+    return (await checked_query(raw)).text
 
 
 def clean_comment(comment: str | None) -> str | None:

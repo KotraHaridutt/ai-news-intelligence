@@ -25,7 +25,8 @@ from services import cache_service, errors, feedback_service, follow_service, sa
 from services.errors import AppError
 from services.pipeline_service import get_pipeline_data, build_time
 from services.rag_service import run_rag_query_with_store
-from services.safety.input_rails import check_query
+from services.safety import privacy
+from services.safety.input_rails import check_query, checked_query
 
 BASE_DIR = Path(__file__).resolve().parent
 
@@ -81,7 +82,8 @@ def error_content(message: str, exc: Exception) -> dict:
 
 @app.exception_handler(AppError)
 async def app_error_handler(request: Request, exc: AppError):
-    print(f"[WARN] {request.url.path} -> {exc.status}: {exc.log}")
+    # The reason may quote the query (or what GNews said about it): personal data tagged (feature 3 #61)
+    print(f"[WARN] {request.url.path} -> {exc.status}: {privacy.for_log(exc.log)}")
     return JSONResponse(status_code=exc.status, content=error_content(exc.message, exc), headers=exc.headers)
 
 @app.exception_handler(RequestValidationError)
@@ -95,7 +97,7 @@ async def validation_error_handler(request: Request, exc: RequestValidationError
 async def unexpected_error_handler(request: Request, exc: Exception):
     # A bug. Starlette re-raises the exception after this response is sent,
     # so uvicorn still logs the full traceback.
-    print(f"[ERROR] {request.url.path} -> 500: unexpected {type(exc).__name__}: {exc}")
+    print(f"[ERROR] {request.url.path} -> 500: unexpected {type(exc).__name__}: {privacy.for_log(exc)}")
     return JSONResponse(status_code=500, content=error_content(errors.UNEXPECTED_MESSAGE, exc))
 
 def render_markdown(text) -> str:
@@ -131,6 +133,16 @@ async def remember_answer(query: str, view: str, text: str, built_at) -> dict:
     return {"answer_id": answer_id if saved else None, "can_rate": bool(saved and trace)}
 
 
+def query_notice(checked) -> dict:
+    """
+    Feature 3 #58: when personal data was taken out of the topic (enforce mode), the page is told
+    what (query_notice) and gets the topic as searched (query), so the tabs and Follow use that one.
+    """
+    if not checked.notice:
+        return {}
+    return {"query": checked.text, "query_notice": checked.notice}
+
+
 @app.get("/", response_class=HTMLResponse)
 async def home(request: Request):
     return templates.TemplateResponse(request=request, name="index.html", context={})
@@ -142,13 +154,15 @@ async def query_endpoint(req: QueryRequest):
     start_time = time.time()
     # Cleaned and checked before any GNews, scrape or chat call (feature 3, Section C): from here on
     # `query` is the search form ("?" "!" removed, "-" a space, hidden characters out)
-    query = await check_query(req.query)
+    checked = await checked_query(req.query)
+    query = checked.text
 
     # Both raise AppError on failure; the handler above turns it into the error response
     data = await get_pipeline_data(query)
     rag_data = await run_rag_query_with_store(query, data["vector_store"], "report")
 
     final_response = {
+        **query_notice(checked),
         "summary_html": render_markdown(rag_data["answer"]),
         "cited_sources": rag_data["sources"],
         "related_links": data["related_links"],
@@ -163,13 +177,15 @@ async def query_endpoint(req: QueryRequest):
 @observability.request_span("POST /api/timeline", view="timeline")
 async def api_timeline(req: QueryRequest):
     start_time = time.time()
-    query = await check_query(req.query)
+    checked = await checked_query(req.query)
+    query = checked.text
 
     data = await get_pipeline_data(query)
     rag_data = await run_rag_query_with_store(query, data["vector_store"], "timeline")
 
     return {
         "query": query,
+        **query_notice(checked),
         "timeline_html": render_markdown(rag_data["answer"]),
         "cited_sources": rag_data["sources"],
         **await remember_answer(query, "timeline", rag_data["answer"], data.get("built_at")),
@@ -180,13 +196,15 @@ async def api_timeline(req: QueryRequest):
 @observability.request_span("POST /api/contradictions", view="contradictions")
 async def api_contradictions(req: QueryRequest):
     start_time = time.time()
-    query = await check_query(req.query)
+    checked = await checked_query(req.query)
+    query = checked.text
 
     data = await get_pipeline_data(query)
     rag_data = await run_rag_query_with_store(query, data["vector_store"], "contradictions")
 
     return {
         "query": query,
+        **query_notice(checked),
         "analysis_html": render_markdown(rag_data["answer"]),
         "cited_sources": rag_data["sources"],
         **await remember_answer(query, "contradictions", rag_data["answer"], data.get("built_at")),

@@ -223,6 +223,11 @@ def query_too_long(limit: int, log=""):
     """C #21: GNews accepts at most 200 characters (A2 §4)."""
     return AppError(400, f"Your topic is too long. Please keep it under {limit:,} characters.", log)
 
+def query_only_personal_data(log=""):
+    """H #58: nothing is left to search once the query's personal data is taken out (enforce mode)."""
+    return AppError(400, "Your topic only had personal details in it (such as an email address or phone number), "
+                         "which aren't searched to keep them private. Please enter a news topic instead.", log)
+
 def answer_withheld(log=""):
     """D #36 (the canary showed up in the answer), K #83 (very insulting wording by the model)."""
     return AppError(502, "The answer couldn't be shown because it failed a safety check. "

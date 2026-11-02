@@ -15,6 +15,7 @@ import lxml.html
 from bs4 import BeautifulSoup
 
 from services import errors, observability
+from services.safety import privacy
 
 # Building a TLS context loads the CA bundle, which blocks for ~0.5 s. Build it once
 # at import and share it, instead of once per AsyncClient (i.e. per request).
@@ -169,7 +170,7 @@ async def fetch_news(query: str, window_from: str | None = None) -> list[dict]:
 
     try:
         async with _gnews_turn(), httpx.AsyncClient(verify=SSL_CONTEXT) as client:
-            print(f"[INFO] Fetching real news from GNews for: {query}")
+            print(f"[INFO] Fetching real news from GNews for: {privacy.for_log(query)}")
             response = await client.get(api_url, params=params, timeout=10.0)
     except httpx.TransportError as e:   # timeouts, DNS, refused connections
         raise errors.news_unreachable(f"GNews request failed: {type(e).__name__}: {e}") from e

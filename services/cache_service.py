@@ -177,8 +177,12 @@ async def get_articles(normalized_query: str, strict: bool = False) -> dict | No
     try:
         return json.loads(raw)
     except ValueError as e:
-        print(f"[WARN] Corrupt cache entry for '{normalized_query}': {e}")
+        print(f"[WARN] Corrupt cache entry for topic {_log_ref(normalized_query)}: {e}")
         return None
+
+def _log_ref(normalized_query: str) -> str:
+    """A topic in a log line, as a short hash: a query may hold personal data (feature 3 H #61)."""
+    return hashlib.sha256(normalized_query.encode("utf-8")).hexdigest()[:12]
 
 async def set_articles(normalized_query: str, data: dict):
     await _mset_with_ttl([(articles_key(normalized_query), json.dumps(data))], ARTICLES_TTL)
@@ -190,7 +194,7 @@ async def get_since_articles(normalized_query: str, from_hour: str) -> dict | No
     try:
         return json.loads(raw)
     except ValueError as e:
-        print(f"[WARN] Corrupt check cache entry for '{normalized_query}' from {from_hour}: {e}")
+        print(f"[WARN] Corrupt check cache entry for topic {_log_ref(normalized_query)} from {from_hour}: {e}")
         return None
 
 async def set_since_articles(normalized_query: str, from_hour: str, data: dict):

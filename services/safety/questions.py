@@ -177,6 +177,26 @@ QUESTIONS = {q.name: q for q in (
         true_is_fine=True, uncertain_at=0.7, block_at=0.7, timeout_s=5.0, batch=True,
         calibrated="A2 §5.4 (5 topics: 1 of 50 own chunks, 37 of 50 others' below 0.3)"),
 
+    # H #64: whether a feedback comment names a private person. Block score = P(private_person).
+    # The hard cases are their own options (rule 1): people in the news (named by an article, so
+    # already public), and people by role only ("the reporter", "my friend").
+    Question(
+        name="names", type="choice",
+        instructions="Who does `{key}` name?",
+        options={
+            "private_person": "Gives the name of a relative, neighbour, friend or colleague, the writer's own name, "
+                              "or another private person",
+            "public_figure": "Names only public figures or people quoted in news articles: politicians, officials, "
+                             "business leaders, celebrities, athletes, journalists, witnesses",
+            "roles_or_organisations": "Names only organisations, places, products or the app; people appear only by "
+                                      "role or pronoun (my mother, my friend, the reporter, they)",
+        },
+        allow=("public_figure", "roles_or_organisations"),
+        # No fallback classifier: when Clef can't run, the comment is kept as written (#18)
+        uncertain_at=0.3, block_at=0.6, timeout_s=3.0, fallback=None,
+        clef_name="names", state_key="comment",
+        calibrated="H §5 (64 written comments + 20 held out: at 0.6, 33 of 34 private names, 0 of 50 public or role-only)"),
+
     # J #74: whether an answer sentence is supported by the sources it was written from. Catches
     # changed facts (all below 0.1), and misses loose summary claims (A2 §5.3).
     Question(

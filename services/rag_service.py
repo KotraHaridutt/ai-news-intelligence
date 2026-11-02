@@ -11,7 +11,7 @@ from dotenv import load_dotenv
 # also when a script imports this module without server.py
 from services import cache_service, errors, observability, online_checks, prompts, usage  # noqa: F401
 from services.news_fetcher import has_enough_text
-from services.safety import articles as safety_articles, canary, gemini, provenance, relevance
+from services.safety import articles as safety_articles, canary, gemini, privacy, provenance, relevance
 from services.safety.text import strip_invisible
 
 # --- LangChain Imports ---
@@ -581,6 +581,10 @@ async def _retrieve(vector_store, query, prompt_type):
                            stories=len({_story(doc.metadata) for doc in documents}))
     return documents
 
+def source_text(documents) -> str:
+    """What the model read from the articles: each chunk's title and text (H #60 compares answers with it)."""
+    return "\n".join(f"{doc.metadata.get('title') or ''}\n{doc.page_content}" for doc in documents)
+
 def _format_response(response):
     answer = response.get('answer') or ''
     source_documents = response.get('context', [])
@@ -631,7 +635,7 @@ async def run_rag_query_with_store(query, vector_store, prompt_type):
         return documents, answer
 
     search = RETRIEVAL_SETTINGS[prompt_type]["search"]
-    print(f"[INFO] RAG: Invoking chain with query: '{query}' for type: '{prompt_type}' ({search} search)")
+    print(f"[INFO] RAG: Invoking chain with query: '{privacy.for_log(query)}' for type: '{prompt_type}' ({search} search)")
     # The view's span: retrieval and the answer, under the request (#19, #22). Its metadata names
     # the prompt and settings (#39); LangSmith passes it down, so the LLM run carries it too.
     versions = {**prompt_metadata(prompt_type, answer),
@@ -665,6 +669,9 @@ async def run_rag_query_with_store(query, vector_store, prompt_type):
         print(f"[INFO] RAG [{prompt_type}, {search}]: Retrieved {summary}")
         # The request's canary in the answer: withheld in enforce mode, cut out in monitor (D #36)
         answer = await canary.check_text(answer or "", marker, where="answer", prompt_type=prompt_type)
+        # Contact details the sources don't contain: masked in enforce mode (H #60). The article's own
+        # (a helpline, a tip line) are its news and stay.
+        answer = await privacy.screen_answer(answer, source_text(documents), where=prompt_type)
         result = _format_response({"answer": answer, "context": documents})
         run.add_outputs({"answer_chars": len(result["answer"]), "sources": len(result["sources"]), "chunks": len(documents)})
         if not result["answer"]:

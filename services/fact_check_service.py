@@ -11,7 +11,7 @@ from langchain_core.runnables import RunnableLambda
 from services import errors, observability, online_checks, prompts, usage
 from services import rag_service as rag
 from services.novelty_service import SHOWN, NOTHING_NEW, UNJUDGED
-from services.safety import articles as safety_articles, canary, gemini, provenance
+from services.safety import articles as safety_articles, canary, gemini, privacy, provenance
 
 # --- feature 1: the fact check of a "Check for updates" ---
 # One LLM call per check (only when the check found unseen articles). novelty_service has
@@ -248,6 +248,9 @@ async def run_fact_check(query, stories, known_stories, told) -> dict:
         if marker and result["texts"]:
             await canary.check_text("\n".join(result["texts"].values()), marker, where="update", prompt_type="update")
             result["texts"] = {k: canary.strip(v, marker) for k, v in result["texts"].items()}
+        # Contact details the prompt's articles don't contain: masked in enforce mode (H #60)
+        result["texts"] = await privacy.screen_texts(result["texts"], "\n".join(str(m.content) for m in messages),
+                                                     where="update")
         counts = {kind: sum(1 for story_id, o in result["outcomes"].items() if o == kind) for kind in (SHOWN, NOTHING_NEW, UNJUDGED)}
         run.add_outputs({"usable": result["usable"], "blocked": blocked, **counts})
         # The fact check's health on this check (Section I #66): feedback on the trace, never an error

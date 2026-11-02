@@ -386,9 +386,13 @@
                                    canRate: data.can_rate === true };
                 renderView("report");
                 renderRelatedLinks(data.related_links);
-                // Only a fully drawn report makes this the topic the tabs ask about
-                shownQuery = query;
+                // Only a fully drawn report makes this the topic the tabs ask about. When the server
+                // took personal data out of it (feature 3 #58), the tabs and Follow use its version,
+                // so the email or phone number isn't sent again or kept in the followed list.
+                const cleaned = data.query_notice && typeof data.query === "string" && data.query.trim();
+                shownQuery = cleaned ? data.query : query;
                 resultDiv.classList.remove("hidden");
+                if (data.query_notice) showNotice(data.query_notice);
             } catch (error) {
                 answers = {};
                 showError(messageFor(error));

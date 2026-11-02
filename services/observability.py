@@ -83,6 +83,28 @@ def make_redactor(environ=None):
     return redact
 
 
+# More redaction added by other modules: feature 3 H adds the personal data detectors
+# (services/safety/privacy.py registers them when it's imported, which the app does at startup).
+# Each takes a string and returns it masked; they run on every string after the secrets above.
+# Registered rather than imported here: the safety package imports this module.
+_extra_redactors: list = []
+
+
+def add_redactor(fn):
+    """Adds fn(text) -> text to what every trace string goes through. Adding the same fn twice does nothing."""
+    if fn not in _extra_redactors:
+        _extra_redactors.append(fn)
+
+
+def _redact_extra(text: str) -> str:
+    for fn in _extra_redactors:
+        try:
+            text = fn(text)
+        except Exception as e:          # a redactor's bug must not lose the trace (or fail the request)
+            print(f"[WARN] A trace redactor failed: {type(e).__name__}: {e}")
+    return text
+
+
 # --- Size (Section C, #29) ---
 # Measured in Section A: a traced answer stored the article text about five times (the chain's
 # input, format_inputs, format_docs, the prompt, the LLM's messages), ~176 KB per trace. The LLM
@@ -105,14 +127,14 @@ def make_scrubber(environ=None):
     """
     Returns scrub(data) -> data, applied by the LangSmith client to every run's inputs,
     outputs, metadata and error before it's queued (it's the client's anonymizer, so it sees
-    LangChain's runs too). Masks secrets in every string; trims long strings except in an LLM
-    run's payload and in error text.
+    LangChain's runs too). Masks secrets, then personal data (the added redactors), in every
+    string; trims long strings except in an LLM run's payload and in error text.
     """
     redact = make_redactor(environ)
 
     def walk(value, trim, depth):
         if isinstance(value, str):
-            value = redact(value)
+            value = _redact_extra(redact(value))
             return _trimmed(value) if trim and len(value) > TRIM_AT else value
         if depth >= _MAX_DEPTH:
             return value
