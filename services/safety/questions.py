@@ -94,6 +94,9 @@ class Question:
         return "allow"
 
 
+# J #80: a topic note applies when the likeliest option isn't "other" and its P is at least this (J §8)
+TOPIC_NOTE_AT = 0.6
+
 QUESTIONS = {q.name: q for q in (
     # C #24: what the query asks for. Block score = 1 - P(news_question).
     Question(
@@ -204,9 +207,25 @@ QUESTIONS = {q.name: q for q in (
         instructions="`{key}` is supported by `articles`.",
         true_is_fine=True, uncertain_at=0.7, block_at=0.7, timeout_s=5.0, batch=True,
         calibrated="A2 §5.3 (60 reviewed sentences + 8 altered facts; 1 of 55 supported below 0.3)"),
+
+    # J #80: what kind of news the answer's articles are, for a short note under the answer (election,
+    # health, money, a story still developing). Asked in the faithfulness call, about `articles`, which
+    # is already in its state (+~2 neurons). faithfulness.topic_note decides: the likeliest option, when it
+    # isn't "other" and its P is at least TOPIC_NOTE_AT (19 labeled sets: 0 wrong notes, J §8).
+    Question(
+        name="topic", type="choice",
+        instructions="What kind of news is in `{key}`?",
+        options={
+            "election": "Elections, voting, campaigns, candidates, polls or election results",
+            "health": "Health, medicine, disease, outbreaks, drug use, overdoses, mental health or suicide",
+            "finance": "Stock markets, investing, company earnings, prices, interest rates or personal money",
+            "developing": "A breaking event that is still unfolding, where casualties, suspects or causes are still being confirmed",
+            "other": "Other news: government, business, technology, science, courts, crime, war, sport or culture",
+        },
+        allow=("other",), uncertain_at=TOPIC_NOTE_AT, block_at=TOPIC_NOTE_AT, timeout_s=5.0, batch=True,
+        calibrated="J §8 (19 labeled article sets: at 0.6, 9 right notes, 0 wrong; terror attack, hostages without one)"),
 )}
-# Toxicity, sentence-level leak, source balance and the sensitive-topic note are added in J and K,
-# when they are calibrated (A2 §5 had no labeled data for them).
+# Toxicity, sentence-level leak and source balance are added in K, when they are calibrated.
 
 # The set's version: on every safety event, so a change of wording shows up in the traces
 VERSION = prompts.version_of(json.dumps({name: q.version for name, q in sorted(QUESTIONS.items())}))

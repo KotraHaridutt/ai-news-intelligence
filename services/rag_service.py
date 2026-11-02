@@ -11,7 +11,7 @@ from dotenv import load_dotenv
 # also when a script imports this module without server.py
 from services import cache_service, errors, observability, online_checks, prompts, usage  # noqa: F401
 from services.news_fetcher import has_enough_text
-from services.safety import articles as safety_articles, canary, gemini, privacy, provenance, relevance
+from services.safety import articles as safety_articles, canary, faithfulness, gemini, privacy, provenance, relevance
 from services.safety.text import strip_invisible
 
 # --- LangChain Imports ---
@@ -597,6 +597,9 @@ async def _retrieve(vector_store, query, prompt_type):
         ranked = await vector_store.asimilarity_search(search_query, k=index_size)
     pick = lambda pool: _cap_per_story(pool, RETRIEVAL_K, STORY_CAP)
     documents = await relevance.screen(query, ranked, pick(ranked), pick, where=prompt_type)
+    # None of them about the query: "not enough coverage" in enforce mode, before Gemini is called (J #79)
+    await relevance.coverage(query, documents, prompt_type,
+                             refuse=lambda d: errors.not_enough_coverage(query, prompt_type, f"{prompt_type}: {d.label}"))
     observability.annotate(search=settings["search"], query_suffix=settings.get("query_suffix"), k=RETRIEVAL_K,
                            story_cap=STORY_CAP, index_size=index_size,
                            stories=len({_story(doc.metadata) for doc in documents}))
@@ -698,6 +701,9 @@ async def run_rag_query_with_store(query, vector_store, prompt_type):
             run.add_tags(["gemini_blocked"])
             gemini.record_block(e, where=prompt_type)
             raise e.app_error(prompt_type) from e
+        except errors.AppError:
+            # A refusal with its own message (not enough coverage, J #79): passed on as it is
+            raise
         except Exception as e:   # a missed deadline is a TimeoutError -> "took too long" (504)
             if isinstance(e, TimeoutError):
                 run.add_tags(["timeout"])
@@ -720,6 +726,9 @@ async def run_rag_query_with_store(query, vector_store, prompt_type):
                          **({"finish_reason": finish["reason"]} if finish.get("reason") else {})})
         if not result["answer"]:
             raise errors.empty_report(prompt_type)
+        # Does it say what its chunks say, and what kind of news is it (feature 3 J): the notes to show
+        # under it (enforce), the scores on the trace. Never raises.
+        result["notes"] = (await faithfulness.check_answer(prompt_type, result["answer"], faithfulness.rows_of(documents)))["notes"]
         # The free code checks on this answer (Section I): feedback on the trace, never an error
         online_checks.answer(prompt_type, result["answer"], documents, list(vector_store.docstore._dict.values()),
                              RETRIEVAL_K, STORY_CAP)

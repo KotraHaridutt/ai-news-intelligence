@@ -40,7 +40,10 @@ CHECKS = {
     "pii": Check("H", "personal data in queries, comments, answers, traces and logs", built=True),
     "names": Check("H", "feedback comments that name a private person (masked before saving)", built=True),
     "output": Check("I", "links to pages that aren't sources and images in answers; cut or malformed answers", built=True),
-    "faithfulness": Check("J", "answer sentences that conflict with the sources", can_block=False),
+    # J: enforce shows a note under the answer; nothing in an answer is ever removed (decision #77)
+    "faithfulness": Check("J", "answer sentences that don't match their sources (note under the answer)", built=True),
+    "sensitive_topic": Check("J", "a note under election, health, money and developing-story answers", built=True),
+    "coverage": Check("J", "retrieved chunks that are all off-topic: 'not enough coverage' before Gemini", built=True),
     "toxicity": Check("K", "insulting wording in the model's own sentences"),
     "leak": Check("K", "an answer that reveals the AI's instructions"),
     "balance": Check("K", "answers that cite one side only", can_block=False),

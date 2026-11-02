@@ -690,6 +690,10 @@ function renderUpdate(data) {
     if (newStories.some(s => s.summary_html) || updates.length) {
         body.appendChild(textEl("p", "Summaries are AI-written from the linked articles.", "text-xs text-gray-500"));
     }
+    // Statements that don't match the articles, the kind of news (feature 3 J #80a), as text
+    for (const note of Array.isArray(data.answer_notes) ? data.answer_notes : []) {
+        if (typeof note === "string" && note) body.appendChild(textEl("p", note, "text-sm text-gray-500"));
+    }
     if (data.answer_id && data.can_rate === true) {
         data.ratingTarget = data.ratingTarget || { answerId: data.answer_id };
         body.appendChild(ratingBar(data.ratingTarget));

@@ -158,10 +158,12 @@ def render_markdown(text, source_urls=()) -> str:
 
 
 async def view_answer(view: str, rag_data: dict, field: str) -> dict:
-    """The view's answer as HTML (field), and its notes when there are any (a cut answer, feature 3 #66)."""
+    """The view's answer as HTML (field), and its notes when there are any: a cut answer (feature 3 #66),
+    statements that don't match the sources (#77), the kind of news (#80)."""
     shown = await output.answer(view, rag_data["answer"], rag_data.get("source_urls") or [],
                                 sources=rag_data.get("sources"), finish_reason=rag_data.get("finish_reason"))
-    return {field: shown["html"], **({"answer_notes": shown["notes"]} if shown["notes"] else {})}
+    notes = [*shown["notes"], *(rag_data.get("notes") or [])]
+    return {field: shown["html"], **({"answer_notes": notes} if notes else {})}
 
 async def remember_answer(query: str, view: str, text: str, built_at) -> dict:
     """

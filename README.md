@@ -151,7 +151,7 @@ The three views accept a JSON body `{"query": "<topic>"}`. Interactive documenta
 
 When personal data was taken out of the topic (`SAFETY_PII=enforce`), the response also has `query` (the topic as searched) and `query_notice` (what the page shows: "We removed a phone number from your topic before searching, to keep it private.").
 
-When Gemini stopped the answer at its length cap, the response also has `answer_notes` (shown in grey under the answer: "This answer reached its length limit, so it may stop mid-sentence.").
+`answer_notes` (only when there are some) are short lines the page shows in grey under the answer: the answer stopped at its length cap ("This answer reached its length limit, so it may stop mid-sentence."); with `SAFETY_FAITHFULNESS=enforce`, statements that don't match the cited articles ("2 statements in this answer don't match the cited articles. Check them against the sources below."); with `SAFETY_SENSITIVE_TOPIC=enforce`, election, health, money or developing-story news ("Market and money news, not financial advice."). A Follow check's response has them too. Nothing in an answer is ever removed for them.
 
 `summary_html` is the answer as safe HTML: raw HTML in it is shown as text, only the tags markdown makes are kept (`nh3`), and with `SAFETY_OUTPUT=enforce` a link to a page that isn't one of the answer's sources becomes plain text and images are removed. The same applies to `timeline_html`, `analysis_html` and a check's summaries.
 
@@ -201,6 +201,7 @@ A check returns:
 | `400` | Empty topic, or a search GNews can't parse (e.g. an unbalanced quote) | Please enter a topic first. |
 | `400` | The topic was only personal details (`SAFETY_PII=enforce`) | Your topic only had personal details in it (such as an email address or phone number), which aren't searched to keep them private. Please enter a news topic instead. |
 | `404` | No news in the last 48 hours, or none of the found pages could be read | No news from the last 2 days was found for "Tesla". Try a broader or different topic. |
+| `404` | None of the retrieved excerpts is about the topic (`SAFETY_COVERAGE=enforce`); no AI call is made | The articles found don't cover "Tesla" closely enough for a report. Try a more specific topic. |
 | `422` | Malformed request body | The request was invalid. Please enter a topic and try again. |
 | `500` | A missing or invalid GNews/Gemini key, or a bug | The news service isn't set up correctly on the server. Please contact the site owner. |
 | `502` | GNews or Gemini answered with an error, or the AI returned an empty answer | The AI couldn't write the report. Please try again. |

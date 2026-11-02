@@ -258,6 +258,8 @@ def _response(watch_id, snapshot, merged, data, articles, classified, result, id
         "unreadable": [{k: a.get(k) for k in nov.LINK_FIELDS} for a in data["unreadable"]],
         "nothing_new": not new_stories and not updates,
         "message": BLOCKED_MESSAGE if result.get("blocked") else RETRY_MESSAGE if retry else None,
+        # Statements that don't match the excerpts, the kind of news (feature 3 J #80a; enforce only)
+        **({"answer_notes": result["notes"]} if result.get("notes") else {}),
         "reused": False,
     }
 

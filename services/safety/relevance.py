@@ -84,6 +84,49 @@ async def screen(query: str, ranked: list, chosen: list, pick: Callable[[list], 
             for doc in final]
 
 
+# --- Not enough coverage (feature 3, J #79) ---
+# When none of the chunks an answer would get is about the query, the model would have to fill the
+# answer in from what it knows. In enforce mode the user gets "not enough coverage" (404) instead, before
+# Gemini is called (a chat call saved). Decided by the relevance scores above when Clef judged the chunks;
+# otherwise by embedding similarity: the query's vector against each chunk's, both from the pipeline's
+# cache (a chunk was embedded for the index, the query for ranking), so usually no embedding call.
+# Needs no Clef of its own. Fails open: an unjudged chunk counts as covered, and an embedding failure allows.
+COVERAGE_MIN_SIMILARITY = 0.60      # the fallback: the best chunk must be at least this close (J §9)
+
+
+def _cosines(query_vector, vectors) -> list[float]:
+    import numpy as np
+    q = np.asarray(query_vector, dtype=np.float32)
+    m = np.asarray(vectors, dtype=np.float32)
+    q /= np.linalg.norm(q) + 1e-12
+    m /= np.linalg.norm(m, axis=1, keepdims=True) + 1e-12
+    return [round(float(x), 4) for x in m @ q]
+
+
+async def coverage(query: str, documents: list, where: str, refuse: Callable[[Decision], Exception]) -> Decision | None:
+    """Raises refuse(decision) in enforce mode when no chunk is about the query. Returns the decision."""
+    if not documents:
+        return None
+    scores = [doc.metadata.get("relevance") for doc in documents]
+
+    async def run() -> Decision:
+        if any(p is not None for p in scores):
+            # Relevance judged them (G #52a): covered when any chunk is outside the block band, or unjudged
+            on_topic = [p for p in scores if p is None or 1.0 - p < RELEVANCE.block_at]
+            best = max((p for p in scores if p is not None), default=None)
+            return Decision(verdict="allow" if on_topic else "block", score=None if best is None else round(1.0 - best, 4),
+                            threshold=RELEVANCE.block_at, engine="clef",
+                            label=f"{len(on_topic)} of {len(scores)} chunks on topic")
+        from services import rag_service       # rag_service imports this module
+        query_vector = await rag_service.get_query_vector(query)
+        sims = _cosines(query_vector, await rag_service.get_vectors([doc.page_content for doc in documents]))
+        best = max(sims)
+        return Decision(verdict="allow" if best >= COVERAGE_MIN_SIMILARITY else "block", score=round(1.0 - best, 4),
+                        threshold=round(1.0 - COVERAGE_MIN_SIMILARITY, 4), engine="embedding",
+                        label=f"best chunk similarity {best:.3f}")
+    return await check("coverage", run, where=where, refuse=refuse, text=query)
+
+
 def _decision(first: list[Decision], removed: int, unjudged: int) -> Decision:
     """One decision for the answer's chunks: block when any chunk was off-topic, flag when any was
     uncertain or couldn't be judged, else allow. The score is the worst chunk's."""

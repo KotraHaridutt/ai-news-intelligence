@@ -11,7 +11,7 @@ from langchain_core.runnables import RunnableLambda
 from services import errors, observability, online_checks, prompts, usage
 from services import rag_service as rag
 from services.novelty_service import SHOWN, NOTHING_NEW, UNJUDGED
-from services.safety import articles as safety_articles, canary, gemini, privacy, provenance
+from services.safety import articles as safety_articles, canary, faithfulness, gemini, privacy, provenance
 
 # --- feature 1: the fact check of a "Check for updates" ---
 # One LLM call per check (only when the check found unseen articles). novelty_service has
@@ -127,6 +127,12 @@ def _excerpts(stories):
                           f"Story: {story['id']}]")
                 blocks.append(f"{header}\n{_as_data(chunk)}")
     return blocks
+
+def _rows(stories) -> list[dict]:
+    """The excerpts the prompt showed, one row each, for the faithfulness check (feature 3 J #80a)."""
+    return [{"title": a.get("title"), "source_name": a.get("source_name"), "published_at": a.get("published_at"), "text": chunk}
+            for story in stories for a in story["articles"]
+            for chunk in safety_articles.article_chunks(a, rag.text_splitter, CHUNKS_PER_ARTICLE)]
 
 def build_messages(query, stories, known_stories, told, marker=None) -> tuple[list, int]:
     """
@@ -273,6 +279,9 @@ async def run_fact_check(query, stories, known_stories, told) -> dict:
         # Contact details the prompt's articles don't contain: masked in enforce mode (H #60)
         result["texts"] = await privacy.screen_texts(result["texts"], "\n".join(str(m.content) for m in messages),
                                                      where="update")
+        # The shown texts against the excerpts they were written from, all in one call (feature 3 J #80a)
+        result["notes"] = (await faithfulness.check_answer("update", "\n\n".join(result["texts"].values()), _rows(stories))
+                           )["notes"] if result["texts"] else []
         counts = {kind: sum(1 for story_id, o in result["outcomes"].items() if o == kind) for kind in (SHOWN, NOTHING_NEW, UNJUDGED)}
         run.add_outputs({"usable": result["usable"], "blocked": blocked, **counts})
         # The fact check's health on this check (Section I #66): feedback on the trace, never an error

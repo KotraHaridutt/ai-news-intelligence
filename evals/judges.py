@@ -32,31 +32,9 @@ from services import prompts, rag_service as rag
 JUDGE_MODEL = os.getenv("JUDGE_MODEL", "gemini-3.8-flash")
 
 # --- Splitting an answer into numbered units ---
-BULLET = re.compile(r"^\s*(?:[-*•]|\d+[.)])\s+")
-SENTENCE_END = re.compile(r"(?<=[.!?])[\"”')\]]*\s+(?=[A-Z\"“(\[])")
-ABBREVIATION_END = re.compile(r"(?:\b(?:[A-Z]\.){2,}|\b(?:Mr|Mrs|Ms|Dr|St|Inc|Corp|Co|Ltd|Jr|Sr|vs|No|Gov|Sen|Rep|Gen)\.)$")
-
-
-def units(answer: str) -> list[str]:
-    """
-    The answer as the judge and the labels see it: one unit per list item or timeline line, and per
-    sentence inside a paragraph. Headings and markdown emphasis stay in the text; empty lines go.
-    """
-    out = []
-    for line in (answer or "").splitlines():
-        line = line.strip()
-        if not line:
-            continue
-        if BULLET.match(line) or re.match(r"^\**\d{4}(-\d{2}){0,2}\**\s*:", line):
-            out.append(line)
-            continue
-        for sentence in (s.strip() for s in SENTENCE_END.split(line) if s.strip()):
-            # "U.S. Federal Reserve", "Mr. Altman": the split above cut after an abbreviation
-            if out and ABBREVIATION_END.search(out[-1]) and not BULLET.match(out[-1]):
-                out[-1] = f"{out[-1]} {sentence}"
-            else:
-                out.append(sentence)
-    return out
+# One splitter for the judges, the labels and the app's live faithfulness check (feature 3 J), so a
+# unit the app checks is always the unit that was labeled
+from services.safety.faithfulness import ABBREVIATION_END, BULLET, SENTENCE_END, units  # noqa: E402,F401
 
 
 def numbered(items: list[str]) -> str:
