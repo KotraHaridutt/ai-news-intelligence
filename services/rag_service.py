@@ -11,7 +11,7 @@ from dotenv import load_dotenv
 # also when a script imports this module without server.py
 from services import cache_service, errors, observability, online_checks, prompts, usage  # noqa: F401
 from services.news_fetcher import has_enough_text
-from services.safety import articles as safety_articles, canary, gemini
+from services.safety import articles as safety_articles, canary, gemini, provenance, relevance
 from services.safety.text import strip_invisible
 
 # --- LangChain Imports ---
@@ -213,11 +213,16 @@ def answer_prompt(prompt) -> tuple:
         return ChatPromptTemplate.from_messages([("system", prompt.system), ("human", prompt.template)]), marker
     return PromptTemplate(template=prompt.template, input_variables=sorted(prompt.variables)), marker
 
+# Where each chunk's page came from (feature 3 #50-#53), copied from its article (pipeline_service
+# attaches them with the page): any sentence of an answer can be traced to the exact page version.
+PROVENANCE_FIELDS = ("final_url", "site", "listed_site", "redirected", "fetched_at", "page_hash", "page_date",
+                     "date_note", "independent_reports")
+
 def chunk_articles(articles):
     """
     Splits each article with enough text into chunks, tagged with its metadata and
     chunk_index (its position in the article: 0, 1, 2...), so a retrieved chunk can be
-    traced back to the part of the article it came from.
+    traced back to the part of the article it came from, and to the page version (provenance).
     """
     all_chunks = []
     for article in articles:
@@ -231,7 +236,8 @@ def chunk_articles(articles):
             "title": strip_invisible(title) if isinstance(title := article.get('title', 'No Title'), str) else title,
             "source_name": article.get('source_name') or '',   # the outlet; "source" is the URL
             "theme_id": article.get('theme_id', -1),
-            "published_at": article.get('published_at', '')
+            "published_at": article.get('published_at', ''),
+            **{field: article[field] for field in PROVENANCE_FIELDS if article.get(field) is not None},
         }
 
         for chunk_index, chunk_text in enumerate(text_splitter.split_text(text)):
@@ -485,6 +491,8 @@ def _published_text(value):
         return parsed.strftime("%Y-%m-%d %H:%M")
     return parsed.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
 
+_SPAN_ONLY_FIELDS = set(PROVENANCE_FIELDS) | {"relevance"}
+
 def _with_source_headers(documents):
     """
     Copies of the retrieved chunks with the values DOCUMENT_PROMPT shows in each chunk's header.
@@ -494,11 +502,17 @@ def _with_source_headers(documents):
     The original chunks and their metadata are kept unchanged.
     """
     return [
+        # G's provenance fields stay off the copies: they're on the retriever span already, and the answer
+        # chain's inputs (these copies) are traced twice per answer (feature 2 C's trace-size budget)
         Document(page_content=_as_data(doc.page_content), metadata={
-            **doc.metadata,
+            **{k: v for k, v in doc.metadata.items() if k not in _SPAN_ONLY_FIELDS},
             "header_title": _as_data(_header_text(doc.metadata.get("title"))) or "untitled",
             "header_outlet": _as_data(_header_text(doc.metadata.get("source_name"))) or "unknown outlet",
             "header_published": _as_data(_published_text(doc.metadata.get("published_at"))),
+            # Feature 3 G: the site the text was read from (#51) and how many independent reports
+            # carry the story (#52), so a claim only one outlet makes is visible to the model
+            "header_site": _as_data(provenance.site_line(doc.metadata)),
+            "header_reports": provenance.reports_line(doc.metadata.get("independent_reports")),
         })
         for doc in documents
     ]
@@ -532,7 +546,13 @@ def _retrieved_documents(documents):
     start (the full text is in the LLM run's prompt) and where it came from."""
     return {"documents": [{
         "page_content": doc.page_content[:300] + ("..." if len(doc.page_content) > 300 else ""),
-        "metadata": {key: doc.metadata.get(key) for key in ("title", "source_name", "published_at", "chunk_index", "theme_id", "source")},
+        "metadata": {**{key: doc.metadata.get(key) for key in ("title", "source_name", "published_at", "chunk_index", "theme_id", "source")},
+                     # Feature 3 #50: the page version each chunk came from, and its relevance score (#52a). Only the
+                     # fields it has, and the final URL only when a redirect changed it (the trace's size, feature 2 #29)
+                     **{key: doc.metadata[key] for key in ("site", "fetched_at", "page_hash", "independent_reports", "relevance")
+                        if doc.metadata.get(key) is not None},
+                     **({"final_url": doc.metadata["final_url"]}
+                        if doc.metadata.get("final_url") not in (None, doc.metadata.get("source")) else {})},
         "type": "Document",
     } for doc in documents]}
 
@@ -543,6 +563,8 @@ async def _retrieve(vector_store, query, prompt_type):
     The chunks for one answer, picked with the prompt type's RETRIEVAL_SETTINGS, then capped
     per story. Ranks the whole index (small: 7-60 chunks measured), because the cap may need
     chunks from beyond the first k. Query embedding is async; the FAISS search runs in a thread.
+    Then the relevance check (feature 3 #52a): in enforce mode a chunk that isn't about the query is
+    swapped for the next one in this ranking, under the same cap.
     """
     settings = RETRIEVAL_SETTINGS[prompt_type]
     search_query = query + settings.get("query_suffix", "")
@@ -552,7 +574,8 @@ async def _retrieve(vector_store, query, prompt_type):
             search_query, k=index_size, fetch_k=index_size, lambda_mult=settings["lambda_mult"])
     else:
         ranked = await vector_store.asimilarity_search(search_query, k=index_size)
-    documents = _cap_per_story(ranked, RETRIEVAL_K, STORY_CAP)
+    pick = lambda pool: _cap_per_story(pool, RETRIEVAL_K, STORY_CAP)
+    documents = await relevance.screen(query, ranked, pick(ranked), pick, where=prompt_type)
     observability.annotate(search=settings["search"], query_suffix=settings.get("query_suffix"), k=RETRIEVAL_K,
                            story_cap=STORY_CAP, index_size=index_size,
                            stories=len({_story(doc.metadata) for doc in documents}))

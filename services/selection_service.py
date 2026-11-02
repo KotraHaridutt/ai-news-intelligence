@@ -98,6 +98,42 @@ def choose_articles(articles, vectors, similarities):
     return sum(1 for article in articles if article['indexed'])
 
 
+def count_reports(articles, vectors):
+    """
+    Feature 3 #52: how many independent reports each story group holds, set on every member as
+    'independent_reports' (None for an article in no group). Articles from one outlet are one report,
+    and so are near-identical texts (a wire story copied by several sites, or one planted text spread
+    over several domains): a claim counts as corroborated only when separate texts make it.
+    Returns {theme_id: count}.
+    """
+    units = [_unit(v) for v in vectors] if vectors is not None else None
+    groups = {}
+    for i, article in enumerate(articles):
+        article['independent_reports'] = None
+        if article.get('theme_id', -1) != -1:
+            groups.setdefault(article['theme_id'], []).append(i)
+
+    counts = {}
+    for theme, members in groups.items():
+        parent = {i: i for i in members}
+
+        def root(i):
+            while parent[i] != i:
+                parent[i] = parent[parent[i]]
+                i = parent[i]
+            return i
+        for a_pos, i in enumerate(members):
+            for j in members[a_pos + 1:]:
+                same_outlet = _outlet(articles[i]) and _outlet(articles[i]) == _outlet(articles[j])
+                copy = units is not None and 1.0 - float(units[i] @ units[j]) < NEAR_IDENTICAL_DISTANCE
+                if same_outlet or copy:
+                    parent[root(i)] = root(j)
+        counts[theme] = len({root(i) for i in members})
+        for i in members:
+            articles[i]['independent_reports'] = counts[theme]
+    return counts
+
+
 def build_related_links(articles, similarities):
     """
     D3: up to 3 links for the biggest groups (most articles first, then most relevant),

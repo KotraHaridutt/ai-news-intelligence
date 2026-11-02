@@ -9,6 +9,9 @@ LLM safety (feature 3). The shared core every guard uses (Section B):
   classifier   the embedding classifier used when Clef can't run
   engine       judge(question, items): Clef, then the classifier, then fail open with a flag
   gemini       Gemini's own filter: explicit thresholds, blocks as values, GeminiBlocked (Section F)
+  provenance   where each article came from: site, redirect, fetch time, text hash, date check,
+               SAFETY_BLOCKED_DOMAINS (Section G)
+  relevance    retrieved chunks that aren't about the query: Clef, swapped in enforce (Section G)
 
 The guards themselves (Sections C-L) call check() with a run() that usually calls judge().
 """

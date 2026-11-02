@@ -246,13 +246,39 @@ def _parse(html: str):
         return None
 
 
+def _page_date(doc) -> str | None:
+    """
+    The page's own publish date (YYYY-MM-DD) from its metadata, for the date check (feature 3 #53).
+    trafilatura asks htmldate for the original date (not the last update), never later than today.
+    Measured on 72 pages (G §3): 35 ms median, 161 ms at most; the extracted text is the same with or
+    without this step. Never raises: a page without a readable date gives None.
+    """
+    try:
+        meta = trafilatura.extract_metadata(doc)
+    except Exception:
+        return None
+    value = getattr(meta, "date", None) if meta is not None else None
+    return value if isinstance(value, str) and re.fullmatch(r"\d{4}-\d{2}-\d{2}", value) else None
+
+
+def extract_page(html: str) -> tuple[str | None, str | None]:
+    """(article text, the page's own publish date). CPU-bound, so callers run it in a thread."""
+    doc = _parse(html)
+    page_date = _page_date(doc) if doc is not None else None
+    return _extract(html, doc), page_date
+
+
 def extract_text(html: str):
+    """The article body of a page's HTML (extract_page without the date)."""
+    return _extract(html, _parse(html))
+
+
+def _extract(html: str, doc):
     """
     Extracts the article body from a page's HTML. CPU-bound, so callers run it in a thread.
     Hidden elements are dropped first (D #30); the cleaned tree goes to trafilatura as it is,
     without being written back to HTML and parsed again.
     """
-    doc = _parse(html)
     if doc is not None:
         drop_hidden(doc)
     # 1. Try Trafilatura (Clean, Markdown-style extraction)
@@ -308,7 +334,7 @@ async def fetch_one_article(client: httpx.AsyncClient, url: str) -> dict:
             raise ScrapeFailed(f"not HTML ({content_type})")
 
         # Parsing runs in a thread so the event loop keeps serving other requests
-        full_text = await asyncio.to_thread(extract_text, response.text)
+        full_text, page_date = await asyncio.to_thread(extract_page, response.text)
 
         if not has_enough_text(full_text):
             raise ScrapeFailed("too little text")
@@ -319,6 +345,11 @@ async def fetch_one_article(client: httpx.AsyncClient, url: str) -> dict:
             "status": "success",
             "http_status": http_status,
             "reason": None,
+            # Provenance (feature 3 #50, #51, #53): where the page ended up after redirects, when it
+            # was read, and the date the page gives itself
+            "final_url": str(response.url),
+            "fetched_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            "page_date": page_date,
         }
 
     except Exception as e:
@@ -358,11 +389,14 @@ async def scrape_results(urls: list[str]) -> list[dict]:
     print(f"[INFO] {_scrape_summary(results)}")
     return results
 
-async def scrape_pages(urls: list[str]) -> dict[str, str]:
+async def scrape_pages(urls: list[str]) -> dict[str, dict]:
     """
     Scrapes the given URLs in parallel.
-    Returns {url: full_text} for the pages that yielded enough text; failed pages are left out.
+    Returns {url: record} for the pages that yielded enough text; failed pages are left out. A record
+    is what cache_service stores: {"text", "final_url", "fetched_at", "page_date"} (feature 3 #50).
     The pipeline calls this only for URLs whose text isn't already cached.
     """
     results = await scrape_results(urls)
-    return {res['url']: res['full_text'] for res in results if res['status'] == 'success'}
+    return {res['url']: {"text": res['full_text'], "final_url": res.get('final_url'), "fetched_at": res.get('fetched_at'),
+                         "page_date": res.get('page_date')}
+            for res in results if res['status'] == 'success'}

@@ -38,6 +38,9 @@ EMB_TTL = 7 * 24 * 60 * 60       # Same text + same model always gives the same 
 TTL_JITTER = 0.10                # +/-10% so keys written together don't expire together
 # An answer can be followed only while the build it came from is cached, so it lives as long
 ANSWER_TTL = ARTICLES_TTL
+# A URL purged as poisoned (feature 3 #55) stays out of every build this long: longer than the
+# oldest article GNews returns (7 days, news_fetcher.MAX_LOOKBACK_HOURS), so it can't come back.
+PURGED_TTL = 8 * 24 * 60 * 60
 # A followed topic expires after this long without a check (feature-1 decision #14).
 # Exact, not jittered: the page tells the user "30 days".
 WATCH_TTL = 30 * 24 * 60 * 60
@@ -65,7 +68,16 @@ def articles_key(normalized_query: str) -> str:
     return f"{KEY_VERSION}:articles:{normalized_query}"
 
 def page_key(url: str) -> str:
+    """A scraped page: its text and where and when it was read (feature 3 #50), as JSON."""
+    return f"{KEY_VERSION}:scraped:{url}"
+
+def legacy_page_key(url: str) -> str:
+    """A page's text alone, as written before feature 3 G. Still read until they expire (PAGE_TTL)."""
     return f"{KEY_VERSION}:page:{url}"
+
+def purged_key(url: str) -> str:
+    """A URL scripts/purge_url.py removed as poisoned: no build uses it while this exists."""
+    return f"{KEY_VERSION}:purged:{url}"
 
 def emb_key(model: str, text: str) -> str:
     text_hash = hashlib.sha256(text.encode("utf-8")).hexdigest()
@@ -269,15 +281,56 @@ async def delete_watch(watch_id: str):
     await _watch_call("delete", lambda c: c.delete(watch_key(watch_id)))
 
 
-# --- Page texts ---
+# --- Scraped pages (feature 3, G #50) ---
+# A record per URL: {"text", "final_url" (after redirects), "fetched_at" (ISO UTC), "page_date" (the
+# page's own publish date, YYYY-MM-DD, or None)}. An answer sentence can then be traced to the exact
+# page version it came from. Pages cached before G hold only the text (legacy_page_key): they're read
+# as a record without provenance until they expire, so a deploy doesn't re-scrape every cached page.
+
+def page_record(value) -> dict:
+    """A record from what a scrape or a caller gives: a record, or a page's text alone."""
+    if isinstance(value, dict):
+        return {"text": value.get("text") or "", "final_url": value.get("final_url"),
+                "fetched_at": value.get("fetched_at"), "page_date": value.get("page_date")}
+    return {"text": value or "", "final_url": None, "fetched_at": None, "page_date": None}
+
+async def get_page_records(urls: list[str]) -> dict[str, dict]:
+    """Returns {url: record} for the URLs that are cached."""
+    records = {}
+    for url, raw in zip(urls, await _mget([page_key(url) for url in urls])):
+        if raw is None:
+            continue
+        try:
+            record = page_record(json.loads(raw))
+        except (ValueError, AttributeError):
+            continue
+        if record["text"]:
+            records[url] = record
+    missing = [url for url in urls if url not in records]
+    for url, raw in zip(missing, await _mget([legacy_page_key(url) for url in missing])):
+        if raw is not None:
+            records[url] = page_record(raw.decode("utf-8"))
+    return records
+
+async def set_page_records(pages: dict):
+    """pages: {url: record or text}."""
+    items = [(page_key(url), json.dumps(page_record(value), ensure_ascii=False)) for url, value in pages.items()]
+    await _mset_with_ttl(items, PAGE_TTL)
 
 async def get_pages(urls: list[str]) -> dict[str, str]:
     """Returns {url: full_text} for the URLs that are cached."""
-    values = await _mget([page_key(url) for url in urls])
-    return {url: raw.decode("utf-8") for url, raw in zip(urls, values) if raw is not None}
+    return {url: record["text"] for url, record in (await get_page_records(urls)).items()}
 
-async def set_pages(pages: dict[str, str]):
-    await _mset_with_ttl([(page_key(url), text) for url, text in pages.items()], PAGE_TTL)
+async def set_pages(pages: dict):
+    """pages: {url: text or record}."""
+    await set_page_records(pages)
+
+
+# --- Purged URLs (feature 3, G #55) ---
+
+async def get_purged(urls: list[str]) -> set[str]:
+    """The URLs among `urls` that were purged as poisoned. A failed read is "none purged", like a cache miss."""
+    return {url for url, raw in zip(urls, await _mget([purged_key(url) for url in urls])) if raw is not None}
 
 
 # --- Embedding vectors (raw float32 bytes) ---

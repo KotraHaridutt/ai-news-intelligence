@@ -11,7 +11,7 @@ from langchain_core.runnables import RunnableLambda
 from services import errors, observability, online_checks, prompts, usage
 from services import rag_service as rag
 from services.novelty_service import SHOWN, NOTHING_NEW, UNJUDGED
-from services.safety import articles as safety_articles, canary, gemini
+from services.safety import articles as safety_articles, canary, gemini, provenance
 
 # --- feature 1: the fact check of a "Check for updates" ---
 # One LLM call per check (only when the check found unseen articles). novelty_service has
@@ -113,6 +113,7 @@ def _excerpts(stories):
                 header = (f"[Source: {_line(article.get('title')) or 'untitled'} | "
                           f"{_line(article.get('source_name')) or 'unknown outlet'} | "
                           f"Published: {_as_data(rag._published_text(article.get('published_at')))} | "
+                          f"Site: {_line(provenance.site_line(article))} | "      # feature 3 #51
                           f"Story: {story['id']}]")
                 blocks.append(f"{header}\n{_as_data(chunk)}")
     return blocks

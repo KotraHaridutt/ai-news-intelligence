@@ -1,4 +1,5 @@
 import os
+import re
 from dataclasses import dataclass
 
 # --- Safety settings (feature 3, Section B #11, #15b) ---
@@ -35,7 +36,7 @@ CHECKS = {
     "comment": Check("C", "feedback comments (a rating is never refused for its comment)", can_block=False, built=True),
     "injection": Check("D", "article text written to give the AI instructions", built=True),
     "canary": Check("D", "the request's secret string showing up in an answer", built=True),
-    "relevance": Check("G", "retrieved chunks that aren't about the query"),
+    "relevance": Check("G", "retrieved chunks that aren't about the query", built=True),
     "pii": Check("H", "personal data in queries, comments, answers and traces"),
     "output": Check("I", "links, images and HTML in answers"),
     "faithfulness": Check("J", "answer sentences that conflict with the sources", can_block=False),
@@ -45,9 +46,16 @@ CHECKS = {
     "rate_limit": Check("L", "per-IP limits and daily shares"),
 }
 
+# Not a check: sites the operator decided never to use (feature 3, G #54). Exact domains, comma- or
+# space-separated; a domain also covers its subdomains ("example.com" covers "www.example.com").
+# Empty by default. A domain is an identifier, not language, so this isn't a keyword list.
+BLOCKED_DOMAINS_ENV = "SAFETY_BLOCKED_DOMAINS"
+_DOMAIN = re.compile(r"(?=.{1,253}$)([a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z][a-z0-9-]{0,62}")
+
 # What configure() read, for mode() and the startup line
 _modes: dict[str, str] = {}
 _engine = DEFAULT_ENGINE
+_blocked_domains: frozenset[str] = frozenset()
 _warnings: list[str] = []
 
 
@@ -61,7 +69,7 @@ def configure(environ=None) -> dict:
     warning (the default applies), so a typo in Render's settings can't stop the app from starting.
     Called once on import; tests call it again with their own environment. Returns the modes.
     """
-    global _engine
+    global _engine, _blocked_domains
     environ = os.environ if environ is None else environ
     _warnings.clear()
     _modes.clear()
@@ -82,13 +90,34 @@ def configure(environ=None) -> dict:
         _warnings.append(f"SAFETY_ENGINE={raw!r} isn't one of {', '.join(ENGINES)}; using {DEFAULT_ENGINE}")
         _engine = DEFAULT_ENGINE
 
+    _blocked_domains = frozenset(_read_domains(environ.get(BLOCKED_DOMAINS_ENV) or ""))
+
     # A SAFETY_ setting that matches no check is most likely a typo of one
-    known = {env_name(name) for name in CHECKS} | {"SAFETY_ENGINE"}
+    known = {env_name(name) for name in CHECKS} | {"SAFETY_ENGINE", BLOCKED_DOMAINS_ENV}
     for key in sorted(k for k in environ if k.startswith("SAFETY_") and k not in known):
         _warnings.append(f"{key} matches no safety check; ignored")
     for line in _warnings:
         print(f"[WARN] Safety: {line}.")
     return dict(_modes)
+
+
+def _read_domains(raw: str) -> list[str]:
+    """'Example.com, https://www.spam.example/' -> ['example.com', 'spam.example']. An entry that isn't a
+    domain is skipped with a warning."""
+    domains = []
+    for entry in re.split(r"[\s,]+", raw.strip().lower()):
+        if not entry:
+            continue
+        domain = re.sub(r"^[a-z]+://", "", entry).split("/", 1)[0].split(":", 1)[0].removeprefix("www.").strip(".")
+        if _DOMAIN.fullmatch(domain):
+            domains.append(domain)
+        else:
+            _warnings.append(f"{BLOCKED_DOMAINS_ENV}: {entry!r} isn't a domain; skipped")
+    return domains
+
+
+def blocked_domains() -> frozenset[str]:
+    return _blocked_domains
 
 
 def mode(check: str) -> str:
@@ -106,7 +135,10 @@ def summary() -> str:
     waiting = sum(1 for check in CHECKS.values() if not check.built)
     if not built:
         return f"no checks built yet ({waiting} planned)"
-    return ", ".join(built) + (f" ({waiting} more planned)" if waiting else "")
+    line = ", ".join(built) + (f" ({waiting} more planned)" if waiting else "")
+    if _blocked_domains:
+        line += f"; {len(_blocked_domains)} blocked domain{'s' if len(_blocked_domains) != 1 else ''}"
+    return line
 
 
 configure()

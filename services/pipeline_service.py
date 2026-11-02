@@ -7,15 +7,19 @@ from services import cache_service, errors, observability
 from services.news_fetcher import fetch_news, scrape_pages, check_window
 from services.clustering_service import group_by_theme
 from services.rag_service import build_vector_store, get_vectors, get_query_vector
+from services.safety import provenance
 from services.selection_service import (
-    cosine_similarities, promote_unique, choose_articles, build_related_links, selection_report,
+    cosine_similarities, promote_unique, choose_articles, build_related_links, selection_report, count_reports,
 )
 
 # Article fields stored in the articles: cache entry. No full_text: page text
 # lives once per URL under page: keys and is re-attached on a cache hit.
 # 'indexed' marks the articles the choose step picked for the FAISS index, so a hit
 # rebuilds the same index as the miss did. 'unique' and 'similarity' record why.
-ARTICLE_META_FIELDS = ("url", "title", "source_name", "published_at", "theme_id", "indexed", "unique", "similarity")
+# Feature 3 G: 'independent_reports' (#52) and the date check's result (#53) are kept too, so a hit
+# shows the model the same source lines; the page's provenance is in its page record (#50).
+ARTICLE_META_FIELDS = ("url", "title", "source_name", "published_at", "theme_id", "indexed", "unique", "similarity",
+                       "independent_reports", "date_note", "gnews_published_at")
 # What a check keeps of an article it found but couldn't read (blocked, paywalled, timed out)
 UNREADABLE_FIELDS = ("url", "title", "source_name", "published_at")
 
@@ -168,27 +172,78 @@ async def _load_or_build(key: str, search_query: str):
     return data
 
 
+async def _screen(articles) -> tuple[list, dict]:
+    """
+    Feature 3 #54, #55: the articles a build may use, and {url: why} for the others: a site in
+    SAFETY_BLOCKED_DOMAINS (by the URL GNews listed; the site a redirect ends on is checked after the
+    scrape), or a URL scripts/purge_url.py removed as poisoned. Neither is ever scraped.
+    """
+    excluded = {a['url']: f"blocked domain {d}" for a in articles if (d := provenance.blocked_by(a['url']))}
+    rest = list(dict.fromkeys(a['url'] for a in articles if a['url'] not in excluded))
+    for url in await cache_service.get_purged(rest) if rest else ():
+        excluded[url] = "purged"
+    if excluded:
+        print(f"[INFO] Left out {len(excluded)} article(s): " + "; ".join(f"{why}: {url}" for url, why in excluded.items()))
+        observability.add_totals(articles_left_out=len(excluded))
+    return [a for a in articles if a['url'] not in excluded], excluded
+
+
+def _check_provenance(articles) -> dict:
+    """
+    #51, #53 on articles that have their page: redirects to another site and the date check, each
+    recorded on the span and in the log. Sites blocked after a redirect are dropped (#54). Returns
+    {"articles": the ones kept, "redirected", "dates", "blocked_after_redirect"}.
+    """
+    now = datetime.now(timezone.utc)
+    kept, redirected, dates, blocked = [], [], [], []
+    for article in articles:
+        if article.get("redirected"):
+            redirected.append({"url": article['url'], "listed": article.get("listed_site"), "read_from": article.get("site")})
+            print(f"[WARN] Redirect to another site: {article['url']} was listed on {article.get('listed_site')} "
+                  f"and read from {article.get('site')}")
+        domain = provenance.blocked_by(article.get("final_url"))
+        if domain:
+            blocked.append({"url": article['url'], "domain": domain})
+            print(f"[INFO] Left out {article['url']}: it redirects to blocked domain {domain}")
+            continue
+        note = provenance.check_date(article, now)
+        if note:
+            dates.append({"url": article['url'], "note": note})
+            print(f"[WARN] Date check: {article['url']}: {note}")
+        kept.append(article)
+    return {"articles": kept, "redirected": redirected, "dates": dates, "blocked_after_redirect": blocked}
+
+
 @observability.traced("pages", inputs=_articles_in, outputs=lambda with_text: {"with_text": len(with_text)})
 async def _attach_pages(articles):
     """
     Reads page texts from the cache, scrapes only the URLs that aren't cached,
     caches the newly scraped ones and returns copies of the articles that have text.
+    Feature 3 G: blocked sites and purged URLs are left out first (#54, #55); each copy carries its
+    page's provenance (#50: final URL, site, fetch time, text hash, the page's own date), and the
+    redirect (#51) and date (#53) checks run on it.
     """
+    articles, _ = await _screen(articles)
     urls = list(dict.fromkeys(article['url'] for article in articles))
-    pages = await cache_service.get_pages(urls)
+    pages = await cache_service.get_page_records(urls) if urls else {}
 
     to_scrape = [url for url in urls if url not in pages]
     scraped = {}
     if to_scrape:
-        scraped = await scrape_pages(to_scrape)
-        await cache_service.set_pages(scraped)
+        # A scrape gives records; a page's text alone (an older caller or a test) is a record without provenance
+        scraped = {url: cache_service.page_record(value) for url, value in (await scrape_pages(to_scrape)).items()}
+        await cache_service.set_page_records(scraped)
         pages.update(scraped)
     observability.annotate(urls=len(urls), from_cache=len(urls) - len(to_scrape), scraped=len(to_scrape), scrape_ok=len(scraped))
     observability.add_totals(pages_from_cache=len(urls) - len(to_scrape), pages_scraped=len(to_scrape))
     print(f"[INFO] Pages: {len(urls)} URLs, {len(urls) - len(to_scrape)} from cache, "
           f"{len(to_scrape)} to scrape, {len(scraped)} succeeded.")
 
-    return [{**article, 'full_text': pages[article['url']]} for article in articles if article['url'] in pages]
+    checked = _check_provenance([provenance.with_page(article, pages[article['url']])
+                                 for article in articles if article['url'] in pages])
+    observability.annotate(provenance={key: value for key, value in checked.items() if key != "articles"})
+    observability.add_totals(redirected_pages=len(checked["redirected"]), date_flags=len(checked["dates"]))
+    return checked["articles"]
 
 
 @observability.traced("rebuild_from_cache", inputs=lambda a: {"articles": len(a["cached"].get("articles", []))},
@@ -200,7 +255,9 @@ async def _rebuild_from_cache(cached):
     back to a full build. Raises AppError if Gemini fails.
     """
     articles = cached.get("articles", [])
-    indexed = [article for article in articles if article.get("indexed", True)]
+    # A site blocked or a URL purged after this list was cached is left out of the index and the links (#54, #55)
+    _, excluded = await _screen(articles)
+    indexed = [article for article in articles if article.get("indexed", True) and article['url'] not in excluded]
 
     with_text = await _attach_pages(indexed)
     if len(with_text) < len(indexed):
@@ -213,9 +270,10 @@ async def _rebuild_from_cache(cached):
         return None
 
     return {
-        "articles": articles,
+        "articles": [article for article in articles if article['url'] not in excluded],
         "vector_store": vector_store,
-        "related_links": cached.get("related_links", []),
+        "related_links": [link for link in cached.get("related_links", [])
+                          if link.get("url") not in excluded and not provenance.blocked_by(link.get("url"))],
         "built_at": cached.get("built_at"),
     }
 
@@ -237,6 +295,11 @@ async def _build(key: str, search_query: str):
 
     # GNews can list the same URL twice; keep the first
     found = _unique_by_url(found)
+    # Blocked sites and purged URLs (feature 3 #54, #55): when nothing else is left, it's "no news"
+    # for this app, not "pages couldn't be read"
+    found, _ = await _screen(found)
+    if not found:
+        raise errors.no_recent_news(search_query)
 
     # 2. Page texts: cached ones first, scrape only the rest
     articles = await _attach_pages(found)
@@ -307,12 +370,14 @@ async def _group_and_choose(key: str, label: str, articles, article_vectors):
             print(f"[ERROR] Failed to embed the query for ranking: {e}. Ranking by GNews relevance order.")
         promote_unique(articles, similarities)
         choose_articles(articles, article_vectors, similarities)
+        # Feature 3 #52: independent reports per story, for each chunk's source line
+        count_reports(articles, article_vectors)
         related_links = build_related_links(articles, similarities)
         print(f"[INFO] Selection for {label}: " + "\n".join(selection_report(articles, similarities)))
     else:
         # Grouping failed, so duplicates can't be told apart: index everything, no Related Links
         for article in articles:
-            article['indexed'], article['unique'] = True, False
+            article['indexed'], article['unique'], article['independent_reports'] = True, False, None
         related_links = []
     for i, article in enumerate(articles):
         article['similarity'] = round(similarities[i], 4) if similarities else None
@@ -400,6 +465,8 @@ async def _build_since(key: str, search_query: str, window: dict):
     """
     built_at = build_time()
     found = _unique_by_url(await fetch_news(search_query, window_from=window["from"]))
+    # Blocked sites and purged URLs aren't counted or listed, not even as unreadable (feature 3 #54, #55)
+    found, _ = await _screen(found)
     result = {
         "articles": [], "article_vectors": [], "unreadable": [],
         "articles_found": len(found), "built_at": built_at,

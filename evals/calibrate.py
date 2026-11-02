@@ -53,7 +53,8 @@ def _context_from_prompt(prompt: str) -> list[dict]:
     else:
         block = prompt.split("CONTEXT:", 1)[1].rsplit("QUERY:", 1)[0]
     out = []
-    for m in re.finditer(r"\[Source: (?P<title>[^|\]]*)\|(?P<outlet>[^|\]]*)\| Published: (?P<pub>[^\]]*)\]\n(?P<text>.*?)(?=\n\n\[Source: |\Z)", block, re.S):
+    # The date ends at "|" too: since feature 3 G the header goes on with "| Site: ... | Reports on this story: ..."
+    for m in re.finditer(r"\[Source: (?P<title>[^|\]]*)\|(?P<outlet>[^|\]]*)\| Published: (?P<pub>[^\]|]*)[^\]]*\]\n(?P<text>.*?)(?=\n\n\[Source: |\Z)", block, re.S):
         pub = m.group("pub").strip().replace(" UTC", "")
         out.append({"title": m.group("title").strip(), "source_name": m.group("outlet").strip(),
                     "published_at": pub.replace(" ", "T") + ("Z" if len(pub) > 10 else ""), "page_content": m.group("text").strip()})
