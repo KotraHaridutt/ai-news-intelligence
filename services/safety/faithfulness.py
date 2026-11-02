@@ -113,42 +113,72 @@ class Judgement:
     reason: str | None = None            # why the fallback decided, or why it failed open
     neurons: float = 0.0
     sampled: bool = False                # the embedding method also ran (1 in SAMPLE_EVERY)
+    review: dict = field(default_factory=dict)       # K: Clef's answers to tone / leak / balance about `answer`
+    sentence_vectors: list | None = None             # the embedding method's vectors (K's leak fallback reuses them)
 
     @property
     def unsupported(self) -> list[int]:
         return [i for i, s in enumerate(self.sentences) if s.unsupported(self.engine)]
 
 
-async def ask_clef(sentences: list[str], articles: str, *, support=True, topic=True) -> tuple[list[float | None], dict | None, float]:
-    """One Clef call (split by clef.ask past 64 questions or the state limit): P(supported) per sentence,
-    the topic answer. Raises clef.ClefError."""
+# K's questions about the whole answer (tone #83, leak #84, balance #85), asked in the same call
+REVIEW = {name: questions.get(name) for name in ("tone", "leak", "balance")}
+
+
+async def ask(sentences: list[str], articles: str, *, support=True, topic=True, answer: str | None = None,
+              review=()) -> dict:
+    """
+    One Clef call (split by clef.ask past 64 questions or the state limit), with the chunks as `articles`:
+    P(supported) per sentence (s00, s01, ...), the topic, and K's questions about the whole `answer`.
+    Returns {"support": [P | None], "topic": answer | None, "review": {name: answer}, "neurons"}.
+    Raises clef.ClefError.
+    """
     state = {"articles": articles, **({key(i): s for i, s in enumerate(sentences)} if support else {})}
     asked = {key(i): SUPPORT.payload(key(i)) for i in range(len(sentences))} if support else {}
     if topic:
         asked["topic"] = TOPIC.payload("articles")
+    review = [name for name in review if answer]
+    if review:
+        state["answer"] = answer
+        asked.update({name: REVIEW[name].payload("answer") for name in review})
     reply = await clef.ask(state, asked, timeout=SUPPORT.timeout_s, label="faithfulness")
     answers = reply["answers"]
-    scores = [float(answers[key(i)]["noul"]) if support else None for i in range(len(sentences))]
-    return scores, answers.get("topic") if topic else None, reply.get("neurons", 0.0)
+    return {"support": [float(answers[key(i)]["noul"]) if support else None for i in range(len(sentences))],
+            "topic": answers.get("topic") if topic else None, "review": {name: answers[name] for name in review},
+            "neurons": reply.get("neurons", 0.0)}
+
+
+async def ask_clef(sentences: list[str], articles: str, *, support=True, topic=True) -> tuple[list[float | None], dict | None, float]:
+    """J's part of the call: (P(supported) per sentence, the topic answer, neurons). Raises clef.ClefError."""
+    r = await ask(sentences, articles, support=support, topic=topic)
+    return r["support"], r["topic"], r["neurons"]
+
+
+def normalized(vectors) -> np.ndarray:
+    m = np.asarray(vectors, dtype=np.float32)
+    return m / (np.linalg.norm(m, axis=1, keepdims=True) + 1e-12)
+
+
+async def embed_sentences(sentences: list[str], rows: list[dict]) -> tuple[list[float], np.ndarray]:
+    """#74a: (each sentence's cosine similarity to its closest source chunk, the sentences' unit vectors).
+    One embedding call for the sentences; the chunks' vectors come from the pipeline's cache."""
+    from services import rag_service      # rag_service imports the safety package
+    chunks = [r.get("text") or "" for r in rows]
+    m = normalized(await rag_service.get_vectors(chunks + sentences))
+    c, s = m[:len(chunks)], m[len(chunks):]
+    sims = [round(float(x), 4) for x in (s @ c.T).max(axis=1)] if len(chunks) else [0.0] * len(sentences)
+    return sims, s
 
 
 async def embedding_similarity(sentences: list[str], rows: list[dict]) -> list[float]:
-    """#74a: each sentence's cosine similarity to its closest source chunk. One embedding call for the
-    sentences; the chunks' vectors come from the pipeline's cache (they were embedded for the index)."""
-    from services import rag_service      # rag_service imports the safety package
-    chunks = [r.get("text") or "" for r in rows]
-    vectors = await rag_service.get_vectors(chunks + sentences)
-    m = np.asarray(vectors, dtype=np.float32)
-    m /= np.linalg.norm(m, axis=1, keepdims=True) + 1e-12
-    c, s = m[:len(chunks)], m[len(chunks):]
-    return [round(float(x), 4) for x in (s @ c.T).max(axis=1)] if len(chunks) else [0.0] * len(sentences)
+    return (await embed_sentences(sentences, rows))[0]
 
 
 def sampled(text: str) -> bool:
     return int(hashlib.sha256((text or "").encode("utf-8")).hexdigest()[:8], 16) % SAMPLE_EVERY == 0
 
 
-async def judge_answer(text: str, rows: list[dict], *, support=True, topic=True) -> Judgement:
+async def judge_answer(text: str, rows: list[dict], *, support=True, topic=True, review=()) -> Judgement:
     """Every check on one answer: figures/dates/names always (when support is on), then Clef, else the
     embedding method, else nothing (fail open). Never raises for an engine failure."""
     sentences = [Sentence(u) for u in checkable(text)]
@@ -158,11 +188,12 @@ async def judge_answer(text: str, rows: list[dict], *, support=True, topic=True)
             s.problems = facts.check_sentence(s.text, src)
     texts = [s.text for s in sentences]
     j = Judgement(sentences, engine="none")
-    if (support and texts) or topic:
+    if (support and texts) or topic or review:
         if settings.engine() == "clef":
             try:
-                scores, j.topic, j.neurons = await ask_clef(texts, articles_text(rows), support=support and bool(texts), topic=topic)
-                for s, p in zip(sentences, scores):
+                r = await ask(texts, articles_text(rows), support=support and bool(texts), topic=topic, answer=text, review=review)
+                j.topic, j.neurons, j.review = r["topic"], r["neurons"], r["review"]
+                for s, p in zip(sentences, r["support"]):
                     s.support = p
                 j.engine = "clef"
             except clef.ClefError as e:
@@ -172,7 +203,8 @@ async def judge_answer(text: str, rows: list[dict], *, support=True, topic=True)
     run_embedding = support and texts and (j.engine != "clef" or sampled(text))
     if run_embedding:
         try:
-            for s, sim in zip(sentences, await embedding_similarity(texts, rows)):
+            sims, j.sentence_vectors = await embed_sentences(texts, rows)
+            for s, sim in zip(sentences, sims):
                 s.similarity = sim
             if j.engine != "clef":
                 j.engine = "embedding"
@@ -216,16 +248,20 @@ def unsupported_note(n: int) -> str:
 
 async def check_answer(where: str, text: str, rows: list[dict]) -> dict:
     """
-    The checks on one answer (a view's, or a Follow check's texts together). Returns {"notes": [...]}:
-    the notes to show (enforce only). Records a `faithfulness` and a `sensitive_topic` event and puts
-    the per-sentence scores on the trace. Never raises.
+    The checks on one answer (a view's, or a Follow check's texts together; `where` is the view or
+    "update"). Returns {"notes": [...]}: the notes to show (enforce only). Records the `faithfulness` and
+    `sensitive_topic` events (J) and K's `toxicity`, `leak` and `balance` (conduct.py), and puts the
+    per-sentence scores on the trace. Raises answer_withheld (502) only for K #83 (hateful wording of the
+    model's own, toxicity in enforce); never for an engine failure.
     """
+    from services.safety import conduct      # conduct imports this module's helpers
     support_on = settings.mode("faithfulness") != "off"
     topic_on = settings.mode("sensitive_topic") != "off"
-    if not (support_on or topic_on) or not (text or "").strip():
+    review = conduct.review_for()
+    if not (support_on or topic_on or review) or not (text or "").strip():
         return {"notes": []}
     started = time.perf_counter()
-    j = await judge_answer(text, rows, support=support_on, topic=topic_on)
+    j = await judge_answer(text, rows, support=support_on, topic=topic_on, review=review)
     notes = []
 
     if support_on:
@@ -268,4 +304,7 @@ async def check_answer(where: str, text: str, rows: list[dict]) -> dict:
         observability.add_totals(faithfulness_unsupported=len(bad), faithfulness_sentences=len(j.sentences))
         observability.feedback("safety.faithfulness", round(1 - len(bad) / len(j.sentences), 4),
                                comment=_label(j) if bad else None)
+    # K: the model's own wording, leaks and balance, from the same call (may withhold: K #83)
+    if review or any(settings.mode(name) != "off" for name in conduct.CHECKS):
+        await conduct.record(where, j, text, rows, view=where)
     return {"notes": notes}

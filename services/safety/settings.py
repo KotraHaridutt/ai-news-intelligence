@@ -44,9 +44,10 @@ CHECKS = {
     "faithfulness": Check("J", "answer sentences that don't match their sources (note under the answer)", built=True),
     "sensitive_topic": Check("J", "a note under election, health, money and developing-story answers", built=True),
     "coverage": Check("J", "retrieved chunks that are all off-topic: 'not enough coverage' before Gemini", built=True),
-    "toxicity": Check("K", "insulting wording in the model's own sentences"),
-    "leak": Check("K", "an answer that reveals the AI's instructions"),
-    "balance": Check("K", "answers that cite one side only", can_block=False),
+    # K: enforce withholds only hateful wording of the model's own (decision #83); leak and balance flag only
+    "toxicity": Check("K", "loaded, insulting or hateful wording of the model's own (hateful: withheld)", built=True),
+    "leak": Check("K", "an answer that repeats or describes the AI's instructions", can_block=False, built=True),
+    "balance": Check("K", "answers that present one side of what the articles say", can_block=False, built=True),
     "rate_limit": Check("L", "per-IP limits and daily shares"),
 }
 

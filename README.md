@@ -202,6 +202,7 @@ A check returns:
 | `400` | The topic was only personal details (`SAFETY_PII=enforce`) | Your topic only had personal details in it (such as an email address or phone number), which aren't searched to keep them private. Please enter a news topic instead. |
 | `404` | No news in the last 48 hours, or none of the found pages could be read | No news from the last 2 days was found for "Tesla". Try a broader or different topic. |
 | `404` | None of the retrieved excerpts is about the topic (`SAFETY_COVERAGE=enforce`); no AI call is made | The articles found don't cover "Tesla" closely enough for a report. Try a more specific topic. |
+| `502` | The answer's own wording was judged hateful (`SAFETY_TOXICITY=enforce`; a quote of someone else's words doesn't count), or it contained the request's private marker (`SAFETY_CANARY=enforce`) | The answer couldn't be shown because it failed a safety check. Please try again, or try another view. |
 | `422` | Malformed request body | The request was invalid. Please enter a topic and try again. |
 | `500` | A missing or invalid GNews/Gemini key, or a bug | The news service isn't set up correctly on the server. Please contact the site owner. |
 | `502` | GNews or Gemini answered with an error, or the AI returned an empty answer | The AI couldn't write the report. Please try again. |
