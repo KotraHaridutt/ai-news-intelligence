@@ -136,7 +136,9 @@ async def _ask_classifier(question: Question, keys: list[str], items: dict[str, 
             vectors = {**vectors, **dict(zip(needed, found))}
     except Exception as e:
         why = f"{reason}; " if reason else ""
-        kind = "timeout" if isinstance(e, asyncio.TimeoutError) else f"failed: {type(e).__name__}"
+        kind = ("timeout" if isinstance(e, asyncio.TimeoutError)
+                else "budget (L #93): retrieval keeps its share" if type(e).__name__ == "EmbeddingBudget"
+                else f"failed: {type(e).__name__}")
         return {key: Decision.failed_open(f"{why}embedding {kind}", clf.block_at) for key in keys}
     decisions = {}
     for key in keys:

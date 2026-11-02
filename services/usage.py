@@ -1,13 +1,14 @@
 import asyncio
 import os
 import time
+from collections import deque
 from datetime import date, datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
 from langchain_core.callbacks import AsyncCallbackHandler
 
 from services import cache_service, errors, observability
-from services.safety import gemini
+from services.safety import gemini, limits
 
 # --- Tokens, cost and the daily quota (feature 2, Section D) ---
 # Every Gemini attempt is counted here: chat calls through a LangChain callback on both chat
@@ -151,6 +152,8 @@ async def _count_and_log(model: str, counts: dict, line: str, chat: bool):
         totals = None
         print(f"[WARN] Couldn't count Gemini usage: {type(e).__name__}: {e}")
     used = used_today(totals)
+    if not chat and used is not None and model == EMBEDDING_MODEL:
+        _adopt_embedding_day(used)
     if chat:
         today = f"{used}/{DAILY_LIMIT}" if used is not None else "?"
     else:
@@ -228,6 +231,9 @@ class UsageHandler(AsyncCallbackHandler):
         if ratings:
             observability.add_totals(gemini_ratings=ratings)
         counts = {"ok": 1, "input_tokens": input_tokens, "output_tokens": output_tokens, "thinking_tokens": thinking}
+        # The visitor's daily share (feature 3 #89): answers, not attempts, so Google's busy errors
+        # aren't held against them. Read from this request's context (limits.ClientLimits).
+        _background(limits.count_chat(limits.current_client()))
         if block is not None:
             observability.add_totals(gemini_blocks=1, gemini_block=block.label())
             counts["blocked"] = 1
@@ -266,6 +272,7 @@ def forget(run_ids):
 
 def record_embedding(model: str, characters: int, texts: int, error=None):
     """One embedding attempt (rag_service.call_with_retry): estimated tokens and cost, counted per day."""
+    _embedding_sent(texts)
     tokens = estimate_tokens(characters)
     if error is None:
         cost = cost_usd(model, tokens, 0) or 0
@@ -279,3 +286,136 @@ def record_embedding(model: str, characters: int, texts: int, error=None):
         line = f"[WARN] Embedding: {model} attempt failed ({kind})"
     _background(_count_and_log(model, counts, line, chat=False))
     return tokens
+
+
+# --- The embedding budget (feature 3, Section L #93) ---
+# gemini-embedding-001's free tier (A1 §4.1): 100 TEXTS a minute (each text of a batch counts) and 100
+# REQUESTS a day (a batch counts once), reset at midnight Pacific. Retrieval needs about 3 requests per
+# fresh topic. Safety's embedding calls (the fallback classifier, J's comparison sample, the coverage and
+# leak fallbacks) go through rag_service with purpose="safety" and may use only what retrieval leaves:
+# a safety call is refused (EmbeddingBudget) when it would take the minute past SAFETY_EMBED_MINUTE_MAX
+# texts, or when the day already has SAFETY_EMBED_DAY_MAX requests. The check then fails open (#18).
+# Vectors already in the cache cost nothing and are never refused.
+EMBEDDING_MODEL = "gemini-embedding-001"
+EMBED_TEXTS_PER_MINUTE = 100
+EMBED_REQUESTS_PER_DAY = 100
+SAFETY_EMBED_MINUTE_MAX = int(os.getenv("SAFETY_EMBED_MINUTE_MAX", "50"))    # half of the minute stays retrieval's
+SAFETY_EMBED_DAY_MAX = int(os.getenv("SAFETY_EMBED_DAY_MAX", "80"))          # the day's last 20 requests too
+
+# Texts sent in the last minute, in this process (one uvicorn worker on Render): (monotonic time, texts)
+_embed_minute: deque = deque()
+_embed_day = {"day": None, "requests": 0}
+
+
+class EmbeddingBudget(Exception):
+    """A safety embedding call that would eat into what retrieval needs. The check fails open."""
+
+
+def _embedding_sent(texts: int):
+    _embed_minute.append((time.monotonic(), texts))
+    day = quota_day()
+    if _embed_day["day"] != day:
+        _embed_day.update(day=day, requests=0)
+    _embed_day["requests"] += 1
+
+
+def _adopt_embedding_day(used: int):
+    """Redis's count for the day, when it's higher (a restart, scripts and evals on the same key)."""
+    day = quota_day()
+    if _embed_day["day"] != day:
+        _embed_day.update(day=day, requests=0)
+    _embed_day["requests"] = max(_embed_day["requests"], used)
+
+
+def embedding_texts_last_minute() -> int:
+    cutoff = time.monotonic() - 60
+    while _embed_minute and _embed_minute[0][0] < cutoff:
+        _embed_minute.popleft()
+    return sum(n for _, n in _embed_minute)
+
+
+def embedding_requests_today() -> int:
+    return _embed_day["requests"] if _embed_day["day"] == quota_day() else 0
+
+
+def safety_embedding_refusal(texts: int) -> str | None:
+    """Why a safety call embedding `texts` new texts can't be sent now, or None when it can."""
+    minute = embedding_texts_last_minute()
+    if minute + texts > SAFETY_EMBED_MINUTE_MAX:
+        return f"{minute} texts embedded in the last minute + {texts} would pass safety's {SAFETY_EMBED_MINUTE_MAX}"
+    day = embedding_requests_today()
+    if day >= SAFETY_EMBED_DAY_MAX:
+        return f"{day} embedding requests today (safety stops at {SAFETY_EMBED_DAY_MAX} of {EMBED_REQUESTS_PER_DAY})"
+    return None
+
+
+# --- GNews searches (feature 3, Section L #92) ---
+# The free plan allows 100 searches a day, reset at 00:00 UTC. Each search is counted in Redis
+# (v1:usage:gnews:<UTC day>) BEFORE it's sent: the count is reserved first, so two builds can't both
+# take the 100th. Past the limit the search isn't sent, and the user gets GNews's own daily-limit
+# message at once (with Retry-After). A 403 from GNews (its own count, which also has other users of
+# the key) marks the day used up in this process. Without Redis the count is this process's own.
+GNEWS = "gnews"
+GNEWS_DAILY_LIMIT = int(os.getenv("GNEWS_DAILY_LIMIT", "100"))
+GNEWS_WARN_AT = max(1, GNEWS_DAILY_LIMIT * 8 // 10)
+_gnews = {"day": None, "sent": 0, "used_up": False, "warned": False}
+
+
+def utc_day(now: datetime | None = None) -> str:
+    return (now or datetime.now(timezone.utc)).astimezone(timezone.utc).date().isoformat()
+
+
+def seconds_to_utc_midnight(now: datetime | None = None) -> int:
+    now = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
+    midnight = datetime.combine(now.date() + timedelta(days=1), datetime.min.time(), tzinfo=timezone.utc)
+    return max(1, int((midnight - now).total_seconds()))
+
+
+def _gnews_today() -> dict:
+    day = utc_day()
+    if _gnews["day"] != day:
+        _gnews.update(day=day, sent=0, used_up=False, warned=False)
+    return _gnews
+
+
+def gnews_sent_today() -> int:
+    return _gnews_today()["sent"]
+
+
+async def reserve_gnews_search():
+    """Counts one GNews search before it's sent. Raises errors.news_daily_limit past the day's limit."""
+    state = _gnews_today()
+    if state["used_up"]:
+        raise errors.news_daily_limit(seconds_to_utc_midnight(), "GNews answered 403 (daily limit) earlier today")
+    totals = await cache_service.add_usage(GNEWS, state["day"], {"requests": 1})
+    state["sent"] = totals.get("requests", 0) if totals else state["sent"] + 1
+    if state["sent"] > GNEWS_DAILY_LIMIT:
+        # Not sent: the reservation is given back, and the refusal counted
+        if totals:
+            await cache_service.add_usage(GNEWS, state["day"], {"requests": -1, "refused": 1})
+        state["sent"] -= 1
+        observability.add_totals(gnews_refused=1)
+        raise errors.news_daily_limit(seconds_to_utc_midnight(),
+                                      f"{state['sent']} GNews searches today (limit {GNEWS_DAILY_LIMIT}): not sent")
+    observability.add_totals(gnews_calls=1)
+    if state["sent"] >= GNEWS_WARN_AT and not state["warned"]:
+        state["warned"] = True
+        print(f"[WARN] GNews: {state['sent']} of {GNEWS_DAILY_LIMIT} searches used today "
+              f"(resets at midnight UTC, in {seconds_to_utc_midnight() / 3600:.1f} h).")
+
+
+def gnews_used_up():
+    """GNews answered 403: its daily limit is reached. Later searches today are refused without a call."""
+    _gnews_today()["used_up"] = True
+    print(f"[WARN] GNews: today's searches are used up (403). Refusing searches for "
+          f"{seconds_to_utc_midnight() / 3600:.1f} h, until midnight UTC.")
+
+
+async def load_today():
+    """At startup: today's embedding requests and GNews searches from Redis, so a restart remembers them."""
+    used = used_today(await cache_service.get_usage(EMBEDDING_MODEL, quota_day()))
+    if used:
+        _adopt_embedding_day(used)
+    gnews = await cache_service.get_usage(GNEWS, utc_day())
+    if gnews:
+        _gnews_today()["sent"] = max(0, gnews.get("requests", 0))

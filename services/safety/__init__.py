@@ -16,6 +16,8 @@ LLM safety (feature 3). The shared core every guard uses (Section B):
   privacy      where pii runs: the query, comments (+ Clef's `names`), answers, traces, log lines (Section H)
   output       model output into the page: HTML allowlist (nh3), links only to sources, no images, length cap
                and timeline format flags (Section I)
+  limits       per-visitor limits (per minute, daily shares), the body-size cap, the ClientLimits middleware
+               (Section L; the GNews and embedding budgets are in services/usage.py)
 
 The guards themselves (Sections C-L) call check() with a run() that usually calls judge().
 """
@@ -32,8 +34,10 @@ __all__ = ["Decision", "check", "judge", "judge_one", "question", "QUESTIONS", "
 async def startup():
     """At app start: loads the classifiers, reads today's Clef neurons, warms the Clef connection,
     prints the one safety line."""
+    from services import usage            # usage imports this package
+    from services.safety import limits
     classifier.load_all()
-    await asyncio.gather(clef.load_today(), clef.warm_up())
+    await asyncio.gather(clef.load_today(), clef.warm_up(), usage.load_today())
     if settings.engine() == "clef" and not clef.available():
         print(f"[WARN] Safety: {clef.status()}: every meaning-based check uses the embedding classifier.")
     line = (f"[INFO] Safety: engine {settings.engine()}, {clef.status()}, {classifier.status()}; {settings.summary()}; "
@@ -41,3 +45,6 @@ async def startup():
     if clef.available() and clef.neurons_today():
         line = line[:-1] + f"; {clef.neurons_today():.0f} Clef neurons used today."
     print(line)
+    print(f"[INFO] Limits: {limits.status()}; GNews {usage.gnews_sent_today()}/{usage.GNEWS_DAILY_LIMIT} today; "
+          f"{usage.embedding_requests_today()}/{usage.EMBED_REQUESTS_PER_DAY} embedding requests today "
+          f"(safety stops at {usage.SAFETY_EMBED_DAY_MAX}).")

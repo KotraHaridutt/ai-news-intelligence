@@ -164,7 +164,7 @@ async def embed_sentences(sentences: list[str], rows: list[dict]) -> tuple[list[
     One embedding call for the sentences; the chunks' vectors come from the pipeline's cache."""
     from services import rag_service      # rag_service imports the safety package
     chunks = [r.get("text") or "" for r in rows]
-    m = normalized(await rag_service.get_vectors(chunks + sentences))
+    m = normalized(await rag_service.get_vectors(chunks + sentences, purpose="safety"))
     c, s = m[:len(chunks)], m[len(chunks):]
     sims = [round(float(x), 4) for x in (s @ c.T).max(axis=1)] if len(chunks) else [0.0] * len(sentences)
     return sims, s

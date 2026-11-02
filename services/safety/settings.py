@@ -48,7 +48,9 @@ CHECKS = {
     "toxicity": Check("K", "loaded, insulting or hateful wording of the model's own (hateful: withheld)", built=True),
     "leak": Check("K", "an answer that repeats or describes the AI's instructions", can_block=False, built=True),
     "balance": Check("K", "answers that present one side of what the articles say", can_block=False, built=True),
-    "rate_limit": Check("L", "per-IP limits and daily shares"),
+    # L: per visitor. The other limits (body size, build queue, scrape caps, GNews, embedding and Clef
+    # budgets) protect the server itself and are always on.
+    "rate_limit": Check("L", "per-visitor limits per minute, daily shares of chat calls and of new follows", built=True),
 }
 
 # Not a check: sites the operator decided never to use (feature 3, G #54). Exact domains, comma- or

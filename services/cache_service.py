@@ -410,3 +410,55 @@ async def get_usage(model: str, day: str) -> dict[str, int] | None:
     except Exception as e:
         _on_redis_error("usage read", e)
         return None
+
+
+# --- Per-visitor counters (feature 3, Section L #87, #89, #94) ---
+# One integer per visitor and window: `v1:limit:<bucket>:<window>:<client>`, where client is a hash of
+# the visitor's address (safety/limits.client_key: no IP is written to Redis) and window names the
+# minute or the day, so a new window is a new key and no counter ever has to be reset. Like the
+# cache, a Redis failure never fails a request: the count is None and the limit fails open (#95).
+
+def limit_key(bucket: str, window: str, client: str) -> str:
+    return f"{KEY_VERSION}:limit:{bucket}:{window}:{client}"
+
+async def incr_counter(key: str, ttl: int, amount: int = 1) -> int | None:
+    """Adds `amount` and returns the new value (one round trip: INCRBY + EXPIRE), or None without Redis."""
+    if not _redis_available():
+        return None
+    try:
+        pipe = redis_client.pipeline(transaction=False)
+        pipe.incrby(key, int(amount))
+        pipe.expire(key, int(ttl))
+        return int((await pipe.execute())[0])
+    except Exception as e:
+        _on_redis_error("counter write", e)
+        return None
+
+async def get_counter(key: str) -> int | None:
+    """The counter's value (0 if it doesn't exist), or None without Redis."""
+    if not _redis_available():
+        return None
+    try:
+        value = await redis_client.get(key)
+        return int(value) if value is not None else 0
+    except Exception as e:
+        _on_redis_error("counter read", e)
+        return None
+
+async def count_and_read(key: str, ttl: int, read_key: str | None = None) -> tuple[int, int | None] | None:
+    """Adds 1 to `key` and reads `read_key` (a day's share) in the same round trip: (new value, the other
+    value or 0; None without read_key). None without Redis."""
+    if not _redis_available():
+        return None
+    try:
+        pipe = redis_client.pipeline(transaction=False)
+        pipe.incr(key)
+        pipe.expire(key, int(ttl))
+        if read_key:
+            pipe.get(read_key)
+        results = await pipe.execute()
+        other = (int(results[2]) if results[2] is not None else 0) if read_key else None
+        return int(results[0]), other
+    except Exception as e:
+        _on_redis_error("counter write", e)
+        return None

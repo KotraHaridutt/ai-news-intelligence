@@ -343,11 +343,12 @@ class _QueryEmbeddingsWithRetry(Embeddings):
 
 @observability.traced("embed.documents", inputs=lambda a: {"texts": len(a["texts"]), "characters": sum(map(len, a["texts"]))},
                       outputs=lambda vectors: {"vectors": len(vectors)})
-async def get_vectors(texts):
+async def get_vectors(texts, purpose: str = "pipeline"):
     """
     Returns one document vector per text, in order. Reads cached vectors first and
     embeds only the misses (each distinct text once), then caches the new ones.
-    Raises if the embedding API fails.
+    Raises if the embedding API fails. purpose="safety" (feature 3 #93): the misses are embedded only
+    while the embedding budget leaves retrieval its share, else usage.EmbeddingBudget is raised.
     """
     if not embeddings_model:
         raise RuntimeError("Embeddings model not loaded.")
@@ -358,6 +359,11 @@ async def get_vectors(texts):
 
     # Wire copies often have identical text, so embed each distinct missing text once
     missing_texts = list(dict.fromkeys(t for t, v in zip(texts, vectors) if v is None))
+    if missing_texts and purpose == "safety":
+        refusal = usage.safety_embedding_refusal(len(missing_texts))
+        if refusal:
+            observability.add_totals(safety_embeddings_refused=1)
+            raise usage.EmbeddingBudget(refusal)
     if missing_texts:
         # Async client call: the event loop keeps serving other requests while Gemini works
         new_vectors = await call_with_retry(
@@ -379,11 +385,11 @@ async def get_vectors(texts):
     return vectors
 
 @observability.traced("embed.query", inputs=lambda a: {"text": a["text"]}, outputs=lambda v: {"dimensions": len(v)})
-async def get_query_vector(text):
+async def get_query_vector(text, purpose: str = "pipeline"):
     """
     Returns the query's RETRIEVAL_QUERY vector, used to rank articles by relevance.
     Cached under its own task type, so it can never be mixed up with a document vector.
-    Raises if the embedding API fails.
+    Raises if the embedding API fails; usage.EmbeddingBudget for a safety call past its budget (#93).
     """
     if not embeddings_model:
         raise RuntimeError("Embeddings model not loaded.")
@@ -392,6 +398,11 @@ async def get_query_vector(text):
     observability.annotate(from_cache=cached is not None)
     if cached is not None:
         return cached
+    if purpose == "safety":
+        refusal = usage.safety_embedding_refusal(1)
+        if refusal:
+            observability.add_totals(safety_embeddings_refused=1)
+            raise usage.EmbeddingBudget(refusal)
 
     vector = await call_with_retry("Query embedding", embeddings_model.aembed_query, text, task_type=QUERY_TASK_TYPE)
     vector = np.asarray(vector, dtype=np.float32)

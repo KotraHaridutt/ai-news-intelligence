@@ -1,13 +1,14 @@
 import os
 import asyncio
 import time
+from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 
 from services import cache_service, errors, observability
 from services.news_fetcher import fetch_news, scrape_pages, check_window
 from services.clustering_service import group_by_theme
 from services.rag_service import build_vector_store, get_vectors, get_query_vector
-from services.safety import provenance
+from services.safety import limits, provenance
 from services.selection_service import (
     cosine_similarities, promote_unique, choose_articles, build_related_links, selection_report, count_reports,
 )
@@ -37,6 +38,33 @@ _started_by: dict[str | tuple, dict | None] = {}
 # 512 MB instance and the burst of Gemini embedding calls. Cache hits don't wait.
 MAX_CONCURRENT_BUILDS = max(1, int(os.getenv("MAX_CONCURRENT_BUILDS", "3")))
 _build_slots = asyncio.Semaphore(MAX_CONCURRENT_BUILDS)
+# Queue cap (feature 3 #90): past this many builds waiting for a slot, the next one is refused at once
+# with 503 "busy, try in a minute" (Retry-After 30) instead of piling up. A build takes 10-25 s, so a
+# full queue of 6 behind 3 running is about a minute of waiting already. Joining a running build of
+# the same topic and cache hits never wait, so they're never refused.
+MAX_QUEUED_BUILDS = max(0, int(os.getenv("MAX_QUEUED_BUILDS", "6")))
+_waiting = {"builds": 0}
+
+
+@asynccontextmanager
+async def _build_slot(label: str):
+    """One of the MAX_CONCURRENT_BUILDS slots, or errors.server_busy when the queue is full."""
+    if _build_slots.locked():
+        if _waiting["builds"] >= MAX_QUEUED_BUILDS:
+            observability.annotate(refused="build queue full")
+            raise errors.server_busy(f"{_waiting['builds']} builds already waiting for {MAX_CONCURRENT_BUILDS} slots "
+                                     f"(cap {MAX_QUEUED_BUILDS}): {label} refused")
+        print(f"[INFO] All {MAX_CONCURRENT_BUILDS} build slots busy. {label} is waiting "
+              f"({_waiting['builds'] + 1} waiting).")
+    _waiting["builds"] += 1
+    try:
+        await _build_slots.acquire()
+    finally:
+        _waiting["builds"] -= 1
+    try:
+        yield
+    finally:
+        _build_slots.release()
 
 
 # --- Span summaries (feature 2, Section C) ---
@@ -96,27 +124,37 @@ async def get_pipeline_data(query: str, since=None):
 
     async with observability.span("pipeline", inputs={"query": key, "since": since},
                                   metadata={"kind": "report" if since is None else "check"}) as run:
-        task = _inflight.get(flight)
-        if task is None:
-            # Created inside this span, so the build's own spans are traced under this request
-            task = asyncio.create_task(start())
-            _inflight[flight] = task
-            _started_by[flight] = observability.current_trace()
-            task.add_done_callback(lambda t: _on_task_done(flight, t))
-        else:
-            print(f"[INFO] Joining in-flight build for {label}")
-            # The build's spans are in the trace of the request that started it: link to it (#24)
-            started = _started_by.get(flight) or {}
-            run.add_tags(["joined_shared_build"])
-            run.add_metadata({"joined": True, "build_trace_id": started.get("trace_id"), "build_ref": started.get("ref")})
-
-        # shield: if this request is cancelled, the build keeps running for the others
         wait_start = time.time()
-        try:
-            data = await asyncio.shield(task)
-        except asyncio.CancelledError:
-            run.add_metadata({"note": "this request was cancelled; the shared build kept running for the others"})
-            raise
+        for attempt in range(2):
+            task = _inflight.get(flight)
+            if task is None:
+                # Created inside this span, so the build's own spans are traced under this request
+                task = asyncio.create_task(start())
+                _inflight[flight] = task
+                _started_by[flight] = observability.current_trace()
+                task.add_done_callback(lambda t: _on_task_done(flight, t))
+            else:
+                print(f"[INFO] Joining in-flight build for {label}")
+                # The build's spans are in the trace of the request that started it: link to it (#24)
+                started = _started_by.get(flight) or {}
+                run.add_tags(["joined_shared_build"])
+                run.add_metadata({"joined": True, "build_trace_id": started.get("trace_id"), "build_ref": started.get("ref")})
+
+            # shield: if this request is cancelled, the build keeps running for the others
+            try:
+                data = await asyncio.shield(task)
+                break
+            except asyncio.CancelledError:
+                run.add_metadata({"note": "this request was cancelled; the shared build kept running for the others"})
+                raise
+            except errors.AppError as e:
+                # The build was refused for the visitor who started it (their fresh-build limit, L #87).
+                # Someone else who joined it isn't over any limit: they start the build themselves, once.
+                blocked = getattr(e, "client", None)
+                if attempt == 0 and blocked is not None and blocked != limits.current_client():
+                    run.add_metadata({"note": "the shared build was refused for another visitor's limit; built again"})
+                    continue
+                raise
         run.add_metadata({"waited_s": round(time.time() - wait_start, 2)})
         if since is not None:
             # Requests in the same hour share the fetch, but the part a long gap couldn't
@@ -161,10 +199,10 @@ async def _load_or_build(key: str, search_query: str):
         observability.add_totals(articles_cache="miss")
         print(f"[INFO] Cache MISS for '{key}'. Running the full pipeline.")
 
-    if _build_slots.locked():
-        print(f"[INFO] All {MAX_CONCURRENT_BUILDS} build slots busy. '{key}' is waiting.")
+    # A fresh build: the visitor's per-minute fresh-build limit (feature 3 #87), then a slot (#90)
+    await limits.check_build(f"'{key}'")
     wait_start = time.time()
-    async with _build_slots:
+    async with _build_slot(f"'{key}'"):
         waited = time.time() - wait_start
         observability.annotate(waited_for_build_slot_s=round(waited, 2))
         data = await _build(key, search_query)
@@ -420,9 +458,8 @@ async def _load_or_build_since(key: str, search_query: str, window: dict):
         return data
     print(f"[INFO] Check cache MISS for {label}. Fetching.")
 
-    if _build_slots.locked():
-        print(f"[INFO] All {MAX_CONCURRENT_BUILDS} build slots busy. Check for {label} is waiting.")
-    async with _build_slots:
+    await limits.check_build(f"the check for {label}")
+    async with _build_slot(f"Check for {label}"):
         data = await _build_since(key, search_query, window)
     print(f"[INFO] Check build for {label} finished in {time.time() - start_time:.2f}s: "
           f"{data['articles_found']} found, {len(data['articles'])} readable, {len(data['unreadable'])} unreadable")

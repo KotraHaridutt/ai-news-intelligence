@@ -14,7 +14,7 @@ import lxml.etree
 import lxml.html
 from bs4 import BeautifulSoup
 
-from services import errors, observability
+from services import errors, observability, usage
 from services.safety import privacy
 
 # Building a TLS context loads the CA bundle, which blocks for ~0.5 s. Build it once
@@ -62,6 +62,16 @@ SCRAPE_HEADERS = {
 
 # Only these pages are parsed; PDFs, images and feeds are skipped
 HTML_CONTENT_TYPES = ("text/html", "application/xhtml+xml")
+
+# --- Scrape caps (feature 3, Section L #91) ---
+# A page used to be read whole, however big, and up to 10 are read and parsed at once on a 512 MB
+# instance: one huge or endless response could take the memory, and a server sending a byte every
+# few seconds could hold a build for minutes (the 15 s timeout is per read, not per page).
+# Measured on 183 real news pages (L §6): HTML median 322 KB, p99 2.2 MB, largest 4.8 MB (CNN);
+# extracted text median 3,138 characters, largest 46,499 (a live blog). So:
+MAX_PAGE_BYTES = 6_000_000       # read no more of a page than this; what was read is still parsed
+MAX_TEXT_CHARS = 60_000          # an article's text past this is cut at a word boundary
+PAGE_DEADLINE_SECONDS = 25.0     # the whole page, from the request to the last byte
 
 def has_enough_text(text) -> bool:
     return bool(text) and len(text) >= MIN_TEXT_LEN
@@ -168,6 +178,8 @@ async def fetch_news(query: str, window_from: str | None = None) -> list[dict]:
         "token": GNEWS_API_KEY,
     }
 
+    # The day's 100 searches (feature 3 #92): counted before the search is sent; past the limit it isn't sent
+    await usage.reserve_gnews_search()
     try:
         async with _gnews_turn(), httpx.AsyncClient(verify=SSL_CONTEXT) as client:
             print(f"[INFO] Fetching real news from GNews for: {privacy.for_log(query)}")
@@ -178,6 +190,8 @@ async def fetch_news(query: str, window_from: str | None = None) -> list[dict]:
         raise errors.news_failed(f"GNews request failed: {type(e).__name__}: {e}") from e
 
     if response.status_code != 200:
+        if response.status_code == 403:
+            usage.gnews_used_up()
         raise errors.news_http_error(response.status_code, response.text)
 
     try:
@@ -306,53 +320,89 @@ def _failure_reason(e: Exception) -> str:
     """
     if isinstance(e, ScrapeFailed):
         return str(e)
+    if isinstance(e, (asyncio.TimeoutError, TimeoutError)):
+        return f"timeout (page took over {PAGE_DEADLINE_SECONDS:.0f} s)"
     if isinstance(e, httpx.TimeoutException):
         return "timeout"
     if isinstance(e, httpx.TransportError):
         return "connection error"
     return f"other: {type(e).__name__}"
 
+def cap_text(text: str | None, limit: int = MAX_TEXT_CHARS) -> tuple[str | None, bool]:
+    """(the text cut to `limit` characters at the last space before it, whether it was cut)."""
+    if not text or len(text) <= limit:
+        return text, False
+    cut = text[:limit]
+    space = cut.rfind(" ", limit - 2000)
+    return (cut[:space] if space > 0 else cut).rstrip(), True
+
+
+async def read_capped(response: httpx.Response, limit: int = MAX_PAGE_BYTES) -> tuple[bytes, bool]:
+    """A streamed response's body, at most `limit` bytes: (body, whether the page was longer)."""
+    parts, size = [], 0
+    async for chunk in response.aiter_bytes():
+        if size + len(chunk) > limit:
+            parts.append(chunk[:limit - size])
+            return b"".join(parts), True
+        parts.append(chunk)
+        size += len(chunk)
+    return b"".join(parts), False
+
+
+async def _read_page(client: httpx.AsyncClient, url: str, seen: dict) -> dict:
+    """The page's text and provenance. Raises ScrapeFailed (or httpx's errors) for a page that can't be used."""
+    async with client.stream("GET", url, timeout=15.0, follow_redirects=True) as response:
+        seen["http_status"] = response.status_code
+
+        # Check before reading the body: an error page ("Access Denied", "404 Not Found") can have
+        # enough text to pass as an article, and would then be cached, embedded and indexed.
+        # The status is the final one, after redirects. A PDF or video isn't downloaded at all.
+        if response.status_code != 200:
+            raise ScrapeFailed(f"HTTP {response.status_code}")
+        content_type = response.headers.get("content-type", "").split(";")[0].strip().lower()
+        if content_type and content_type not in HTML_CONTENT_TYPES:
+            raise ScrapeFailed(f"not HTML ({content_type})")
+        body, html_cut = await read_capped(response)
+        # As response.text decodes: the charset from the headers, else the client's default (UTF-8)
+        html = body.decode(response.encoding or "utf-8", errors="replace")
+        final_url = str(response.url)
+
+    # Parsing runs in a thread so the event loop keeps serving other requests
+    full_text, page_date = await asyncio.to_thread(extract_page, html)
+    full_text, text_cut = cap_text(full_text)
+    if not has_enough_text(full_text):
+        raise ScrapeFailed("too little text")
+    cut = [*([f"page over {MAX_PAGE_BYTES // 1_000_000} MB: the first {MAX_PAGE_BYTES // 1_000_000} MB read"] if html_cut else []),
+           *([f"text over {MAX_TEXT_CHARS:,} characters: cut"] if text_cut else [])]
+    if cut:
+        print(f"[INFO] Scrape cap: {'; '.join(cut)}: {url}")
+    return {
+        "url": url,
+        "full_text": full_text,
+        "status": "success",
+        "http_status": seen["http_status"],
+        "reason": None,
+        "cut": "; ".join(cut) or None,
+        # Provenance (feature 3 #50, #51, #53): where the page ended up after redirects, when it
+        # was read, and the date the page gives itself
+        "final_url": final_url,
+        "fetched_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "page_date": page_date,
+    }
+
+
 @observability.traced("scrape", run_type="tool", inputs=lambda a: {"url": a["url"]},
                       outputs=lambda r: {"status": r["status"], "http_status": r["http_status"], "reason": r["reason"],
-                                         "chars": len(r["full_text"] or "")})
+                                         "chars": len(r["full_text"] or ""), **({"cut": r["cut"]} if r.get("cut") else {})})
 async def fetch_one_article(client: httpx.AsyncClient, url: str) -> dict:
     """
     Asynchronously fetches and scrapes a single article using Trafilatura for clean text.
     Returns status "success" or "failed"; a failed page carries the reason it failed.
+    At most MAX_PAGE_BYTES are read, in at most PAGE_DEADLINE_SECONDS, and the text is capped (#91).
     """
-    http_status = None
+    seen = {"http_status": None}
     try:
-        response = await client.get(url, timeout=15.0, follow_redirects=True)
-        http_status = response.status_code
-
-        # Check before parsing: an error page ("Access Denied", "404 Not Found") can have
-        # enough text to pass as an article, and would then be cached, embedded and indexed.
-        # The status is the final one, after redirects.
-        if http_status != 200:
-            raise ScrapeFailed(f"HTTP {http_status}")
-        content_type = response.headers.get("content-type", "").split(";")[0].strip().lower()
-        if content_type and content_type not in HTML_CONTENT_TYPES:
-            raise ScrapeFailed(f"not HTML ({content_type})")
-
-        # Parsing runs in a thread so the event loop keeps serving other requests
-        full_text, page_date = await asyncio.to_thread(extract_page, response.text)
-
-        if not has_enough_text(full_text):
-            raise ScrapeFailed("too little text")
-
-        return {
-            "url": url,
-            "full_text": full_text,
-            "status": "success",
-            "http_status": http_status,
-            "reason": None,
-            # Provenance (feature 3 #50, #51, #53): where the page ended up after redirects, when it
-            # was read, and the date the page gives itself
-            "final_url": str(response.url),
-            "fetched_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
-            "page_date": page_date,
-        }
-
+        return await asyncio.wait_for(_read_page(client, url, seen), PAGE_DEADLINE_SECONDS)
     except Exception as e:
         reason = _failure_reason(e)
         print(f"[WARN] Scrape failed ({reason}): {url}")
@@ -360,7 +410,7 @@ async def fetch_one_article(client: httpx.AsyncClient, url: str) -> dict:
             "url": url,
             "full_text": None,
             "status": "failed",
-            "http_status": http_status,
+            "http_status": seen["http_status"],
             "reason": reason,
         }
 

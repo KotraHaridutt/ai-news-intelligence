@@ -149,5 +149,5 @@ async def vectors_for(clf: Classifier, texts: list[str]) -> list[np.ndarray]:
     """
     from services import rag_service
     if clf.task_type == rag_service.QUERY_TASK_TYPE:
-        return [await rag_service.get_query_vector(text) for text in texts]
-    return await rag_service.get_vectors(texts)
+        return [await rag_service.get_query_vector(text, purpose="safety") for text in texts]
+    return await rag_service.get_vectors(texts, purpose="safety")

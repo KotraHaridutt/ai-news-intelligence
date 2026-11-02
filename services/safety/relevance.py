@@ -118,8 +118,8 @@ async def coverage(query: str, documents: list, where: str, refuse: Callable[[De
                             threshold=RELEVANCE.block_at, engine="clef",
                             label=f"{len(on_topic)} of {len(scores)} chunks on topic")
         from services import rag_service       # rag_service imports this module
-        query_vector = await rag_service.get_query_vector(query)
-        sims = _cosines(query_vector, await rag_service.get_vectors([doc.page_content for doc in documents]))
+        query_vector = await rag_service.get_query_vector(query, purpose="safety")
+        sims = _cosines(query_vector, await rag_service.get_vectors([doc.page_content for doc in documents], purpose="safety"))
         best = max(sims)
         return Decision(verdict="allow" if best >= COVERAGE_MIN_SIMILARITY else "block", score=round(1.0 - best, 4),
                         threshold=round(1.0 - COVERAGE_MIN_SIMILARITY, 4), engine="embedding",

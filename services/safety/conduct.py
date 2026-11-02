@@ -51,7 +51,7 @@ async def _system_vectors() -> np.ndarray:
         from services import rag_service
         from services.safety.faithfulness import normalized
         _system["sentences"] = system_sentences()
-        _system["vectors"] = normalized(await rag_service.get_vectors(_system["sentences"]))
+        _system["vectors"] = normalized(await rag_service.get_vectors(_system["sentences"], purpose="safety"))
     return _system["vectors"]
 
 

@@ -67,14 +67,19 @@ def news_http_error(status: int, body: str):
     if status == 401:   # key is well-formed but matches no account
         return news_not_configured(log)
     if status == 403:   # daily quota used up, resets at 00:00 UTC
-        return AppError(503, "Today's news search limit has been reached. "
-                             "It resets at midnight UTC, so please try again later.", log)
+        return news_daily_limit(log=log)
     if status == 429:   # free plan: 1 request per second
         return AppError(503, "The news service is getting too many requests right now. "
                              "Please try again in a minute.", log)
     if status == 503:   # GNews maintenance
         return AppError(503, "The news service is down for maintenance. Please try again later.", log)
     return news_failed(log)
+
+def news_daily_limit(seconds_left=None, log=""):
+    """GNews's 100 searches a day are used up: GNews said so (403), or our own count did (feature 3 #92),
+    so the search isn't sent. GNews resets at 00:00 UTC."""
+    return AppError(503, "Today's news search limit has been reached. "
+                         "It resets at midnight UTC, so please try again later.", log, _retry_after(seconds_left))
 
 def no_recent_news(topic: str):
     return AppError(404, f'No news from the last 2 days was found for "{_topic(topic)}". '
@@ -265,9 +270,9 @@ def not_enough_coverage(topic: str, prompt_type: str, log=""):
     return AppError(404, f'The articles found don\'t cover "{_topic(topic)}" closely enough for {_a(name)}. '
                          "Try a more specific topic.", log)
 
-def server_busy(log=""):
+def server_busy(log="", seconds=30):
     """L #90: the build queue is over its cap."""
-    return AppError(503, "Many people are using the app right now. Please try again in a minute.", log)
+    return AppError(503, "Many people are using the app right now. Please try again in a minute.", log, _retry_after(seconds))
 
 def follow_limit(seconds_left=None, log=""):
     """L #94: this visitor's new watches for today are used up."""

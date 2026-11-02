@@ -600,6 +600,25 @@ def _record_failure(run, e: BaseException):
             pass
 
 
+# Called when a request's root span opens (feature 3 L: the limits middleware's events for a request it
+# served in monitor mode go on that request's trace). Registered, like the redactors above.
+_request_hooks: list = []
+
+
+def add_request_hook(fn):
+    """Adds fn() to what runs when a request's root span opens. Adding the same fn twice does nothing."""
+    if fn not in _request_hooks:
+        _request_hooks.append(fn)
+
+
+def _run_request_hooks():
+    for fn in _request_hooks:
+        try:
+            fn()
+        except Exception as e:          # a hook's bug must not fail the request
+            print(f"[WARN] A request hook failed: {type(e).__name__}: {e}")
+
+
 def request_span(name: str, view: str | None = None):
     """
     The root span of one API request (#19), named after its route, e.g. "POST /query".
@@ -621,6 +640,7 @@ def request_span(name: str, view: str | None = None):
                     ref = ref_of(run)
                     if ref:
                         run.add_metadata({"ref": ref})
+                    _run_request_hooks()
                     started = time.perf_counter()
                     try:
                         result = await fn(*args, **kwargs)

@@ -24,7 +24,7 @@ from services import cache_service, errors, feedback_service, follow_service, sa
 from services.errors import AppError
 from services.pipeline_service import get_pipeline_data, build_time
 from services.rag_service import run_rag_query_with_store
-from services.safety import output, privacy
+from services.safety import limits, output, privacy
 from services.safety.input_rails import check_query, checked_query
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -85,6 +85,11 @@ class SecurityHeaders:
         await self.app(scope, receive, with_headers)
 
 
+# --- Consumption limits (feature 3, Section L) ---
+# Who the visitor is, the request body cap (413), and the per-visitor limits per minute and per day
+# (429, SAFETY_RATE_LIMIT), before the body is parsed and before a trace starts. Added first, so it
+# runs inside SecurityHeaders: its own 413 / 429 responses get the security headers too.
+app.add_middleware(limits.ClientLimits)
 app.add_middleware(SecurityHeaders)
 
 # Setup templates and static files

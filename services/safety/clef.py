@@ -50,9 +50,13 @@ KEEPALIVE_SECONDS = 300
 BACKOFF_AFTER_FAILURES = 3
 BACKOFF_SECONDS = 30
 
-# Daily neurons (B #19; L #93a adds the warning alert and the gateway's spending limit). Counted
-# per UTC day from every response's cf-ai-neurons, in Redis (v1:usage:clef:<day>) and in process.
+# Daily neurons (B #19, L #93a). Counted per UTC day from every response's cf-ai-neurons, in Redis
+# (v1:usage:clef:<day>) and in process. Past WARN_AT_NEURONS: one [WARN] line a day and a
+# clef_budget_warning total on that request's trace (O #114 alerts on it). Past FALLBACK_AT_NEURONS
+# every check uses the embedding classifier for the rest of the day (one [WARN] line), and if that
+# can't run either, fails open (#18). The AI Gateway's own rate limit is the second stop (L §8).
 DAILY_NEURONS = 10_000
+WARN_AT_NEURONS = int(os.getenv("CLEF_WARN_AT_NEURONS", "7000"))     # A2 §7.2
 FALLBACK_AT_NEURONS = 9_500    # from here on, checks use the embedding classifier (A2 §7.2)
 
 
@@ -140,6 +144,7 @@ def backing_off() -> bool:
 
 # --- Neurons used today ---
 _spent = {"day": None, "neurons": 0.0}
+_said = {"day": None, "warned": False, "fallback": False}
 _pending: set[asyncio.Task] = set()
 
 
@@ -155,6 +160,23 @@ def over_budget() -> bool:
     return neurons_today() >= FALLBACK_AT_NEURONS
 
 
+def _check_levels():
+    """The warning and the switch to the fallback, each said once a day (L #93a)."""
+    day, spent = utc_day(), neurons_today()
+    if _said["day"] != day:
+        _said.update(day=day, warned=False, fallback=False)
+    if spent >= WARN_AT_NEURONS and not _said["warned"]:
+        _said["warned"] = True
+        observability.add_totals(clef_budget_warning=1)
+        print(f"[WARN] Clef: {spent:,.0f} of {DAILY_NEURONS:,} neurons used today (warning level {WARN_AT_NEURONS:,}); "
+              f"checks switch to the embedding classifier at {FALLBACK_AT_NEURONS:,}. Resets at 00:00 UTC.")
+    if spent >= FALLBACK_AT_NEURONS and not _said["fallback"]:
+        _said["fallback"] = True
+        observability.add_totals(clef_budget_fallback=1)
+        print(f"[WARN] Clef: {spent:,.0f} neurons used today: every check uses the embedding classifier "
+              f"until 00:00 UTC (it fails open where that can't run).")
+
+
 async def _count_neurons(day: str, neurons: float, failed: bool):
     """Adds to the day's count in Redis; the total Redis returns is kept if it's higher (another worker, a restart)."""
     counts = {"calls": 1, "neurons_x100": round(neurons * 100)}
@@ -163,6 +185,7 @@ async def _count_neurons(day: str, neurons: float, failed: bool):
     totals = await cache_service.add_usage("clef", day, counts)
     if totals and _spent["day"] == day:
         _spent["neurons"] = max(_spent["neurons"], totals.get("neurons_x100", 0) / 100)
+        _check_levels()
 
 
 def _add_neurons(neurons: float, failed: bool = False):
@@ -170,6 +193,7 @@ def _add_neurons(neurons: float, failed: bool = False):
     if _spent["day"] != day:
         _spent.update(day=day, neurons=0.0)
     _spent["neurons"] += neurons
+    _check_levels()
     try:
         task = asyncio.get_running_loop().create_task(_count_neurons(day, neurons, failed))
     except RuntimeError:
