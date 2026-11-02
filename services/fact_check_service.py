@@ -24,8 +24,17 @@ from services.safety import articles as safety_articles, canary, gemini, privacy
 # Chunks per article (feature-1 decision #12, measured in Section A): the first 6 hold the
 # news (the lead); one live blog had 45. With 2 articles per story, at most 12 per story.
 CHUNKS_PER_ARTICLE = 6
-# The fact check's settings: the answers' (chunking, thinking, timeouts) plus its own chunk count
-FACT_CHECK_CONFIG_VERSION = prompts.version_of(json.dumps({**rag.ANSWER_CONFIG, "chunks_per_article": CHUNKS_PER_ARTICLE},
+# What the code accepts from the model's JSON (feature 3 #71). A text is a story's 2-5 sentence summary
+# or its list of new facts (a few hundred to ~1,000 characters); one four times longer than that isn't
+# what was asked for (a page that got the model to copy it out, or a runaway reply), and its story is
+# left unjudged. One entry per story sent is expected; past twice that, the rest isn't read.
+MAX_TEXT_CHARS = 4000
+MAX_ENTRIES_PER_STORY = 2
+# The fact check's settings: the answers' (chunking, thinking, timeouts) plus its own chunk count and caps
+FACT_CHECK_CONFIG_VERSION = prompts.version_of(json.dumps({**rag.ANSWER_CONFIG, "chunks_per_article": CHUNKS_PER_ARTICLE,
+                                                           "max_output_tokens": rag.FACT_CHECK_MAX_OUTPUT_TOKENS,
+                                                           "max_text_chars": MAX_TEXT_CHARS,
+                                                           "max_entries_per_story": MAX_ENTRIES_PER_STORY},
                                                           sort_keys=True))
 
 
@@ -50,7 +59,8 @@ def _structured(model_name, role="primary"):
     # include_raw (feature 3 #48): the reply comes back with its parse result, so a reply Gemini's
     # filter blocked is returned as it is and never reaches the fallback (it used to fail the parser
     # and spend a second call, A1 §3.3). An unreadable reply still raises and goes to the fallback.
-    structured = rag._chat_model(model_name, role).with_structured_output(FactCheckAnswer, method="json_schema", include_raw=True)
+    # Output cap (feature 3 #66): a reply cut at the cap is unreadable JSON, handled as one already
+    structured = rag._chat_model(model_name, role, rag.FACT_CHECK_MAX_OUTPUT_TOKENS).with_structured_output(FactCheckAnswer, method="json_schema", include_raw=True)
     return rag._retrying(structured | RunnableLambda(gemini.structured_raw_or_raise, name="parse_or_blocked"))
 
 try:
@@ -168,21 +178,33 @@ def read_answer(answer, stories) -> dict:
       missing         -> UNJUDGED (a new story is shown without a summary; a known story
                          stays hidden and its articles are retried on the next check)
     Ids the code didn't send are ignored. answer None (unusable) -> everything UNJUDGED.
+    Feature 3 #71: a text over MAX_TEXT_CHARS leaves its story UNJUDGED, and past MAX_ENTRIES_PER_STORY
+    entries per story sent the rest isn't read. "rejected" names both for the output event.
     """
     sent = {s["id"]: s["kind"] for s in stories}
     outcomes = {story_id: UNJUDGED for story_id in sent}
-    texts = {}
+    texts, decided, too_long, rejected = {}, set(), [], []
     if answer is not None:
         given = [(a.story_id, a.summary, "new") for a in answer.new_stories] + \
                 [(a.story_id, a.new_facts, "update") for a in answer.updates]
+        limit = MAX_ENTRIES_PER_STORY * len(sent)
+        if len(given) > limit:
+            rejected.append(f"entries_over_cap={len(given) - limit}")
+            given = given[:limit]
         for story_id, text, kind in given:
-            if sent.get(story_id) != kind or outcomes[story_id] != UNJUDGED:
+            if sent.get(story_id) != kind or story_id in decided:
                 continue                      # not sent, sent as the other kind, or answered twice
-            if _usable(text):
+            decided.add(story_id)
+            if _usable(text) and len(text.strip()) > MAX_TEXT_CHARS:
+                too_long.append(story_id)     # stays UNJUDGED
+            elif _usable(text):
                 outcomes[story_id], texts[story_id] = SHOWN, text.strip()
             else:
                 outcomes[story_id] = NOTHING_NEW
-    return {"outcomes": outcomes, "texts": texts, "usable": answer is not None}
+    if too_long:
+        rejected.append(f"too_long={len(too_long)}")
+        print(f"[WARN] UPDATE: {len(too_long)} text(s) over {MAX_TEXT_CHARS:,} characters left unjudged: {', '.join(too_long)}")
+    return {"outcomes": outcomes, "texts": texts, "usable": answer is not None, "rejected": rejected}
 
 
 async def run_fact_check(query, stories, known_stories, told) -> dict:
@@ -190,13 +212,13 @@ async def run_fact_check(query, stories, known_stories, told) -> dict:
     One LLM call for a check. stories: [{id, kind: "new" | "update", title (known story),
     related_to: {id, title} | None, articles: [article dicts with full_text]}], in display
     order; known_stories: [{id, title}]; told: the snapshot's "already told" texts.
-    Returns {"outcomes", "texts", "usable", "blocked"} (see read_answer). An answer that isn't valid
+    Returns {"outcomes", "texts", "usable", "rejected", "blocked"} (see read_answer). An answer that isn't valid
     JSON for the schema is unusable, not an error: the check still shows its new stories. The same
     when Gemini's filter blocked it: "blocked" is then "prompt" or "answer" (else None), feature 3 #48.
     Raises AppError (503 busy / 504 too long / 502 other / 500 not set up) if the call fails.
     """
     if not stories:
-        return {"outcomes": {}, "texts": {}, "usable": True, "blocked": None}
+        return {"outcomes": {}, "texts": {}, "usable": True, "blocked": None, "rejected": []}
     if fact_check_llm is None:
         raise errors.ai_not_configured("fact-check model not loaded")
 

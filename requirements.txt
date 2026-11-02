@@ -8,6 +8,8 @@ trafilatura
 lxml
 python-dotenv
 markdown2
+# feature 3 #69: the HTML allowlist after markdown2 (one wheel, no dependencies)
+nh3
 beautifulsoup4
 scikit-learn
 langchain-google-genai

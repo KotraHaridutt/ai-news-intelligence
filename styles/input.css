@@ -1,0 +1,16 @@
+/* The page's styles: Tailwind, built into static/tailwind.css by scripts/build_css.py (feature 3 #110).
+   The page used to load Tailwind's Play CDN script, which writes styles while the page runs; a strict
+   Content-Security-Policy (#70) allows neither that script nor the styles it writes. */
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer components {
+    /* The answer's text (HTML from the server, inside .prose) */
+    .prose p { margin-bottom: 1rem; }
+    .prose ul { list-style-type: disc; margin-left: 1.5rem; }
+    .prose ol { list-style-type: decimal; margin-left: 1.5rem; }
+    /* Links in an answer go only to its sources (#67). One whose address isn't a source is kept as text
+       (an <a> without href), so it doesn't look like a link either. */
+    .prose a[href] { color: #2563eb; text-decoration: underline; }
+}

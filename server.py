@@ -16,7 +16,6 @@ from fastapi.templating import Jinja2Templates
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 import time
-import markdown2
 
 # --- Our Services ---
 # observability first: it decides whether traces are sent before any model is called
@@ -25,7 +24,7 @@ from services import cache_service, errors, feedback_service, follow_service, sa
 from services.errors import AppError
 from services.pipeline_service import get_pipeline_data, build_time
 from services.rag_service import run_rag_query_with_store
-from services.safety import privacy
+from services.safety import output, privacy
 from services.safety.input_rails import check_query, checked_query
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -40,6 +39,53 @@ async def lifespan(app: FastAPI):
     await asyncio.to_thread(observability.shutdown)
 
 app = FastAPI(title="AI News Intelligence API", lifespan=lifespan)
+
+# --- Security headers on every response (feature 3 #70) ---
+# The answer is model output written from scraped pages, so the page assumes some text in it could be
+# hostile. The CSP lets the page run only its own script and stylesheet (static/app.js, the Tailwind
+# CSS built into static/tailwind.css), load nothing from other sites (an image link in an answer can't
+# send data out, #68), talk only to this server, and not be framed. Inline scripts, inline styles and
+# onclick="" attributes are refused by the browser, so injected HTML that got past the server still
+# couldn't run. FastAPI's /docs and /redoc pages load Swagger from a CDN: they get the headers without
+# the CSP (Section M #101 turns them off in prod).
+CONTENT_SECURITY_POLICY = ("default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self'; connect-src 'self'; "
+                           "font-src 'self'; object-src 'none'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'")
+SECURITY_HEADERS = {
+    "X-Content-Type-Options": "nosniff",      # a JSON or text response is never run as a script or page
+    "Referrer-Policy": "no-referrer",          # opening a source sends it nothing about this app
+    "X-Frame-Options": "DENY",                 # frame-ancestors for older browsers
+}
+CSP_EXEMPT = ("/docs", "/redoc")
+
+
+def security_headers(path: str) -> dict:
+    headers = dict(SECURITY_HEADERS)
+    if not path.startswith(CSP_EXEMPT):
+        headers["Content-Security-Policy"] = CONTENT_SECURITY_POLICY
+    return headers
+
+
+class SecurityHeaders:
+    """Pure ASGI middleware: adds the headers to every response, streamed ones and static files included.
+    A 500 is sent by Starlette's outermost layer, past this one: its handler adds them itself."""
+
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http":
+            return await self.app(scope, receive, send)
+        extra = [(k.lower().encode("latin-1"), v.encode("latin-1")) for k, v in security_headers(scope.get("path", "")).items()]
+
+        async def with_headers(message):
+            if message["type"] == "http.response.start":
+                names = {name.lower() for name, _ in message.get("headers", [])}
+                message["headers"] = list(message.get("headers", [])) + [h for h in extra if h[0] not in names]
+            await send(message)
+        await self.app(scope, receive, with_headers)
+
+
+app.add_middleware(SecurityHeaders)
 
 # Setup templates and static files
 templates = Jinja2Templates(directory=str(BASE_DIR / "templates"))
@@ -98,15 +144,24 @@ async def unexpected_error_handler(request: Request, exc: Exception):
     # A bug. Starlette re-raises the exception after this response is sent,
     # so uvicorn still logs the full traceback.
     print(f"[ERROR] {request.url.path} -> 500: unexpected {type(exc).__name__}: {privacy.for_log(exc)}")
-    return JSONResponse(status_code=500, content=error_content(errors.UNEXPECTED_MESSAGE, exc))
+    return JSONResponse(status_code=500, content=error_content(errors.UNEXPECTED_MESSAGE, exc),
+                        headers=security_headers(request.url.path))
 
-def render_markdown(text) -> str:
+def render_markdown(text, source_urls=()) -> str:
     """
-    Markdown -> HTML for the LLM's answer. safe_mode="escape" turns any raw HTML in the
-    answer into plain text and replaces javascript: links with "#". The answer is built from
-    scraped web pages, so a page could steer the model into echoing HTML/script (XSS).
+    Markdown -> HTML for model output, without the trace event (scripts and tests; the views use
+    view_answer). safe_mode="escape" turns any raw HTML into plain text and javascript: links into "#";
+    the nh3 allowlist keeps only the tags markdown makes; links to pages that aren't in source_urls
+    and images are removed in enforce mode (SAFETY_OUTPUT, feature 3 I).
     """
-    return markdown2.markdown(text or "", safe_mode="escape")
+    return output.render(text, output.allowed_urls(source_urls)).html
+
+
+async def view_answer(view: str, rag_data: dict, field: str) -> dict:
+    """The view's answer as HTML (field), and its notes when there are any (a cut answer, feature 3 #66)."""
+    shown = await output.answer(view, rag_data["answer"], rag_data.get("source_urls") or [],
+                                sources=rag_data.get("sources"), finish_reason=rag_data.get("finish_reason"))
+    return {field: shown["html"], **({"answer_notes": shown["notes"]} if shown["notes"] else {})}
 
 async def remember_answer(query: str, view: str, text: str, built_at) -> dict:
     """
@@ -163,7 +218,7 @@ async def query_endpoint(req: QueryRequest):
 
     final_response = {
         **query_notice(checked),
-        "summary_html": render_markdown(rag_data["answer"]),
+        **await view_answer("report", rag_data, "summary_html"),
         "cited_sources": rag_data["sources"],
         "related_links": data["related_links"],
         "total_articles_found": len(data["articles"]),
@@ -186,7 +241,7 @@ async def api_timeline(req: QueryRequest):
     return {
         "query": query,
         **query_notice(checked),
-        "timeline_html": render_markdown(rag_data["answer"]),
+        **await view_answer("timeline", rag_data, "timeline_html"),
         "cited_sources": rag_data["sources"],
         **await remember_answer(query, "timeline", rag_data["answer"], data.get("built_at")),
         "time_taken": f"{time.time() - start_time:.2f}s"
@@ -205,7 +260,7 @@ async def api_contradictions(req: QueryRequest):
     return {
         "query": query,
         **query_notice(checked),
-        "analysis_html": render_markdown(rag_data["answer"]),
+        **await view_answer("contradictions", rag_data, "analysis_html"),
         "cited_sources": rag_data["sources"],
         **await remember_answer(query, "contradictions", rag_data["answer"], data.get("built_at")),
         "time_taken": f"{time.time() - start_time:.2f}s"
@@ -232,7 +287,7 @@ async def api_follow(req: FollowRequest):
 async def api_follow_check(watch_id: str):
     """Check for updates: only what is new since the last look (or the stored result, within 30 min)."""
     start_time = time.time()
-    result = await follow_service.check(watch_id, render_markdown)
+    result = await follow_service.check(watch_id)
     return {**result, "time_taken": f"{time.time() - start_time:.2f}s"}
 
 @app.get("/api/follow/{watch_id}")

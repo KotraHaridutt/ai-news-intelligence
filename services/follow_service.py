@@ -7,7 +7,7 @@ from services.cache_service import WatchStoreUnavailable
 from services.fact_check_service import run_fact_check
 from services.pipeline_service import get_pipeline_data, build_time, _attach_pages
 from services.rag_service import get_vectors
-from services.safety import privacy
+from services.safety import output, privacy
 
 # --- feature 1: following a topic ---
 # Follow saves what report V1 contained; Check shows only what is new since the last look.
@@ -140,16 +140,17 @@ async def unfollow(watch_id: str) -> dict:
 
 # --- Check ---
 
-async def check(watch_id: str, render) -> dict:
+async def check(watch_id: str) -> dict:
     """
-    "Check for updates". render: markdown -> safe HTML (server.render_markdown).
-    One check per followed topic at a time; a second request gets the first one's result.
+    "Check for updates". Each story's text becomes HTML through the output guard (feature 3 I), with
+    only that story's own articles as links. One check per followed topic at a time; a second request
+    gets the first one's result.
     """
     async with observability.span("check", inputs={"watch": observability.short_hash(watch_id)}) as run:
         task = _checks_inflight.get(watch_id)
         if task is None:
             # Created inside this span, so the check's own spans are traced under this request
-            task = asyncio.create_task(_check(watch_id, render))
+            task = asyncio.create_task(_check(watch_id))
             _checks_inflight[watch_id] = task
             _checks_started_by[watch_id] = observability.current_trace()
             task.add_done_callback(lambda t: _on_check_done(watch_id, t))
@@ -196,11 +197,18 @@ async def _rating_record(query: str, now: str) -> dict:
     return {"answer_id": answer_id if saved else None, "can_rate": saved}
 
 
-def _response(watch_id, snapshot, merged, data, articles, classified, result, ids, render, now) -> dict:
-    """The check's answer for the page: what's new, what was hidden as a repeat, what couldn't be read."""
+def _response(watch_id, snapshot, merged, data, articles, classified, result, ids, rendered, now) -> dict:
+    """The check's answer for the page: what's new, what was hidden as a repeat, what couldn't be read.
+    rendered: collects each text's output.Rendered, for the check's one output event."""
     outcomes, texts = result["outcomes"], result["texts"]
     stories = {s["id"]: s for s in merged["stories"]}
     links = lambda idxs: [nov.link(articles[i]) for i in nov._by_relevance(articles, idxs)]
+
+    def render(text, idxs):
+        # Links only to this story's articles (feature 3 #67), as listed and as read after a redirect
+        allowed = output.allowed_urls(u for i in idxs for u in (articles[i].get("url"), articles[i].get("final_url")))
+        rendered.append(output.render(text, allowed))
+        return rendered[-1].html
 
     new_stories, updates, hidden = [], [], []
     for item in classified["new"]:
@@ -215,7 +223,7 @@ def _response(watch_id, snapshot, merged, data, articles, classified, result, id
             "title": story["title"],
             "outlets": story["outlets"],
             "articles": len(item["articles"]),
-            "summary_html": render(texts[item["key"]]) if outcome == nov.SHOWN else None,
+            "summary_html": render(texts[item["key"]], item["articles"]) if outcome == nov.SHOWN else None,
             "related_to": {"id": related, "title": stories[related]["title"]} if related in stories else None,
             "links": links(item["articles"]),
         })
@@ -232,7 +240,7 @@ def _response(watch_id, snapshot, merged, data, articles, classified, result, id
                 "story_id": story["id"],
                 "story_title": story["title"],
                 "first_seen": story["first_seen"],
-                "new_facts_html": render(texts[item["story_id"]]),
+                "new_facts_html": render(texts[item["story_id"]], item["articles"]),
                 "links": links(item["articles"]),
             })
 
@@ -254,7 +262,7 @@ def _response(watch_id, snapshot, merged, data, articles, classified, result, id
     }
 
 
-async def _check(watch_id: str, render) -> dict:
+async def _check(watch_id: str) -> dict:
     snapshot = await _load(watch_id)
     now = build_time()
 
@@ -278,14 +286,18 @@ async def _check(watch_id: str, render) -> dict:
     known = [{"id": s["id"], "title": s["title"]} for s in snapshot["stories"]]
     result = await run_fact_check(snapshot["query"], stories, known, snapshot["told"])
 
-    ids = {}
+    ids, rendered = {}, []
     with observability.span("novelty.merge", inputs={"stories_judged": len(stories)}) as run:
         merged = nov.merge(snapshot, articles, vectors, classified, result["outcomes"], result["texts"],
                            data["built_at"] or now, now, ids_out=ids)
-        response = _response(watch_id, snapshot, merged, data, articles, classified, result, ids, render, now)
+        response = _response(watch_id, snapshot, merged, data, articles, classified, result, ids, rendered, now)
         run.add_outputs({"new_stories": len(response["new_stories"]), "updates": len(response["updates"]),
                          "hidden_repeats": len(response["hidden_repeats"]), "unreadable": len(response["unreadable"]),
                          "known_stories_after": len(merged["stories"])})
+    # The check's texts on the trace (feature 3 I): outside links or images, and fact-check entries the
+    # code didn't accept (#71). Only when the fact check wrote something.
+    if rendered or result.get("rejected"):
+        await output.record("update", rendered, text="\n".join(result["texts"].values()), extra=result.get("rejected") or [])
     response.update(await _rating_record(snapshot["query"], now))
     merged["last_result"] = response
 

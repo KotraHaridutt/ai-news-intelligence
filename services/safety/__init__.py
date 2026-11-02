@@ -14,6 +14,8 @@ LLM safety (feature 3). The shared core every guard uses (Section B):
   relevance    retrieved chunks that aren't about the query: Clef, swapped in enforce (Section G)
   pii          personal data by format and checksum: email, phone, card, Aadhaar, PAN, IBAN, IP (Section H)
   privacy      where pii runs: the query, comments (+ Clef's `names`), answers, traces, log lines (Section H)
+  output       model output into the page: HTML allowlist (nh3), links only to sources, no images, length cap
+               and timeline format flags (Section I)
 
 The guards themselves (Sections C-L) call check() with a run() that usually calls judge().
 """

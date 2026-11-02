@@ -67,6 +67,14 @@ CHAT_ATTEMPTS = 2             # per model, including the first try
 CHAT_DEADLINE_SECONDS = 75
 DEADLINE_CANCELLED = "cancelled: the answer step's deadline passed while this attempt was still running"
 
+# Output cap per view (feature 3 #66): Gemini's max_output_tokens. Thinking counts toward it, and the
+# fallback (3.6-flash) thinks up to 1,352 tokens even at thinking_level="low", so the caps are about 2x
+# the largest total output measured (2,158 tokens, A2 §3), far above any visible answer (~900 tokens).
+# An answer that reaches its cap ends with finish_reason MAX_TOKENS: it's shown with a note and
+# flagged (safety/output.py). The fact check's cap is FACT_CHECK_MAX_OUTPUT_TOKENS.
+MAX_OUTPUT_TOKENS = {"report": 4608, "contradictions": 4608, "timeline": 3072}
+FACT_CHECK_MAX_OUTPUT_TOKENS = 3072
+
 # --- Retrieval (gap_4 Section D) ---
 # Measured on 8 topics: indexes hold 7-60 chunks, and with k=15 a third of them were sent whole.
 # A lower k alone let one long article fill every slot (20 of 60 chunks were one article), so
@@ -105,12 +113,13 @@ def _is_chat_retryable(e):
     # daily quota: it can't pass before midnight Pacific, so it goes straight to the fallback.
     return _api_error_code(e) in CHAT_RETRYABLE_CODES and not errors.is_daily_quota_error(e)
 
-def _chat_model(model_name, role="primary"):
+def _chat_model(model_name, role="primary", max_output_tokens=None):
     """One chat model without retries (1 = no retries in this SDK; 0 would mean its default).
     The usage callback sees every attempt: tokens, cost, the daily count, one log line (#31).
     Gemini's safety thresholds are set explicitly (feature 3 #45, safety/gemini.py), and a block
     comes back as a blocked reply, not an exception (GeminiChat, #47): raise_if_blocked turns it
-    into GeminiBlocked after the fallback wrapper, so a block never reaches the fallback model."""
+    into GeminiBlocked after the fallback wrapper, so a block never reaches the fallback model.
+    max_output_tokens: a fixed cap (the fact check's); the views pass theirs per call (with_cap)."""
     return gemini.GeminiChat(
         model=model_name,
         thinking_level=THINKING_LEVEL,
@@ -118,6 +127,7 @@ def _chat_model(model_name, role="primary"):
         max_retries=1,
         safety_settings=gemini.SETTINGS,
         callbacks=[usage.UsageHandler(role)],
+        **({"max_output_tokens": max_output_tokens} if max_output_tokens else {}),
     )
 
 # After the chat model and its fallback (#47): a blocked reply raises GeminiBlocked here, once
@@ -143,6 +153,16 @@ except Exception as e:
     llm = None
     llm_fallback_only = None
     embeddings_model = None
+
+# The chains built above take a per-call max_output_tokens (bound kwargs reach both models through the
+# retry and fallback wrappers). A stand-in that a test or an experiment puts in their place may not, so
+# only these get the cap.
+_CAPPABLE = {id(model) for model in (llm, llm_fallback_only) if model is not None}
+
+def with_cap(model, view):
+    """The chat runnable with the view's output cap (#66), when it's one of the Gemini chains built here."""
+    cap = MAX_OUTPUT_TOKENS.get(view)
+    return model.bind(max_output_tokens=cap) if cap and id(model) in _CAPPABLE else model
 
 
 def pick_chat_model(full, fallback_only):
@@ -184,6 +204,7 @@ ANSWER_CONFIG = {
     "retrieval_k": RETRIEVAL_K, "story_cap": STORY_CAP, "retrieval": RETRIEVAL_SETTINGS,
     "thinking_level": THINKING_LEVEL, "timeout_s": CHAT_TIMEOUT_SECONDS, "attempts": CHAT_ATTEMPTS,
     "deadline_s": CHAT_DEADLINE_SECONDS, "gemini_safety": gemini.settings_summary(gemini.SETTINGS),
+    "max_output_tokens": MAX_OUTPUT_TOKENS,
 }
 CONFIG_VERSION = prompts.version_of(json.dumps(ANSWER_CONFIG, sort_keys=True))
 
@@ -585,6 +606,16 @@ def source_text(documents) -> str:
     """What the model read from the articles: each chunk's title and text (H #60 compares answers with it)."""
     return "\n".join(f"{doc.metadata.get('title') or ''}\n{doc.page_content}" for doc in documents)
 
+def source_urls(documents) -> list[str]:
+    """Every page the chunks came from: the URL GNews listed and, after a redirect, the one read (#67)."""
+    urls = []
+    for doc in documents:
+        for key in ("source", "final_url"):
+            url = doc.metadata.get(key)
+            if url and url not in urls:
+                urls.append(url)
+    return urls
+
 def _format_response(response):
     answer = response.get('answer') or ''
     source_documents = response.get('context', [])
@@ -624,6 +655,13 @@ async def run_rag_query_with_store(query, vector_store, prompt_type):
         raise ValueError(f"Unknown prompt type: {prompt_type!r}")
 
     prompt, marker = answer_prompt(answer)
+    # Why the model stopped (feature 3 #66): MAX_TOKENS means the answer reached its cap. Read off the
+    # model's reply on its way to the text parser; a stand-in that returns text leaves it empty.
+    finish = {}
+
+    def note_finish(message):
+        finish["reason"] = gemini.finish_reason(message)
+        return message
 
     async def retrieve_and_answer():
         documents = await _retrieve(vector_store, query, prompt_type)
@@ -647,7 +685,9 @@ async def run_rag_query_with_store(query, vector_store, prompt_type):
                                             "attempts": CHAT_ATTEMPTS, "deadline_s": CHAT_DEADLINE_SECONDS},
                                   tags=["answer"]) as run:
         # Raises "today's AI limit" (503) at once when both models' daily quota is used up (#34)
-        qa_chain = create_stuff_documents_chain(pick_chat_model(llm, llm_fallback_only) | BLOCK_CHECK, prompt,
+        # The view's output cap is bound on the call (#66)
+        model = with_cap(pick_chat_model(llm, llm_fallback_only), prompt_type)
+        qa_chain = create_stuff_documents_chain(model | BLOCK_CHECK | RunnableLambda(note_finish, name="finish_reason"), prompt,
                                                 document_prompt=DOCUMENT_PROMPT)
         try:
             # One deadline for retrieval and the answer, as before
@@ -673,7 +713,11 @@ async def run_rag_query_with_store(query, vector_store, prompt_type):
         # (a helpline, a tip line) are its news and stay.
         answer = await privacy.screen_answer(answer, source_text(documents), where=prompt_type)
         result = _format_response({"answer": answer, "context": documents})
-        run.add_outputs({"answer_chars": len(result["answer"]), "sources": len(result["sources"]), "chunks": len(documents)})
+        # For the output guard (feature 3 I): the pages the answer may link to, and why the model stopped
+        result["source_urls"] = source_urls(documents)
+        result["finish_reason"] = finish.get("reason")
+        run.add_outputs({"answer_chars": len(result["answer"]), "sources": len(result["sources"]), "chunks": len(documents),
+                         **({"finish_reason": finish["reason"]} if finish.get("reason") else {})})
         if not result["answer"]:
             raise errors.empty_report(prompt_type)
         # The free code checks on this answer (Section I): feedback on the trace, never an error

@@ -39,7 +39,7 @@ CHECKS = {
     "relevance": Check("G", "retrieved chunks that aren't about the query", built=True),
     "pii": Check("H", "personal data in queries, comments, answers, traces and logs", built=True),
     "names": Check("H", "feedback comments that name a private person (masked before saving)", built=True),
-    "output": Check("I", "links, images and HTML in answers"),
+    "output": Check("I", "links to pages that aren't sources and images in answers; cut or malformed answers", built=True),
     "faithfulness": Check("J", "answer sentences that conflict with the sources", can_block=False),
     "toxicity": Check("K", "insulting wording in the model's own sentences"),
     "leak": Check("K", "an answer that reveals the AI's instructions"),

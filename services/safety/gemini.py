@@ -141,6 +141,13 @@ def block_of(message, llm_output: dict | None = None) -> Block | None:
     return None
 
 
+def finish_reason(message) -> str | None:
+    """Why the model stopped ('STOP', 'MAX_TOKENS', ...), from a reply; None for anything else (a stand-in's text)."""
+    metadata = getattr(message, "response_metadata", None)
+    reason = _name(metadata.get("finish_reason")) if isinstance(metadata, dict) else ""
+    return reason or None
+
+
 def http_block_reason(e) -> str | None:
     """The block code of Google's HTTP 400 shape ('jailbreak', 'safety', ...), or None for any other error."""
     api = errors.api_error(e)

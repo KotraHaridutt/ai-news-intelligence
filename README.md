@@ -122,7 +122,7 @@ All three endpoints share the cache, so switching from the report to the timelin
 | RAG | LangChain (text splitter, retrieval and stuff-documents chains), FAISS (`faiss-cpu`) |
 | Caching | Upstash Redis (`redis` asyncio client) |
 | LLM | Google Gemini Flash (`gemini-3.8-flash`, falling back to `gemini-3.6-flash`), thinking level `low`, default temperature, 45 s timeout per attempt, 75 s deadline for the whole answer step; the follow check uses structured output (JSON schema, Pydantic) |
-| Frontend | Jinja2 template, Tailwind CSS, vanilla JavaScript; followed topics in `localStorage` |
+| Frontend | Jinja2 template, Tailwind CSS (built into `static/tailwind.css`), vanilla JavaScript (`static/app.js`); followed topics in `localStorage` |
 | Observability | LangSmith: traces and spans, tokens and cost, prompt versions, eval datasets and experiments, online checks, user feedback, dashboards; alerts to ntfy.sh |
 | Deployment | Render (free tier) |
 
@@ -150,6 +150,10 @@ The three views accept a JSON body `{"query": "<topic>"}`. Interactive documenta
 ```
 
 When personal data was taken out of the topic (`SAFETY_PII=enforce`), the response also has `query` (the topic as searched) and `query_notice` (what the page shows: "We removed a phone number from your topic before searching, to keep it private.").
+
+When Gemini stopped the answer at its length cap, the response also has `answer_notes` (shown in grey under the answer: "This answer reached its length limit, so it may stop mid-sentence.").
+
+`summary_html` is the answer as safe HTML: raw HTML in it is shown as text, only the tags markdown makes are kept (`nh3`), and with `SAFETY_OUTPUT=enforce` a link to a page that isn't one of the answer's sources becomes plain text and images are removed. The same applies to `timeline_html`, `analysis_html` and a check's summaries.
 
 `answer_id` names this answer for **Follow** and for rating it (`null` if it couldn't be saved; the answer is still shown). `can_rate` says whether 👍 / 👎 can be saved for it (only when its trace was sent to LangSmith).
 
@@ -329,6 +333,17 @@ Names in topics and answers are never touched: public figures are what news is a
 
 There are no accounts, and the app stores no IP address. Render's own request logs can show the visitor's address, for the same 7 days.
 
+## What the page allows
+
+Every response carries a Content-Security-Policy: the page runs only its own script (`static/app.js`) and stylesheet (`static/tailwind.css`), loads nothing from other sites, talks only to this server and can't be framed (plus `X-Content-Type-Options: nosniff`, `Referrer-Policy: no-referrer`, `X-Frame-Options: DENY`). An answer is written from scraped pages, so this is the last layer: even HTML that got past the server couldn't run a script or send data to another site through an image. FastAPI's `/docs` and `/redoc` get the headers without the CSP.
+
+The CSS is built once with Tailwind's standalone CLI (pinned v3.4.17, checksum-verified, downloaded into `.local/tools/`; no Node). After adding or changing Tailwind classes in `templates/index.html` or `static/app.js`:
+
+```bash
+python scripts/build_css.py            # rebuilds static/tailwind.css: commit it
+python scripts/build_css.py --check    # fails if the committed file is out of date
+```
+
 ## Project structure
 
 ```
@@ -352,9 +367,11 @@ ai-news-intelligence/
 │   ├── online_checks.py         # Those checks on every live answer, as trace feedback
 │   └── feedback_service.py      # 👍 / 👎 on an answer's trace, the review queue
 ├── evals/                       # Eval data, datasets, judges, calibration, the experiment runner, judge_yesterday
-├── scripts/                     # Prompt Hub mirror, review queue, dashboards and alerts setup
+├── scripts/                     # Prompt Hub mirror, review queue, dashboards and alerts setup, build_css.py
 ├── templates/index.html         # Web UI: report / timeline / contradictions tabs, Following list, update view
-├── static/style.css
+├── static/app.js                # The page's script (no inline script: the CSP allows only this file)
+├── static/tailwind.css          # Built from styles/ by scripts/build_css.py
+├── styles/                      # Tailwind input CSS and config
 ├── render.yaml                  # Render deployment blueprint
 ├── Procfile
 └── requirements.txt
@@ -369,7 +386,7 @@ ai-news-intelligence/
 - **Deduplicate before indexing, not after retrieval.** Grouping and choosing happen before chunks are embedded, so skipped copies cost no embedding calls and can't take retrieval slots. In a real query this cut the index from 35 to 21 chunks and Related Links from 1 to 5 distinct stories.
 - **Cap chunks per story, not only articles.** Keeping at most 2 articles per story still let one long article fill most of the context, so retrieval also limits each story to 3 of the 10 chunks an answer gets. The cap is soft: a topic with only one or two stories still gets 10 chunks.
 - **Each view retrieves for its own question.** A report wants the most relevant chunks, a timeline wants chunks that date events, and a contradictions analysis wants different viewpoints, so the three use different searches over the same index instead of sharing one result.
-- **Scraped text is data, never instructions.** Article text goes into the prompt inside a marked block, after a rule not to follow anything written inside it. The model has no tools or secrets and the answer is HTML-escaped, so the risk is a misleading answer; the block and the rewriting of fake delimiters and headers make that harder.
+- **Scraped text is data, never instructions.** Article text goes into the prompt inside a marked block, after a rule not to follow anything written inside it. The model has no tools or secrets, and the answer is HTML-escaped, reduced to the tags markdown makes and shown under a strict Content-Security-Policy, so the risk is a misleading answer; the block and the rewriting of fake delimiters and headers make that harder.
 - **The "stuff" strategy instead of map-reduce.** Finding contradictions requires the model to see all sources at once. Map-reduce processes documents separately and would miss conflicts between them.
 - **Cache the inputs, not the index.** Redis stores page text and embedding vectors, and the FAISS index is rebuilt from them on each request. Storing the FAISS object itself would need `pickle` (unsafe to load, tied to library versions), while rebuilding the index from 7-60 vectors takes milliseconds. Keying text and vectors by URL and content hash lets different queries share the expensive work.
 - **Errors are raised, not returned.** Each failure point raises one error type carrying its HTTP status and a user-facing message, and one handler turns it into the response. Before, `None` and `[]` were passed up through three layers that each had to guess what they meant, and five different failures reached the user as the same "no articles" 404.
