@@ -93,19 +93,28 @@ STORY_CAP = 3
 #   "off"     the search's ranking as it is
 # The reranker is asked with the plain query (the same for every view, so the views share one call and
 # its cache); "rerank_query": "search" sends the view's search query instead (the timeline's suffix).
-# Which method each view keeps is decided by Section E's evals.
+# Both can be one value, or one per engine ({"cohere": ..., "cloudflare": ...}): the method is the one of
+# the engine that actually ranked (a fallback uses its own), the query that of the engine tried first.
+# Chosen in Section E (docs/E-reranker-comparison.md), measured on 15 examples against the search alone:
+#   Cohere rerank-v4.0-pro: "order" for report and timeline, "mmr" for contradictions (ndcg@k +0.127,
+#     4 topics better, none worse; "order" there scored higher but cut the stories from 5.4 to 4.2)
+#   Cloudflare bge-reranker-base: "fusion" everywhere (+0.082, 5 of 5 topics better; plain "order" was
+#     +0.055, 2 better and 1 worse), and the timeline's search query (dated chunks +0.066)
 RETRIEVAL_SETTINGS = {
     # The chunks closest to the query
-    "report": {"search": "similarity", "rerank": "order"},
+    "report": {"search": "similarity", "rerank": {"cohere": "order", "cloudflare": "fusion"}},
     # Searched with date and event words added, so chunks that date events rank higher.
     # Suffix chosen from 5 measured on 3 topics: most date words in the chunks (56 vs 43 for the
     # plain query and 47 for "dates events announced timeline"; .local/tests/timeline_suffix_gap4.py)
     "timeline": {"search": "similarity", "query_suffix": " what happened and when: dates, days, announcements",
-                 "rerank": "order"},
+                 "rerank": {"cohere": "order", "cloudflare": "fusion"},
+                 # Cohere: the plain query shares the topic's one call (the trial's 1,000 a month); the search
+                 # query was better still (ndcg@k +0.026, dated chunks +0.047) for a second call per topic
+                 "rerank_query": {"cohere": "plain", "cloudflare": "search"}},
     # MMR: each next chunk must also differ from the ones already picked, so repeated wire
     # copy gives way to other viewpoints (lambda_mult 0.5: relevance and difference count equally).
     # Reranked, it stays MMR: the reranker's score replaces the search's as the relevance.
-    "contradictions": {"search": "mmr", "lambda_mult": 0.5, "rerank": "mmr"},
+    "contradictions": {"search": "mmr", "lambda_mult": 0.5, "rerank": {"cohere": "mmr", "cloudflare": "fusion"}},
 }
 RERANK_METHODS = ("order", "fusion", "mmr", "off")
 # Reciprocal rank fusion's constant (the usual 60): a chunk's fused score is 1/(60 + rank) summed over
@@ -612,6 +621,13 @@ def _retrieved_documents(documents):
 
 # --- Reranking (feature 4, Section D) ---
 
+def for_engine(value, engine: str | None, default: str):
+    """A setting that is one value for every engine, or one per engine (missing -> default)."""
+    if isinstance(value, dict):
+        return value.get(engine, default)
+    return default if value is None else value
+
+
 def _doc_key(doc) -> tuple:
     """A chunk's identity across copies: its page, its place in the page, its text."""
     return doc.metadata.get("source"), doc.metadata.get("chunk_index"), doc.page_content
@@ -670,16 +686,22 @@ async def _rerank(vector_store, query: str, search_query: str, ranked: list, set
     ("rerank_score", "rerank_engine": on the trace, never in the prompt). Returns (ranking, what happened
     for the trace). The search's ranking as it is when reranking is off for this view or can't run.
     """
-    method = settings.get("rerank", "off")
-    if method not in RERANK_METHODS:
-        raise ValueError(f"Unknown rerank method for {prompt_type}: {method!r}")
-    if method == "off" or not rerank_service.enabled() or not ranked:
-        return ranked, {"reranked": False, "method": method}
-    sent = search_query if settings.get("rerank_query") == "search" else query
+    setting = settings.get("rerank", "off")
+    methods = set(setting.values()) if isinstance(setting, dict) else {setting}
+    if not methods <= set(RERANK_METHODS):
+        raise ValueError(f"Unknown rerank method for {prompt_type}: {setting!r}")
+    planned = for_engine(setting, rerank_service.engine(), "off")
+    if methods == {"off"} or not rerank_service.enabled() or not ranked:
+        return ranked, {"reranked": False, "method": planned}
+    sent = search_query if for_engine(settings.get("rerank_query"), rerank_service.engine(), "plain") == "search" else query
     result = await rerank_service.rerank(sent, [doc.page_content for doc in ranked], label=prompt_type)
     if result is None:
-        return ranked, {"reranked": False, "method": method, "failed": True}
-    info = {"reranked": True, "method": method, "engine": result.engine, "model": result.model, "from_cache": result.from_cache}
+        return ranked, {"reranked": False, "method": planned, "failed": True}
+    method = for_engine(setting, result.engine, "off")
+    if method == "off":
+        return ranked, {"reranked": False, "method": method, "engine": result.engine}
+    info = {"reranked": True, "method": method, "engine": result.engine, "model": result.model, "from_cache": result.from_cache,
+            "query": "search" if sent != query else "plain"}
     if method == "mmr":
         vectors = await asyncio.to_thread(_chunk_vectors, vector_store, ranked)
         if vectors is None:

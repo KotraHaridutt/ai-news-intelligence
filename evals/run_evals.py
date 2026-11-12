@@ -9,6 +9,8 @@ and compares it with the baseline.
   .local/venv/Scripts/python.exe evals/run_evals.py status
   .local/venv/Scripts/python.exe evals/run_evals.py compare <experiment A> <experiment B> [--pairwise]
   .local/venv/Scripts/python.exe evals/run_evals.py rescore <experiment>
+  .local/venv/Scripts/python.exe evals/run_evals.py run retrieval --name cohere-v4pro --rerank cohere --rerank-model rerank-v4.0-pro
+  .local/venv/Scripts/python.exe evals/run_evals.py run retrieval --name cf-fusion --rerank cloudflare --rerank-method fusion
 
 How a run works (resumable across days, because a full answers baseline is ~30 calls and the free
 tier allows 20 a day):
@@ -34,6 +36,7 @@ import os
 import re
 import subprocess
 import sys
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -71,8 +74,14 @@ def _commit() -> str:
 class Variant:
     """The settings an experiment runs with: the app's, or overrides (k, story cap, a prompt per view)."""
 
-    def __init__(self, k=None, cap=None, prompt_files=None, retrieve=False, prompt_texts=None):
+    def __init__(self, k=None, cap=None, prompt_files=None, retrieve=False, prompt_texts=None,
+                 rerank=None, rerank_model=None, rerank_method=None, rerank_query=None):
         self.k, self.cap, self.retrieve = k, cap, retrieve
+        # Feature 4 E: the reranker the run measures ("cohere" / "cloudflare"; None = the search's order),
+        # its Cohere model, the method ("order" / "fusion" / "mmr" / "off" for every view, or
+        # "report=order,contradictions=mmr"; None keeps the app's per-view defaults), and the timeline's
+        # query ("plain" / "search"). The run uses that engine only (RERANK_FALLBACK=off).
+        self.rerank, self.rerank_model, self.rerank_method, self.rerank_query = rerank, rerank_model, rerank_method, rerank_query
         # A prompt file is one text (a one-part prompt, as before feature 3 E) or, as .json,
         # {"system": ..., "user": ...} (a two-part prompt). Kept as a str or a dict either way.
         self.prompts = {view: self._read(Path(path)) for view, path in (prompt_files or {}).items()}
@@ -92,15 +101,40 @@ class Variant:
 
     def to_dict(self) -> dict:
         """Saved in the experiment's manifest, so rescore can rebuild exactly this variant."""
-        return {"k": self.k, "cap": self.cap, "retrieve": self.retrieve, "prompt_texts": self.prompts}
+        return {"k": self.k, "cap": self.cap, "retrieve": self.retrieve, "prompt_texts": self.prompts,
+                "rerank": self.rerank, "rerank_model": self.rerank_model, "rerank_method": self.rerank_method,
+                "rerank_query": self.rerank_query}
 
     @classmethod
     def from_dict(cls, d: dict) -> "Variant":
-        return cls(k=d.get("k"), cap=d.get("cap"), retrieve=d.get("retrieve", False), prompt_texts=d.get("prompt_texts"))
+        return cls(k=d.get("k"), cap=d.get("cap"), retrieve=d.get("retrieve", False), prompt_texts=d.get("prompt_texts"),
+                   rerank=d.get("rerank"), rerank_model=d.get("rerank_model"), rerank_method=d.get("rerank_method"),
+                   rerank_query=d.get("rerank_query"))
+
+    def methods(self) -> dict:
+        """The rerank method per view this run sets ({} = the app's defaults)."""
+        if not self.rerank_method:
+            return {}
+        if "=" not in self.rerank_method:
+            return {view: self.rerank_method for view in data.VIEWS}
+        return dict(part.split("=", 1) for part in self.rerank_method.split(","))
 
     def apply(self):
         """Patches the app's settings in this process (the run is its own process)."""
-        from services import rag_service as rag, fact_check_service as fcs
+        from services import rag_service as rag, fact_check_service as fcs, rerank_service as rr
+        # The reranker: on with this engine only, or off (so a RERANK_MODE=on in .env can't touch a baseline)
+        env = {**os.environ, "RERANK_MODE": "on" if self.rerank else "off", "RERANK_FALLBACK": "off"}
+        if self.rerank:
+            env["RERANK_ENGINE"] = self.rerank
+        if self.rerank_model:
+            env["RERANK_COHERE_MODEL"] = self.rerank_model
+        rr.configure(env)
+        for view, method in self.methods().items():
+            if method not in rag.RERANK_METHODS or view not in rag.RETRIEVAL_SETTINGS:
+                raise SystemExit(f"--rerank-method: unknown view or method in {view}={method}")
+            rag.RETRIEVAL_SETTINGS[view]["rerank"] = method
+        if self.rerank_query:
+            rag.RETRIEVAL_SETTINGS["timeline"]["rerank_query"] = self.rerank_query
         if self.k:
             rag.RETRIEVAL_K = self.k
         if self.cap:
@@ -112,8 +146,10 @@ class Variant:
                 rag.ANSWER_PROMPTS[view] = self.as_prompt(view, value)
 
     def fingerprint(self, dataset: str) -> dict:
-        from services import prompts, rag_service as rag, fact_check_service as fcs
-        config = {**rag.ANSWER_CONFIG, "retrieval_k": self.k or rag.RETRIEVAL_K, "story_cap": self.cap or rag.STORY_CAP}
+        from services import prompts, rag_service as rag, fact_check_service as fcs, rerank_service as rr
+        # "retrieval" is the live RETRIEVAL_SETTINGS (apply() set the methods), "rerank" the reranker as configured
+        config = {**rag.ANSWER_CONFIG, "retrieval_k": self.k or rag.RETRIEVAL_K, "story_cap": self.cap or rag.STORY_CAP,
+                  "rerank": rr.summary()}
         details = {"config_version": prompts.version_of(json.dumps(config, sort_keys=True)), "retrieve": self.retrieve}
         if dataset in ("answers", "injection"):
             details["prompt_versions"] = {v: rag.as_prompt(v, rag.ANSWER_PROMPTS[v]).version for v in data.VIEWS}
@@ -140,6 +176,25 @@ def examples(dataset: str) -> list[dict]:
 _stores = {}
 
 
+def _cached_query_embeddings():
+    """The query embedder for the frozen stores: rag.get_query_vector, which reads and writes the Redis
+    cache (RETRIEVAL_QUERY, the same vector LangChain's aembed_query gives). Feature 4 E runs a dozen
+    variants on the same 10 queries: without it each run would spend 15 of the day's 100 embedding requests."""
+    from langchain_core.embeddings import Embeddings
+    from services import rag_service as rag
+
+    class CachedQuery(Embeddings):
+        def embed_documents(self, texts):
+            raise NotImplementedError("the frozen stores hold their vectors already")
+
+        def embed_query(self, text):
+            raise NotImplementedError("async only: aembed_query")
+
+        async def aembed_query(self, text):
+            return [float(x) for x in await rag.get_query_vector(text)]
+    return CachedQuery()
+
+
 async def _store(slug):
     """A FAISS index of a topic's frozen chunks and vectors (built once per run)."""
     if slug not in _stores:
@@ -157,7 +212,7 @@ async def _store(slug):
                   "theme_id": articles[c["article"]].get("theme_id", -1), "chunk_index": c["chunk_index"]} for c in topic["chunks"]]
         _stores[slug] = (topic, await asyncio.to_thread(
             FAISS.from_embeddings, text_embeddings=[(c["text"], v) for c, v in zip(topic["chunks"], vectors)],
-            embedding=rag._QueryEmbeddingsWithRetry(rag.embeddings_model), metadatas=metas))
+            embedding=_cached_query_embeddings(), metadatas=metas))
     return _stores[slug]
 
 
@@ -170,9 +225,23 @@ async def generate(dataset: str, inputs: dict, variant: Variant) -> dict:
     from services import rag_service as rag
     if dataset == "retrieval":
         topic, store = await _store(inputs["topic"])
+        if variant.rerank == "cohere":
+            await _pace_cohere()
+        started = time.perf_counter()
         docs = await rag._retrieve(store, inputs["query"], inputs["view"])
+        ms = round((time.perf_counter() - started) * 1000)
+        engines = {d.metadata.get("rerank_engine") for d in docs}
+        method = rag.for_engine(rag.RETRIEVAL_SETTINGS[inputs["view"]].get("rerank"), variant.rerank, "off")
+        if variant.rerank and method != "off" and engines != {variant.rerank}:
+            # A limit, a failure or a missing key: the search's order would be scored as the reranker's
+            raise RuntimeError(f"not reranked by {variant.rerank} (got {sorted(map(str, engines))}); not cached, run again")
         return {"retrieved": [d.metadata["chunk_id"] for d in docs],
-                "theme_ids": [d.metadata.get("theme_id", -1) for d in docs], "sources": [d.metadata.get("source") for d in docs]}
+                "theme_ids": [d.metadata.get("theme_id", -1) for d in docs], "sources": [d.metadata.get("source") for d in docs],
+                # Feature 4 E: the whole index in the reranker's (or the search's) order, for the reranker-alone
+                # scores; Clef's relevance per chunk (monitor mode); the time the retrieval took
+                "full_order": await _full_order(topic, store, inputs["query"], variant),
+                "relevance": [d.metadata.get("relevance") for d in docs], "ms": ms,
+                "rerank_engine": next(iter(engines)) if len(engines) == 1 else None}
     if dataset in ("answers", "injection"):
         from evals import targets
         context = inputs["context"]
@@ -189,6 +258,35 @@ async def generate(dataset: str, inputs: dict, variant: Variant) -> dict:
         result = await fcs.run_fact_check(inputs["query"], inputs["stories"], inputs["known_stories"], inputs["told"])
         return {"outcomes": result["outcomes"], "texts": result["texts"], "usable": result["usable"]}
     raise ValueError(dataset)
+
+
+async def _pace_cohere():
+    """Waits for Cohere's minute instead of letting the app's limit send the call elsewhere (feature 4 E):
+    the app sends at most 8 a minute, and a run of 5 topics x several models needs more."""
+    from services import rerank_service as rr
+    while True:
+        wait = 0.0
+        if rr.cohere_calls_last_minute() >= rr.cohere_minute_max():
+            wait = 60.5 - (time.monotonic() - rr._cohere_minute[0])
+        wait = max(wait, rr._cohere_pause["until"] - time.monotonic())
+        if wait <= 0:
+            return
+        print(f"[H]   waiting {wait:.0f}s for Cohere's minute")
+        await asyncio.sleep(wait)
+
+
+async def _full_order(topic: dict, store, query: str, variant: "Variant") -> list[str]:
+    """Every chunk of the topic, best first: by the reranker's score (the same cached call _retrieve made),
+    or for the baseline by the search's similarity. Scored as 'the reranker alone', before the cap."""
+    ids = [c["id"] for c in topic["chunks"]]
+    if variant.rerank:
+        from services import rerank_service as rr
+        result = await rr.rerank(query, [c["text"] for c in topic["chunks"]], label="eval:full_order")
+        if result is None or result.engine != variant.rerank:
+            raise RuntimeError(f"full order: not reranked by {variant.rerank}")
+        return [ids[i] for i in sorted(range(len(ids)), key=lambda i: (-result.scores[i], i))]
+    docs = await store.asimilarity_search(query, k=len(ids))
+    return [d.metadata["chunk_id"] for d in docs]
 
 
 async def judge(dataset: str, inputs: dict, output: dict) -> dict | None:
@@ -224,6 +322,20 @@ def score(dataset: str, inputs: dict, reference: dict, output: dict, verdict: di
         cap = checks.check_retrieval([{"theme_id": t, "source": s} for t, s in zip(output["theme_ids"], output["sources"])],
                                      k=rag.RETRIEVAL_K, cap=rag.STORY_CAP, index=index)
         out["story_cap"] = float(cap["checks"]["story_cap"])
+        # Feature 4 E: the reranker alone (its order of the whole index, before the cap) ...
+        if output.get("full_order"):
+            n = len(output["full_order"])
+            full = scores.retrieval_scores(output["full_order"], reference["grades"], reference["dated"], k=n)
+            out["ndcg_full"], out["mrr_full"] = full[f"ndcg@{n}"], full["mrr"]
+        # ... how many stories the answer's chunks come from (the contradictions view needs several) ...
+        out["stories@k"] = float(len({("theme", t) if t != -1 else ("article", s)
+                                      for t, s in zip(output["theme_ids"], output["sources"])}))
+        # ... and how many of them Clef's relevance check puts in its block band (what enforce would swap)
+        judged = [p for p in output.get("relevance") or [] if p is not None]
+        if judged:
+            from services.safety import questions
+            block_at = questions.get("relevance").block_at
+            out["off_topic@k"] = float(sum(1 for p in judged if 1.0 - p >= block_at))
     if dataset in ("answers", "injection"):
         context = output.get("context") or inputs["context"]
         if dataset == "answers":
@@ -579,6 +691,10 @@ def main(argv=None) -> int:
     p.add_argument("--no-upload", action="store_true")
     p.add_argument("--baseline", help="compare with this experiment instead of the saved baseline")
     p.add_argument("--set-baseline", action="store_true")
+    p.add_argument("--rerank", choices=["cohere", "cloudflare"], help="retrieval: rerank with this engine only (feature 4)")
+    p.add_argument("--rerank-model", help="the Cohere model, e.g. rerank-v4.0-pro, rerank-v5.0-fast")
+    p.add_argument("--rerank-method", help="order, fusion, mmr or off for every view, or VIEW=METHOD,VIEW=METHOD")
+    p.add_argument("--rerank-query", choices=["plain", "search"], help="the timeline's reranker query: plain (default) or with its suffix")
     c = sub.add_parser("compare")
     c.add_argument("a")
     c.add_argument("b")
@@ -604,7 +720,9 @@ def main(argv=None) -> int:
         return 0
     if args.cmd == "rescore":
         return asyncio.run(rescore(args.name, args.max_calls, args.reserve))
-    variant = Variant(k=args.k, cap=args.cap, prompt_files=dict(x.split("=", 1) for x in args.prompt), retrieve=args.retrieve)
+    variant = Variant(k=args.k, cap=args.cap, prompt_files=dict(x.split("=", 1) for x in args.prompt), retrieve=args.retrieve,
+                      rerank=args.rerank, rerank_model=args.rerank_model, rerank_method=args.rerank_method,
+                      rerank_query=args.rerank_query)
     return asyncio.run(run(args.dataset, args.name, variant, args.judge, args.max_calls, args.reserve, not args.no_upload,
                            args.baseline, args.set_baseline))
 

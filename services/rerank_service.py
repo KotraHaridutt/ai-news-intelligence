@@ -33,8 +33,10 @@ DEFAULT_COHERE_MODEL = "rerank-v4.0-pro"     # the most consistent in A §3.5; S
 
 COHERE_URL = "https://api.cohere.com/v2/rerank"
 CLOUDFLARE_MODEL = "@cf/baai/bge-reranker-base"
-# Per call. Measured 1.1-1.7 s (Cohere) and 1.8-2.9 s (Cloudflare, with a cold connection), A §3.3.
+# Per call. Cloudflare: median 0.73 s, cold 2.5 s (E §5). Cohere: median 0.86 s, but a cold connection
+# took 3.5 s and once more than 5 s (E §5), so it gets more time; startup opens its connection (warm_up).
 TIMEOUT_SECONDS = 5.0
+COHERE_TIMEOUT_SECONDS = 8.0
 # bge-reranker-base reads about 512 tokens of query + chunk and cuts the rest silently (A §3.2: a
 # 26,799-character chunk cost the neurons of ~512 tokens). At ~4 characters a token that's ~2,000
 # characters. Today's chunks are at most 1,500 (rag_service.text_splitter), so this only matters if
@@ -90,7 +92,7 @@ class Reranked:
 # --- Settings ---
 _settings = {"mode": DEFAULT_MODE, "engine": DEFAULT_ENGINE, "cohere_model": DEFAULT_COHERE_MODEL, "cohere_key": "",
              "cohere_monthly": DEFAULT_COHERE_MONTHLY_CALLS, "cohere_per_minute": DEFAULT_COHERE_PER_MINUTE,
-             "cloudflare_neurons": DEFAULT_CLOUDFLARE_NEURONS_PER_DAY}
+             "cloudflare_neurons": DEFAULT_CLOUDFLARE_NEURONS_PER_DAY, "fallback": True}
 _warnings: list[str] = []
 
 
@@ -109,9 +111,9 @@ def _positive_int(environ, name: str, default: int) -> int:
 
 
 def configure(environ=None) -> dict:
-    """Reads RERANK_MODE, RERANK_ENGINE, RERANK_COHERE_MODEL, COHERE_API_KEY and the limits
-    (COHERE_MONTHLY_CALLS, COHERE_PER_MINUTE, RERANK_CLOUDFLARE_NEURONS). A value that isn't one of
-    the choices warns once and the default applies. Returns the settings (without the key)."""
+    """Reads RERANK_MODE, RERANK_ENGINE, RERANK_COHERE_MODEL, COHERE_API_KEY, RERANK_FALLBACK and the
+    limits (COHERE_MONTHLY_CALLS, COHERE_PER_MINUTE, RERANK_CLOUDFLARE_NEURONS). A value that isn't one
+    of the choices warns once and the default applies. Returns the settings (without the key)."""
     environ = os.environ if environ is None else environ
     _warnings.clear()
     mode = (environ.get("RERANK_MODE") or "").strip().lower() or DEFAULT_MODE
@@ -122,7 +124,13 @@ def configure(environ=None) -> dict:
     if engine not in ENGINES:
         _warnings.append(f"RERANK_ENGINE={engine!r} isn't one of {', '.join(ENGINES)}; using {DEFAULT_ENGINE}")
         engine = DEFAULT_ENGINE
-    _settings.update(mode=mode, engine=engine,
+    # RERANK_FALLBACK=off (Section E): only the chosen engine, so an eval run measures that engine and
+    # never another one in its place. The app keeps the default (on): an answer is never held up by one engine.
+    fallback = (environ.get("RERANK_FALLBACK") or "").strip().lower() or "on"
+    if fallback not in ("on", "off"):
+        _warnings.append(f"RERANK_FALLBACK={fallback!r} isn't one of on, off; using on")
+        fallback = "on"
+    _settings.update(mode=mode, engine=engine, fallback=fallback == "on",
                      cohere_model=(environ.get("RERANK_COHERE_MODEL") or "").strip() or DEFAULT_COHERE_MODEL,
                      cohere_key=(environ.get("COHERE_API_KEY") or "").strip(),
                      cohere_monthly=_positive_int(environ, "COHERE_MONTHLY_CALLS", DEFAULT_COHERE_MONTHLY_CALLS),
@@ -152,12 +160,13 @@ def model_of(name: str) -> str:
 def summary() -> dict:
     """What decides the reranking, for rag_service's config version (feature 2 E): a change is a new version."""
     return {"mode": _settings["mode"], "engine": _settings["engine"], "cohere_model": _settings["cohere_model"],
-            "cloudflare_model": CLOUDFLARE_MODEL}
+            "cloudflare_model": CLOUDFLARE_MODEL, "fallback": _settings["fallback"]}
 
 
 def engines() -> list[str]:
-    """The engines to try, in order: the chosen one, then the other, skipping one that isn't set up."""
-    order = [_settings["engine"]] + [e for e in ENGINES if e != _settings["engine"]]
+    """The engines to try, in order: the chosen one, then the other (unless RERANK_FALLBACK=off), skipping
+    one that isn't set up."""
+    order = [_settings["engine"]] + ([e for e in ENGINES if e != _settings["engine"]] if _settings["fallback"] else [])
     ready = {"cohere": cohere_available(), "cloudflare": clef.available()}
     return [e for e in order if ready[e]]
 
@@ -360,6 +369,17 @@ def _http() -> httpx.AsyncClient:
     return _client
 
 
+async def warm_up():
+    """Opens Cohere's connection (DNS, TLS) at startup, so the first topic doesn't pay for it (E §5: a cold call
+    took 3.5-5+ s). A HEAD without the key: no API call, nothing counted. Never raises."""
+    if not cohere_available() or "cohere" not in engines():
+        return
+    try:
+        await _http().head(COHERE_URL, timeout=5.0)
+    except Exception as e:
+        print(f"[WARN] Rerank: couldn't reach Cohere at startup ({type(e).__name__}); the first call may be slow.")
+
+
 def _cohere_error(response: httpx.Response) -> RerankError:
     code = response.status_code
     detail = f"HTTP {code}"
@@ -407,8 +427,8 @@ async def _cohere(query: str, texts: list[str], run) -> list[float]:
                "Accept": "application/json"}
     try:
         # httpx's timeout is per phase (connect, read...); wait_for bounds the whole call
-        response = await asyncio.wait_for(_http().post(COHERE_URL, json=payload, headers=headers, timeout=TIMEOUT_SECONDS),
-                                          TIMEOUT_SECONDS)
+        response = await asyncio.wait_for(_http().post(COHERE_URL, json=payload, headers=headers, timeout=COHERE_TIMEOUT_SECONDS),
+                                          COHERE_TIMEOUT_SECONDS)
     except (httpx.TimeoutException, asyncio.TimeoutError) as e:
         raise RerankError("timeout", type(e).__name__) from e
     except httpx.TransportError as e:
