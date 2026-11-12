@@ -9,7 +9,7 @@ from dotenv import load_dotenv
 
 # observability sets up tracing (one client, redaction) for every model call made from here,
 # also when a script imports this module without server.py
-from services import cache_service, errors, observability, online_checks, prompts, usage  # noqa: F401
+from services import cache_service, errors, observability, online_checks, prompts, rerank_service, usage  # noqa: F401
 from services.news_fetcher import has_enough_text
 from services.safety import articles as safety_articles, canary, faithfulness, gemini, privacy, provenance, relevance
 from services.safety.text import strip_invisible
@@ -84,17 +84,33 @@ RETRIEVAL_K = 10
 STORY_CAP = 3
 
 # How each prompt type picks its chunks. All three show the model the user's own query.
+# "rerank" (feature 4, Section D), used only while RERANK_MODE=on: how the reranker's scores reorder the
+# search's ranking of the whole index, before the per-story cap:
+#   "order"   the reranker's order (ties keep the search's order)
+#   "fusion"  reciprocal rank fusion of the search's and the reranker's orders (A §3.5: keeps most of
+#             the gain on a mixed index without the small loss where the search was already right)
+#   "mmr"     MMR with the reranker's score as relevance and the chunk vectors for difference
+#   "off"     the search's ranking as it is
+# The reranker is asked with the plain query (the same for every view, so the views share one call and
+# its cache); "rerank_query": "search" sends the view's search query instead (the timeline's suffix).
+# Which method each view keeps is decided by Section E's evals.
 RETRIEVAL_SETTINGS = {
     # The chunks closest to the query
-    "report": {"search": "similarity"},
+    "report": {"search": "similarity", "rerank": "order"},
     # Searched with date and event words added, so chunks that date events rank higher.
     # Suffix chosen from 5 measured on 3 topics: most date words in the chunks (56 vs 43 for the
     # plain query and 47 for "dates events announced timeline"; .local/tests/timeline_suffix_gap4.py)
-    "timeline": {"search": "similarity", "query_suffix": " what happened and when: dates, days, announcements"},
+    "timeline": {"search": "similarity", "query_suffix": " what happened and when: dates, days, announcements",
+                 "rerank": "order"},
     # MMR: each next chunk must also differ from the ones already picked, so repeated wire
-    # copy gives way to other viewpoints (lambda_mult 0.5: relevance and difference count equally)
-    "contradictions": {"search": "mmr", "lambda_mult": 0.5},
+    # copy gives way to other viewpoints (lambda_mult 0.5: relevance and difference count equally).
+    # Reranked, it stays MMR: the reranker's score replaces the search's as the relevance.
+    "contradictions": {"search": "mmr", "lambda_mult": 0.5, "rerank": "mmr"},
 }
+RERANK_METHODS = ("order", "fusion", "mmr", "off")
+# Reciprocal rank fusion's constant (the usual 60): a chunk's fused score is 1/(60 + rank) summed over
+# the two orders, so neither order's top few dominate
+RRF_K = 60
 
 # The busy answers worth another attempt: the Google SDK's own list (408 included), except 504.
 # The SDK sends our timeout to Google, and Gemini answers 504 DEADLINE_EXCEEDED when it runs out
@@ -205,6 +221,8 @@ ANSWER_CONFIG = {
     "thinking_level": THINKING_LEVEL, "timeout_s": CHAT_TIMEOUT_SECONDS, "attempts": CHAT_ATTEMPTS,
     "deadline_s": CHAT_DEADLINE_SECONDS, "gemini_safety": gemini.settings_summary(gemini.SETTINGS),
     "max_output_tokens": MAX_OUTPUT_TOKENS,
+    # Feature 4: the reranker's mode, engine and models (the per-view method is in "retrieval")
+    "rerank": rerank_service.summary(),
 }
 CONFIG_VERSION = prompts.version_of(json.dumps(ANSWER_CONFIG, sort_keys=True))
 
@@ -476,6 +494,9 @@ def _retrieval_summary(documents, index_size=None, k=None, cap=None, limit=60):
         notes = [f"k={k}"] if k is not None else []
         if cap is not None:
             notes.append(f"max {cap} per story")
+        engine = next((doc.metadata["rerank_engine"] for doc in documents if doc.metadata.get("rerank_engine")), None)
+        if engine:
+            notes.append(f"reranked by {engine}")
         if len(documents) >= index_size:
             notes.append("whole index")
         if notes:
@@ -523,7 +544,7 @@ def _published_text(value):
         return parsed.strftime("%Y-%m-%d %H:%M")
     return parsed.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
 
-_SPAN_ONLY_FIELDS = set(PROVENANCE_FIELDS) | {"relevance"}
+_SPAN_ONLY_FIELDS = set(PROVENANCE_FIELDS) | {"relevance", "rerank_score", "rerank_engine"}
 
 def _with_source_headers(documents):
     """
@@ -581,12 +602,101 @@ def _retrieved_documents(documents):
         "metadata": {**{key: doc.metadata.get(key) for key in ("title", "source_name", "published_at", "chunk_index", "theme_id", "source")},
                      # Feature 3 #50: the page version each chunk came from, and its relevance score (#52a). Only the
                      # fields it has, and the final URL only when a redirect changed it (the trace's size, feature 2 #29)
-                     **{key: doc.metadata[key] for key in ("site", "fetched_at", "page_hash", "independent_reports", "relevance")
+                     **{key: doc.metadata[key] for key in ("site", "fetched_at", "page_hash", "independent_reports", "relevance",
+                                                          "rerank_score")
                         if doc.metadata.get(key) is not None},
                      **({"final_url": doc.metadata["final_url"]}
                         if doc.metadata.get("final_url") not in (None, doc.metadata.get("source")) else {})},
         "type": "Document",
     } for doc in documents]}
+
+# --- Reranking (feature 4, Section D) ---
+
+def _doc_key(doc) -> tuple:
+    """A chunk's identity across copies: its page, its place in the page, its text."""
+    return doc.metadata.get("source"), doc.metadata.get("chunk_index"), doc.page_content
+
+
+def _order_by_score(scores: list[float]) -> list[int]:
+    """Positions, best score first; a tie keeps the search's order."""
+    return sorted(range(len(scores)), key=lambda i: (-scores[i], i))
+
+
+def _fused_order(scores: list[float]) -> list[int]:
+    """Reciprocal rank fusion of the search's order (the positions as given) and the reranker's."""
+    reranked_rank = {i: rank for rank, i in enumerate(_order_by_score(scores))}
+    fused = [1 / (RRF_K + i + 1) + 1 / (RRF_K + reranked_rank[i] + 1) for i in range(len(scores))]
+    return sorted(range(len(scores)), key=lambda i: (-fused[i], i))
+
+
+def _mmr_order(scores: list[float], vectors: np.ndarray, lambda_mult: float) -> list[int]:
+    """
+    Maximal marginal relevance over the whole pool: each next chunk scores lambda * relevance -
+    (1 - lambda) * its highest cosine to a chunk already picked. Relevance is the reranker's score scaled
+    to 0-1 within this topic (min-max), so the result doesn't depend on the engine's scale (A §3.4).
+    """
+    n = len(scores)
+    low, high = min(scores), max(scores)
+    relevance = np.array([(s - low) / (high - low) if high > low else 1.0 for s in scores], dtype=np.float32)
+    unit = vectors / (np.linalg.norm(vectors, axis=1, keepdims=True) + 1e-12)
+    picked, left = [], list(range(n))
+    closest = np.full(n, -1.0, dtype=np.float32)       # each chunk's highest cosine to the picked ones
+    while left:
+        values = lambda_mult * relevance[left] - (1 - lambda_mult) * (closest[left] if picked else 0.0)
+        best = left[int(np.argmax(values))]             # argmax takes the first of equals: the search's order
+        picked.append(best)
+        left.remove(best)
+        if left:
+            closest[left] = np.maximum(closest[left], unit[left] @ unit[best])
+    return picked
+
+
+def _chunk_vectors(vector_store, documents) -> np.ndarray | None:
+    """The index's own vectors for these chunks (no embedding call), or None if one can't be found."""
+    try:
+        position = {}
+        for i, doc_id in vector_store.index_to_docstore_id.items():
+            stored = vector_store.docstore.search(doc_id)
+            if isinstance(stored, Document):
+                position[_doc_key(stored)] = i
+        return np.vstack([vector_store.index.reconstruct(position[_doc_key(doc)]) for doc in documents]).astype(np.float32)
+    except Exception:
+        return None
+
+
+async def _rerank(vector_store, query: str, search_query: str, ranked: list, settings: dict, prompt_type: str) -> tuple[list, dict]:
+    """
+    The search's ranking reordered by the reranker (rerank_service), with each chunk's score on a copy
+    ("rerank_score", "rerank_engine": on the trace, never in the prompt). Returns (ranking, what happened
+    for the trace). The search's ranking as it is when reranking is off for this view or can't run.
+    """
+    method = settings.get("rerank", "off")
+    if method not in RERANK_METHODS:
+        raise ValueError(f"Unknown rerank method for {prompt_type}: {method!r}")
+    if method == "off" or not rerank_service.enabled() or not ranked:
+        return ranked, {"reranked": False, "method": method}
+    sent = search_query if settings.get("rerank_query") == "search" else query
+    result = await rerank_service.rerank(sent, [doc.page_content for doc in ranked], label=prompt_type)
+    if result is None:
+        return ranked, {"reranked": False, "method": method, "failed": True}
+    info = {"reranked": True, "method": method, "engine": result.engine, "model": result.model, "from_cache": result.from_cache}
+    if method == "mmr":
+        vectors = await asyncio.to_thread(_chunk_vectors, vector_store, ranked)
+        if vectors is None:
+            # Can't read the index's vectors (shouldn't happen): the reranker's order, said on the trace
+            order, info["method"] = _order_by_score(result.scores), "order (no vectors for mmr)"
+        else:
+            order = _mmr_order(result.scores, vectors, settings.get("lambda_mult", 0.5))
+    elif method == "fusion":
+        order = _fused_order(result.scores)
+    else:
+        order = _order_by_score(result.scores)
+    reranked = [Document(page_content=ranked[i].page_content,
+                         metadata={**ranked[i].metadata, "rerank_score": round(float(result.scores[i]), 6),
+                                   "rerank_engine": result.engine})
+                for i in order]
+    return reranked, info
+
 
 @observability.traced("retrieve", run_type="retriever",
                       inputs=lambda a: {"query": a["query"], "view": a["prompt_type"]}, outputs=_retrieved_documents)
@@ -595,8 +705,10 @@ async def _retrieve(vector_store, query, prompt_type):
     The chunks for one answer, picked with the prompt type's RETRIEVAL_SETTINGS, then capped
     per story. Ranks the whole index (small: 7-60 chunks measured), because the cap may need
     chunks from beyond the first k. Query embedding is async; the FAISS search runs in a thread.
-    Then the relevance check (feature 3 #52a): in enforce mode a chunk that isn't about the query is
-    swapped for the next one in this ranking, under the same cap.
+    Feature 4: while RERANK_MODE=on, the reranker reorders that ranking first (_rerank), so the cap, the
+    relevance check's swaps and the answer all follow the reranked order. Then the relevance check
+    (feature 3 #52a): in enforce mode a chunk that isn't about the query is swapped for the next one in
+    this ranking, under the same cap.
     """
     settings = RETRIEVAL_SETTINGS[prompt_type]
     search_query = query + settings.get("query_suffix", "")
@@ -607,13 +719,20 @@ async def _retrieve(vector_store, query, prompt_type):
     else:
         ranked = await vector_store.asimilarity_search(search_query, k=index_size)
     pick = lambda pool: _cap_per_story(pool, RETRIEVAL_K, STORY_CAP)
+    searched = ranked
+    ranked, rerank_info = await _rerank(vector_store, query, search_query, ranked, settings, prompt_type)
+    if rerank_info["reranked"]:
+        # How much the reranker changed what the answer gets: chunks in its k that the search's k didn't have
+        before = {_doc_key(doc) for doc in pick(searched)}
+        rerank_info["changed"] = sum(1 for doc in pick(ranked) if _doc_key(doc) not in before)
+        observability.add_totals(rerank_changed=rerank_info["changed"])
     documents = await relevance.screen(query, ranked, pick(ranked), pick, where=prompt_type)
     # None of them about the query: "not enough coverage" in enforce mode, before Gemini is called (J #79)
     await relevance.coverage(query, documents, prompt_type,
                              refuse=lambda d: errors.not_enough_coverage(query, prompt_type, f"{prompt_type}: {d.label}"))
     observability.annotate(search=settings["search"], query_suffix=settings.get("query_suffix"), k=RETRIEVAL_K,
                            story_cap=STORY_CAP, index_size=index_size,
-                           stories=len({_story(doc.metadata) for doc in documents}))
+                           stories=len({_story(doc.metadata) for doc in documents}), rerank=rerank_info)
     return documents
 
 def source_text(documents) -> str:

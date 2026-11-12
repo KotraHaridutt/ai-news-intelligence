@@ -149,6 +149,12 @@ def model_of(name: str) -> str:
     return _settings["cohere_model"] if name == "cohere" else CLOUDFLARE_MODEL
 
 
+def summary() -> dict:
+    """What decides the reranking, for rag_service's config version (feature 2 E): a change is a new version."""
+    return {"mode": _settings["mode"], "engine": _settings["engine"], "cohere_model": _settings["cohere_model"],
+            "cloudflare_model": CLOUDFLARE_MODEL}
+
+
 def engines() -> list[str]:
     """The engines to try, in order: the chosen one, then the other, skipping one that isn't set up."""
     order = [_settings["engine"]] + [e for e in ENGINES if e != _settings["engine"]]

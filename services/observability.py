@@ -533,7 +533,9 @@ _TOTALS_AS_METADATA = ("answered_by", "cost_usd", "chat_calls", "chat_errors", "
                        # feature 4 B #11: which reranker ordered the chunks, and requests where none could
                        "rerank_engine", "rerank_failed",
                        # feature 4 C: requests where a free limit sent the ranking to the other engine
-                       "rerank_limited")
+                       "rerank_limited",
+                       # feature 4 D: how many of the answer's chunks the reranker changed
+                       "rerank_changed")
 
 
 def add_totals(**amounts):
