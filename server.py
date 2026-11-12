@@ -33,7 +33,8 @@ BASE_DIR = Path(__file__).resolve().parent
 async def lifespan(app: FastAPI):
     # Safety (feature 3): loads the fallback classifiers, reads today's Clef neurons, one log line
     await safety.startup()
-    # Reranking (feature 4): which engine orders the chunks, and its fallback
+    # Reranking (feature 4): which engine orders the chunks, its fallback, and what's used of the free limits
+    await rerank_service.load_usage()
     print(f"[INFO] {rerank_service.status()}.")
     yield
     # Shutdown: send the traces still queued. Render's free plan stops an idle app, and

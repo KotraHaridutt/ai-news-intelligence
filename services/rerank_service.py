@@ -1,7 +1,9 @@
 import asyncio
 import os
 import time
+from collections import deque
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 
 import httpx
 from dotenv import load_dotenv
@@ -45,13 +47,30 @@ BACKOFF_AFTER_FAILURES = 3
 BACKOFF_SECONDS = 30
 KEEPALIVE_SECONDS = 300
 
+# --- Free limits (Section C) ---
+# Cohere's trial key: 10 rerank calls a minute and 1,000 calls a month (A §3.1, from its reply headers).
+# The app stops a little below both, so a probe or an eval run on the same key in the same minute or
+# month doesn't push the live app into Cohere's own 429: past either, Cloudflare ranks instead (no
+# error, no wait). COHERE_MONTHLY_CALLS / COHERE_PER_MINUTE are the key's limits (another key may differ).
+DEFAULT_COHERE_MONTHLY_CALLS = 1000
+DEFAULT_COHERE_PER_MINUTE = 10
+COHERE_MONTH_SHARE = 0.95          # the app stops at 950 of 1,000: the last 50 stay for probes and evals
+COHERE_MINUTE_MARGIN = 2           # the app sends at most 8 of 10 in any 60 s
+COHERE_WARN_SHARE = 0.80           # one [WARN] a day from 800 of 1,000
+COHERE_PAUSE_SECONDS = 60          # after Cohere's own 429, or its header saying no calls are left this minute
+# Cloudflare's reranker share of the day's 10,000 free neurons (shared with Clef, whose checks are the
+# app's safety): measured ~2 neurons for 18 chunks and ~6 for 60 (A §3.2), so 300 is ~50-150 fresh topics.
+# Past it the reranker stops using Cloudflare for the day; Clef keeps everything else.
+DEFAULT_CLOUDFLARE_NEURONS_PER_DAY = 300
+
 
 class RerankError(Exception):
     """
     A call that gave no usable scores. `kind`: not_configured, timeout, busy (5xx or a network error),
     rate_limited (Cohere's 429: the trial's per-minute or monthly limit), auth (401/403), billing (402),
     bad_request (400/413/422), bad_response, too_long (a chunk over Cloudflare's limit), over_budget
-    (the day's neurons, clef.over_budget), backoff. Every kind sends the call to the next engine.
+    (the day's neurons, clef.over_budget), backoff, over_limit (Section C: the app's share of Cohere's
+    minute or month, or of Cloudflare's neurons). Every kind sends the call to the next engine.
     """
     def __init__(self, kind: str, detail: str = ""):
         super().__init__(f"{kind}: {detail}" if detail else kind)
@@ -69,13 +88,30 @@ class Reranked:
 
 
 # --- Settings ---
-_settings = {"mode": DEFAULT_MODE, "engine": DEFAULT_ENGINE, "cohere_model": DEFAULT_COHERE_MODEL, "cohere_key": ""}
+_settings = {"mode": DEFAULT_MODE, "engine": DEFAULT_ENGINE, "cohere_model": DEFAULT_COHERE_MODEL, "cohere_key": "",
+             "cohere_monthly": DEFAULT_COHERE_MONTHLY_CALLS, "cohere_per_minute": DEFAULT_COHERE_PER_MINUTE,
+             "cloudflare_neurons": DEFAULT_CLOUDFLARE_NEURONS_PER_DAY}
 _warnings: list[str] = []
 
 
+def _positive_int(environ, name: str, default: int) -> int:
+    raw = (environ.get(name) or "").strip()
+    if not raw:
+        return default
+    try:
+        value = int(raw)
+        if value > 0:
+            return value
+    except ValueError:
+        pass
+    _warnings.append(f"{name}={raw!r} isn't a whole number above 0; using {default}")
+    return default
+
+
 def configure(environ=None) -> dict:
-    """Reads RERANK_MODE, RERANK_ENGINE, RERANK_COHERE_MODEL and COHERE_API_KEY. A value that isn't
-    one of the choices warns once and the default applies. Returns the settings (without the key)."""
+    """Reads RERANK_MODE, RERANK_ENGINE, RERANK_COHERE_MODEL, COHERE_API_KEY and the limits
+    (COHERE_MONTHLY_CALLS, COHERE_PER_MINUTE, RERANK_CLOUDFLARE_NEURONS). A value that isn't one of
+    the choices warns once and the default applies. Returns the settings (without the key)."""
     environ = os.environ if environ is None else environ
     _warnings.clear()
     mode = (environ.get("RERANK_MODE") or "").strip().lower() or DEFAULT_MODE
@@ -88,7 +124,10 @@ def configure(environ=None) -> dict:
         engine = DEFAULT_ENGINE
     _settings.update(mode=mode, engine=engine,
                      cohere_model=(environ.get("RERANK_COHERE_MODEL") or "").strip() or DEFAULT_COHERE_MODEL,
-                     cohere_key=(environ.get("COHERE_API_KEY") or "").strip())
+                     cohere_key=(environ.get("COHERE_API_KEY") or "").strip(),
+                     cohere_monthly=_positive_int(environ, "COHERE_MONTHLY_CALLS", DEFAULT_COHERE_MONTHLY_CALLS),
+                     cohere_per_minute=_positive_int(environ, "COHERE_PER_MINUTE", DEFAULT_COHERE_PER_MINUTE),
+                     cloudflare_neurons=_positive_int(environ, "RERANK_CLOUDFLARE_NEURONS", DEFAULT_CLOUDFLARE_NEURONS_PER_DAY))
     for line in _warnings:
         print(f"[WARN] Rerank: {line}.")
     return {k: v for k, v in _settings.items() if k != "cohere_key"}
@@ -123,7 +162,14 @@ def status() -> str:
     if not order:
         return f"Rerank {_settings['mode']}: no engine set up (COHERE_API_KEY, or the Cloudflare settings Clef uses)"
     names = [f"{e} ({model_of(e)})" for e in order]
-    return f"Rerank {_settings['mode']}: {names[0]}" + (f", fallback {names[1]}" if len(names) > 1 else ", no fallback")
+    line = f"Rerank {_settings['mode']}: {names[0]}" + (f", fallback {names[1]}" if len(names) > 1 else ", no fallback")
+    usage = []
+    if "cohere" in order:
+        usage.append(f"Cohere {cohere_calls_this_month()}/{_settings['cohere_monthly']:,} calls this month "
+                     f"(the app stops at {cohere_month_max():,})")
+    if "cloudflare" in order:
+        usage.append(f"Cloudflare {cloudflare_neurons_today():.0f}/{_settings['cloudflare_neurons']} rerank neurons today")
+    return line + (f"; {', '.join(usage)}" if usage else "")
 
 
 configure()
@@ -150,6 +196,144 @@ def _call_failed(name: str, kind: str):
 
 def _call_worked(name: str):
     _trouble[name]["failures"] = 0
+
+
+# --- Free limits (Section C #13-#15) ---
+def utc_month(now: datetime | None = None) -> str:
+    return (now or datetime.now(timezone.utc)).astimezone(timezone.utc).strftime("%Y-%m")
+
+
+def _utc_day() -> str:
+    return datetime.now(timezone.utc).date().isoformat()
+
+
+def _next_month_start(month: str) -> str:
+    year, number = (int(x) for x in month.split("-"))
+    return f"{year + number // 12}-{number % 12 + 1:02d}-01"
+
+
+def cohere_month_max() -> int:
+    return max(1, int(_settings["cohere_monthly"] * COHERE_MONTH_SHARE))
+
+
+def cohere_minute_max() -> int:
+    return max(1, _settings["cohere_per_minute"] - COHERE_MINUTE_MARGIN)
+
+
+# Month: counted in Redis (v1:usage:cohere:<YYYY-MM>) BEFORE each call, like GNews's searches (feature 3
+# #92), so two requests can't both take the last one, and a restart, the evals and the probe all add to
+# the same count. Without Redis the count is this process's own.
+_cohere_month = {"month": None, "sent": 0}
+# Minute: this process's calls in the last 60 s (one uvicorn worker on Render), plus a pause after
+# Cohere's own 429 or its header saying none are left (that covers other users of the key too).
+_cohere_minute: deque = deque()
+_cohere_pause = {"until": 0.0}
+# Cloudflare's reranker neurons today, in this process; startup reads Redis's count (load_usage)
+_cloudflare_day = {"day": None, "neurons": 0.0}
+# Each [WARN] once a day
+_said: dict[str, str] = {}
+
+
+def _say_once_a_day(key: str, line: str):
+    day = _utc_day()
+    if _said.get(key) != day:
+        _said[key] = day
+        print(line)
+
+
+def _month_state() -> dict:
+    month = utc_month()
+    if _cohere_month["month"] != month:
+        _cohere_month.update(month=month, sent=0)
+    return _cohere_month
+
+
+def cohere_calls_this_month() -> int:
+    return _month_state()["sent"]
+
+
+def cohere_calls_last_minute() -> int:
+    cutoff = time.monotonic() - 60
+    while _cohere_minute and _cohere_minute[0] < cutoff:
+        _cohere_minute.popleft()
+    return len(_cohere_minute)
+
+
+def cloudflare_neurons_today() -> float:
+    return _cloudflare_day["neurons"] if _cloudflare_day["day"] == _utc_day() else 0.0
+
+
+def _pause_cohere(why: str):
+    _cohere_pause["until"] = time.monotonic() + COHERE_PAUSE_SECONDS
+    _say_once_a_day("cohere_pause", f"[WARN] Rerank: Cohere {why}. Not calling it for {COHERE_PAUSE_SECONDS}s "
+                                    "(Cloudflare ranks meanwhile). Said once a day.")
+
+
+def _month_used_up(state: dict):
+    observability.add_totals(rerank_limited=1)
+    _say_once_a_day("cohere_month", f"[WARN] Rerank: the app's share of Cohere's month is used ({state['sent']} of "
+                                    f"{_settings['cohere_monthly']:,} calls). Cloudflare ranks until "
+                                    f"{_next_month_start(state['month'])}.")
+
+
+async def _reserve_cohere_call():
+    """Counts one Cohere call before it's sent. Raises RerankError("over_limit") past the app's share of the
+    minute or the month: the call isn't sent and the next engine ranks."""
+    now = time.monotonic()
+    if now < _cohere_pause["until"]:
+        raise RerankError("over_limit", f"paused for {_cohere_pause['until'] - now:.0f}s more after Cohere's rate limit")
+    minute = cohere_calls_last_minute()
+    if minute >= cohere_minute_max():
+        observability.add_totals(rerank_limited=1)
+        raise RerankError("over_limit", f"{minute} Cohere calls in the last minute (the app sends at most {cohere_minute_max()})")
+    state = _month_state()
+    if state["sent"] >= cohere_month_max():
+        _month_used_up(state)
+        raise RerankError("over_limit", f"{state['sent']} Cohere calls this month (the app stops at {cohere_month_max()})")
+    key = cache_service.cohere_month_key(state["month"])
+    total = await cache_service.incr_counter(key, cache_service.COHERE_MONTH_TTL)
+    state["sent"] = total if total is not None else state["sent"] + 1
+    if state["sent"] > cohere_month_max():
+        # Another worker or an eval run took the last one meanwhile: not sent, the reservation given back
+        if total is not None:
+            await cache_service.incr_counter(key, cache_service.COHERE_MONTH_TTL, -1)
+        state["sent"] -= 1
+        _month_used_up(state)
+        raise RerankError("over_limit", f"{state['sent']} Cohere calls this month (the app stops at {cohere_month_max()})")
+    _cohere_minute.append(time.monotonic())
+    if state["sent"] >= int(_settings["cohere_monthly"] * COHERE_WARN_SHARE):
+        _say_once_a_day("cohere_warn", f"[WARN] Rerank: {state['sent']} of {_settings['cohere_monthly']:,} Cohere calls "
+                                       f"used this month; from {cohere_month_max():,} Cloudflare ranks until "
+                                       f"{_next_month_start(state['month'])}.")
+
+
+def _check_cloudflare_share():
+    used = cloudflare_neurons_today()
+    if used >= _settings["cloudflare_neurons"]:
+        observability.add_totals(rerank_limited=1)
+        _say_once_a_day("cloudflare_share", f"[WARN] Rerank: {used:.0f} of the reranker's {_settings['cloudflare_neurons']} "
+                                            "Cloudflare neurons used today; it stops using Cloudflare until 00:00 UTC "
+                                            "(Clef's checks keep the rest).")
+        raise RerankError("over_limit", f"{used:.0f} rerank neurons today (share {_settings['cloudflare_neurons']})")
+
+
+def _add_cloudflare_neurons(neurons: float):
+    day = _utc_day()
+    if _cloudflare_day["day"] != day:
+        _cloudflare_day.update(day=day, neurons=0.0)
+    _cloudflare_day["neurons"] += neurons
+
+
+async def load_usage():
+    """At startup: this month's Cohere calls and today's rerank neurons from Redis, so a restart remembers them."""
+    state = _month_state()
+    total = await cache_service.get_counter(cache_service.cohere_month_key(state["month"]))
+    if total:
+        state["sent"] = max(state["sent"], total)
+    clef_day = await cache_service.get_usage("clef", _utc_day())
+    if clef_day and clef_day.get("rerank_neurons_x100"):
+        _cloudflare_day.update(day=_utc_day(),
+                               neurons=max(cloudflare_neurons_today(), clef_day["rerank_neurons_x100"] / 100))
 
 
 # --- The Cohere client: one per process, so the connection is reused ---
@@ -211,6 +395,7 @@ async def _cohere(query: str, texts: list[str], run) -> list[float]:
         raise RerankError("not_configured", "COHERE_API_KEY not set")
     if len(texts) > COHERE_MAX_DOCUMENTS:
         raise RerankError("bad_request", f"{len(texts)} documents; Cohere takes {COHERE_MAX_DOCUMENTS}")
+    await _reserve_cohere_call()
     payload = {"model": _settings["cohere_model"], "query": query, "documents": texts, "top_n": len(texts)}
     headers = {"Authorization": f"Bearer {_settings['cohere_key']}", "Content-Type": "application/json",
                "Accept": "application/json"}
@@ -224,10 +409,16 @@ async def _cohere(query: str, texts: list[str], run) -> list[float]:
         raise RerankError("busy", type(e).__name__) from e
     # What's left of the trial's minute (Cohere's header), on the span for Section C's limiter
     remaining = response.headers.get("x-trial-endpoint-call-remaining")
+    run.add_metadata({"cohere_month_calls": cohere_calls_this_month()})
     if remaining is not None:
         run.add_metadata({"cohere_minute_calls_left": remaining})
+        if remaining.strip() == "0":
+            _pause_cohere("says no calls are left this minute")
     if response.status_code != 200:
-        raise _cohere_error(response)
+        error = _cohere_error(response)
+        if error.kind == "rate_limited":
+            _pause_cohere("answered 429 (rate limit)")
+        raise error
     try:
         body = response.json()
     except ValueError as e:
@@ -241,6 +432,7 @@ async def _cloudflare(query: str, texts: list[str], run) -> list[float]:
         raise RerankError("not_configured", clef.status())
     if clef.over_budget():
         raise RerankError("over_budget", f"{clef.neurons_today():.0f} neurons used today")
+    _check_cloudflare_share()
     longest = max(len(t) for t in texts)
     if len(query) + longest > CLOUDFLARE_MAX_CHARS:
         raise RerankError("too_long", f"a chunk of {longest} characters; bge-reranker-base reads ~{CLOUDFLARE_MAX_CHARS}")
@@ -253,7 +445,9 @@ async def _cloudflare(query: str, texts: list[str], run) -> list[float]:
         # ClefError's text is "<kind>: <detail>"; the detail alone, so the kind isn't said twice
         detail = str(e)[len(e.kind) + 2:] if str(e).startswith(f"{e.kind}: ") else ""
         raise RerankError(e.kind, detail) from e
-    run.add_metadata({"neurons": neurons, "attempts": attempts, "cf_aig_log_id": response.headers.get("cf-aig-log-id")})
+    _add_cloudflare_neurons(neurons)
+    run.add_metadata({"neurons": neurons, "attempts": attempts, "cf_aig_log_id": response.headers.get("cf-aig-log-id"),
+                      "rerank_neurons_today": round(cloudflare_neurons_today(), 2)})
     try:
         result = response.json()["result"]
         items = result["response"] if isinstance(result, dict) else result

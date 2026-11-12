@@ -403,6 +403,16 @@ async def set_rerank_scores(model: str, query: str, scores: dict[str, float]):
     await _mset_with_ttl([(rerank_key(model, query, text), repr(float(score))) for text, score in scores.items()], RERANK_TTL)
 
 
+# --- Cohere calls this month (feature 4, Section C #13) ---
+# One counter per UTC month, counted before each call (rerank_service._reserve_cohere_call). Kept 40
+# days, so a month with a quiet stretch can't lose its count before it ends.
+COHERE_MONTH_TTL = 40 * 24 * 60 * 60
+
+def cohere_month_key(month: str) -> str:
+    """month: '2026-11' (UTC)."""
+    return f"{KEY_VERSION}:usage:cohere:{month}"
+
+
 # --- Daily Gemini usage (feature 2, #33) ---
 # A hash per model per day: attempts, answers, errors by kind, tokens. The day is Pacific time,
 # when Google resets the free quota. Kept 2 days. Like the cache, a Redis failure never fails a
