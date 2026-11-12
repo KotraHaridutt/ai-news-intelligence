@@ -44,6 +44,9 @@ TOPICS = [
     {"slug": "artificial_intelligence", "query": "artificial intelligence", "snapshot": "answers_articles_artificial_intelligence.json"},
     {"slug": "tesla", "query": "Tesla", "day1": "Tesla"},
     {"slug": "climate_change", "query": "climate change", "day1": "climate change"},
+    # Feature 4 H: a topic where every chunk is on-topic and one long feature article crowded the news out of
+    # the reranked answer (live, 2026-11-12); the 7 articles the app used then, saved from its cache
+    {"slug": "bird_flu", "query": "bird flu", "snapshot": "answers_articles_bird_flu.json"},
 ]
 # Feature 1's real day-1 / day-2 fetches; EU AI Act found nothing on day 2
 FACT_CHECK_TOPICS = ["Tesla", "OpenAI", "stock market", "climate change"]
