@@ -19,3 +19,11 @@ services:
         value: ai-news-prod
       - key: APP_ENV
         value: prod
+      # Reranking (feature 4): RERANK_MODE off|on, RERANK_ENGINE cloudflare|cohere, set in the dashboard.
+      # COHERE_API_KEY only if Cohere is used on Render (trial key: evaluation use, 10 calls/min, 1,000/month).
+      - key: RERANK_MODE
+        sync: false
+      - key: RERANK_ENGINE
+        sync: false
+      - key: COHERE_API_KEY
+        sync: false

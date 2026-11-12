@@ -177,25 +177,30 @@ def _check_levels():
               f"until 00:00 UTC (it fails open where that can't run).")
 
 
-async def _count_neurons(day: str, neurons: float, failed: bool):
-    """Adds to the day's count in Redis; the total Redis returns is kept if it's higher (another worker, a restart)."""
-    counts = {"calls": 1, "neurons_x100": round(neurons * 100)}
+async def _count_neurons(day: str, neurons: float, failed: bool, usage: str = "clef"):
+    """Adds to the day's count in Redis; the total Redis returns is kept if it's higher (another worker, a restart).
+    Every model's neurons go into one total; calls and errors are counted per caller ("calls" for Clef,
+    "rerank_calls" for the reranker, feature 4 B #7)."""
+    prefix = "" if usage == "clef" else f"{usage}_"
+    counts = {f"{prefix}calls": 1, "neurons_x100": round(neurons * 100)}
+    if prefix:
+        counts[f"{prefix}neurons_x100"] = round(neurons * 100)
     if failed:
-        counts["errors"] = 1
+        counts[f"{prefix}errors"] = 1
     totals = await cache_service.add_usage("clef", day, counts)
     if totals and _spent["day"] == day:
         _spent["neurons"] = max(_spent["neurons"], totals.get("neurons_x100", 0) / 100)
         _check_levels()
 
 
-def _add_neurons(neurons: float, failed: bool = False):
+def _add_neurons(neurons: float, failed: bool = False, usage: str = "clef"):
     day = utc_day()
     if _spent["day"] != day:
         _spent.update(day=day, neurons=0.0)
     _spent["neurons"] += neurons
     _check_levels()
     try:
-        task = asyncio.get_running_loop().create_task(_count_neurons(day, neurons, failed))
+        task = asyncio.get_running_loop().create_task(_count_neurons(day, neurons, failed, usage))
     except RuntimeError:
         return
     _pending.add(task)
@@ -311,42 +316,55 @@ async def _call(questions: dict, state: dict, timeout: float, label: str) -> dic
         raise
 
 
+async def post_run(payload: dict, timeout: float, run, skip=None, usage: str = "clef") -> tuple[httpx.Response, float, int]:
+    """
+    One Workers AI /ai/run call through the AI Gateway, shared by Clef and the Cloudflare reranker
+    (feature 4 B #7): it waits for one of the PARALLEL_CALLS slots, then has `timeout` seconds, with
+    one retry on a 429 / 5xx if at least MIN_RETRY_SECONDS are left. The neurons go into the day's
+    ledger, so the 10,000 free neurons are counted once for every model. `skip()` is the caller's
+    back-off, checked at each attempt. `usage` names the caller in the Redis counters ("clef",
+    "rerank"). Returns (the 200 response, neurons, attempts). Raises ClefError (kinds as above).
+    """
+    headers = {"Authorization": f"Bearer {API_TOKEN}", "cf-aig-gateway-id": GATEWAY_ID}
+    client = _http()
+    deadline = None
+    for attempt in (1, 2):
+        try:
+            async with _semaphore:
+                if skip is not None and skip():
+                    raise ClefError("backoff", "skipped after repeated failures in a row")
+                deadline = deadline or time.monotonic() + timeout
+                left = deadline - time.monotonic()
+                if left <= 0:
+                    raise ClefError("timeout", "no time left before the check's deadline")
+                # httpx's timeout is per phase (connect, read...); wait_for bounds the whole call
+                response = await asyncio.wait_for(
+                    client.post(_url(), json=payload, headers=headers, timeout=left), left)
+        except (httpx.TimeoutException, asyncio.TimeoutError) as e:
+            raise ClefError("timeout", type(e).__name__) from e
+        except httpx.TransportError as e:
+            raise ClefError("busy", type(e).__name__) from e
+        neurons = float(response.headers.get("cf-ai-neurons") or 0)
+        if neurons:
+            _add_neurons(neurons, failed=response.status_code != 200, usage=usage)
+        if response.status_code == 200:
+            return response, neurons, attempt
+        error = _error_of(response)
+        run.add_metadata({f"attempt_{attempt}": str(error)})
+        if error.kind != "busy" or attempt == 2 or deadline - time.monotonic() < MIN_RETRY_SECONDS:
+            raise error
+        await asyncio.sleep(RETRY_WAIT_SECONDS)
+    raise ClefError("busy", "no attempt left")        # not reached: the second attempt returns or raises
+
+
 async def _call_once(questions: dict, state: dict, timeout: float, label: str) -> dict:
     payload = {"model": WORKERS_MODEL, "input": {"model": MODEL, "state": state, "questions": questions}}
-    headers = {"Authorization": f"Bearer {API_TOKEN}", "cf-aig-gateway-id": GATEWAY_ID}
     estimated = sum(estimate_tokens(v) for v in state.values())
-    client = _http()
     async with observability.span(
             "clef", run_type="tool",
             inputs={"label": label, "questions": list(questions), "state_chars": {k: len(v) for k, v in state.items()}},
             metadata={"ls_provider": "cloudflare", "ls_model_name": MODEL, "estimated_state_tokens": estimated}) as run:
-        deadline = None
-        for attempt in (1, 2):
-            try:
-                async with _semaphore:
-                    if backing_off():
-                        raise ClefError("backoff", f"skipped after {_trouble['failures']} failures in a row")
-                    deadline = deadline or time.monotonic() + timeout
-                    left = deadline - time.monotonic()
-                    if left <= 0:
-                        raise ClefError("timeout", "no time left before the check's deadline")
-                    # httpx's timeout is per phase (connect, read...); wait_for bounds the whole call
-                    response = await asyncio.wait_for(
-                        client.post(_url(), json=payload, headers=headers, timeout=left), left)
-            except (httpx.TimeoutException, asyncio.TimeoutError) as e:
-                raise ClefError("timeout", type(e).__name__) from e
-            except httpx.TransportError as e:
-                raise ClefError("busy", type(e).__name__) from e
-            neurons = float(response.headers.get("cf-ai-neurons") or 0)
-            if neurons:
-                _add_neurons(neurons, failed=response.status_code != 200)
-            if response.status_code == 200:
-                break
-            error = _error_of(response)
-            run.add_metadata({f"attempt_{attempt}": str(error)})
-            if error.kind != "busy" or attempt == 2 or deadline - time.monotonic() < MIN_RETRY_SECONDS:
-                raise error
-            await asyncio.sleep(RETRY_WAIT_SECONDS)
+        response, neurons, attempt = await post_run(payload, timeout, run, skip=backing_off)
 
         try:
             result = response.json()["result"]

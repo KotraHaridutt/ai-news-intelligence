@@ -529,7 +529,9 @@ _TOTALS_AS_METADATA = ("answered_by", "cost_usd", "chat_calls", "chat_errors", "
                        "prompt_version", "config_version", "check_score", "checks_failed",
                        "finish_reason", "gemini_blocks", "gemini_block",
                        # feature 3 K #82: Gemini's own ratings per answer (sent only when it rates above NEGLIGIBLE)
-                       "gemini_ratings")
+                       "gemini_ratings",
+                       # feature 4 B #11: which reranker ordered the chunks, and requests where none could
+                       "rerank_engine", "rerank_failed")
 
 
 def add_totals(**amounts):

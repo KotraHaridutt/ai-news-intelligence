@@ -377,6 +377,32 @@ async def set_verdicts(items: dict[str, dict]):
     await _mset_with_ttl([(key, json.dumps(value)) for key, value in items.items()], VERDICT_TTL)
 
 
+# --- Reranker scores (feature 4, Section B #8) ---
+# One score per (engine and model, query, chunk text): a cross-encoder scores each pair on its own, so a
+# cached chunk never needs the call again, and the three views of a topic share one call. Both engines
+# returned identical scores for the same request (Section A §3.2), so caching changes nothing but the cost.
+RERANK_TTL = EMB_TTL
+
+def rerank_key(model: str, query: str, text: str) -> str:
+    query_hash = hashlib.sha256(query.encode("utf-8")).hexdigest()[:16]
+    text_hash = hashlib.sha256(text.encode("utf-8")).hexdigest()
+    return f"{KEY_VERSION}:rerank:{model}:{query_hash}:{text_hash}"
+
+async def get_rerank_scores(model: str, query: str, texts: list[str]) -> list[float | None]:
+    """One cached score per text, in order, None for a miss (and for all of them without Redis)."""
+    scores = []
+    for raw in await _mget([rerank_key(model, query, text) for text in texts]):
+        try:
+            scores.append(float(raw) if raw is not None else None)
+        except (TypeError, ValueError):
+            scores.append(None)
+    return scores
+
+async def set_rerank_scores(model: str, query: str, scores: dict[str, float]):
+    """scores: text -> score."""
+    await _mset_with_ttl([(rerank_key(model, query, text), repr(float(score))) for text, score in scores.items()], RERANK_TTL)
+
+
 # --- Daily Gemini usage (feature 2, #33) ---
 # A hash per model per day: attempts, answers, errors by kind, tokens. The day is Pacific time,
 # when Google resets the free quota. Kept 2 days. Like the cache, a Redis failure never fails a

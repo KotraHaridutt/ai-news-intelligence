@@ -20,7 +20,7 @@ import time
 # --- Our Services ---
 # observability first: it decides whether traces are sent before any model is called
 from services import observability
-from services import cache_service, errors, feedback_service, follow_service, safety
+from services import cache_service, errors, feedback_service, follow_service, rerank_service, safety
 from services.errors import AppError
 from services.pipeline_service import get_pipeline_data, build_time
 from services.rag_service import run_rag_query_with_store
@@ -33,6 +33,8 @@ BASE_DIR = Path(__file__).resolve().parent
 async def lifespan(app: FastAPI):
     # Safety (feature 3): loads the fallback classifiers, reads today's Clef neurons, one log line
     await safety.startup()
+    # Reranking (feature 4): which engine orders the chunks, and its fallback
+    print(f"[INFO] {rerank_service.status()}.")
     yield
     # Shutdown: send the traces still queued. Render's free plan stops an idle app, and
     # traces queued at that moment would be lost. Waits at most 5 s; never raises.
