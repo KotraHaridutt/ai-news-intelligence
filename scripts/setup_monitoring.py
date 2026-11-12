@@ -43,9 +43,12 @@ PREFIX = "ai-news"
 # has a run tagged retry:attempt:2 (D); embedding attempts are embedding runs with estimated
 # usage_metadata (K); the article-list cache records metadata path on cache_or_build (C); root
 # runs carry answered_by and prompt_version (D, E); feedback is on the request's trace (its root
-# run): check.*, fact_check.* (I), user_rating (J), judge.* (I's judge_yesterday).
+# run): check.*, fact_check.* (I), user_rating (J), judge.* (I's judge_yesterday). Feature 4 F: root runs
+# carry metadata rerank_engine (cohere / cloudflare, absent when not reranked); the "rerank" step is tagged
+# rerank_failed (no engine could rank: the search's order was used) and rerank_limited (a free limit sent
+# the ranking to the other engine).
 ANSWER_ROUTES = ["POST /query", "POST /api/timeline", "POST /api/contradictions"]
-STEPS = ["gnews.search", "scrape", "embed.documents", "embed.query", "retrieve", "fact_check"]
+STEPS = ["gnews.search", "scrape", "embed.documents", "embed.query", "rerank", "retrieve", "fact_check"]
 STATUS_CODES = [400, 404, 409, 422, 500, 502, 503, 504]
 ROOT_FILTER = "eq(is_root, true)"
 LLM = 'eq(run_type, "llm")'
@@ -198,6 +201,13 @@ def dashboards(project: str) -> list[dict]:
                   "Calls that needed a retry after a busy answer (429/5xx)."),
             chart("Requests per day by endpoint", "bar", [count("requests", ROOT_FILTER, by("name"))],
                   "Traffic, to read the rates above against."),
+            chart("Reranker: who ordered the chunks", "bar",
+                  [count("answers", f"and({ROOT_FILTER}, {name_in(ANSWER_ROUTES)})", by("metadata", "rerank_engine"))],
+                  "Feature 4: cohere, cloudflare (the fallback, or past Cohere's free limit), or none (reranking off or failed)."),
+            chart("Reranker: failures and free limits", "bar",
+                  [count("no engine could rank", 'and(eq(name, "rerank"), has(tags, "rerank_failed"))'),
+                   count("a free limit moved it", 'and(eq(name, "rerank"), has(tags, "rerank_limited"))')],
+                  "Failed: the search's order was used. Limited: Cohere's minute or month (or Cloudflare's neuron share) sent it to the other engine. Also alerts."),
         ],
     }
     quality = {
@@ -255,6 +265,13 @@ def alert_rules() -> list[dict]:
         # can never match (a real unreadable run fired nothing until it was removed, 2026-10-20)
         {"name": f"{PREFIX}: unreadable fact-check answer", "metric": "Run Count", "aggregation": "Count", "condition": "at least 1",
          "window_minutes": 15, "filter": "Tag = unreadable_answer only (no Is Trace)"},
+        # Feature 4 F #31. Tags on the "rerank" step inside the request: no Is Trace, as above
+        {"name": f"{PREFIX}: reranker failing", "metric": "Run Count", "aggregation": "Count", "condition": "at least 3",
+         "window_minutes": 15, "filter": "Tag = rerank_failed only (no Is Trace)"},
+        # Fires while Cohere's month (950 of 1,000) or minute is used up, so expect it every window then:
+        # the sign to look at the month counter (startup line / v1:usage:cohere:<month>)
+        {"name": f"{PREFIX}: reranker past a free limit", "metric": "Run Count", "aggregation": "Count", "condition": "at least 1",
+         "window_minutes": 15, "filter": "Tag = rerank_limited only (no Is Trace)"},
     ]
 
 

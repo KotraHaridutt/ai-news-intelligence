@@ -548,6 +548,11 @@ async def rerank(query: str, texts: list[str], label: str = "") -> Reranked | No
             ms = round((time.perf_counter() - started) * 1000)
             run.add_outputs({"engine": result.engine if result else None, "from_cache": result.from_cache if result else 0,
                              "failed": failed, "ms": ms})
+            # For the LangSmith charts and alerts (Section F #31): tags, which its alert filters can match
+            tags = (["rerank_failed"] if result is None and order and sent else []) + \
+                   (["rerank_limited"] if any(": over_limit" in f for f in failed) else [])
+            if tags:
+                run.add_tags(tags)
     except Exception as e:            # a bug or Redis trouble here must not stop the answer
         failed.append(f"error: {type(e).__name__}")
         result, ms = None, round((time.perf_counter() - started) * 1000)
