@@ -83,6 +83,36 @@ FACT_CHECK_MAX_OUTPUT_TOKENS = 3072
 RETRIEVAL_K = 10
 STORY_CAP = 3
 
+# Feature 5 (E1): a view can get another k than RETRIEVAL_K. Off by default ({}: every view gets 10).
+# Measured on the 6 eval topics (feature 5 B §3.3): at k=15 the timeline's dated chunks rise from 0.565 to
+# 0.704 of the dated must-haves, while a bigger k for every view fails the keep rule (precision, and one
+# topic's ndcg). The timeline is the view that lists dated events, so only it is tried with more.
+# RETRIEVAL_TIMELINE_K=15 in the environment turns it on; whether it's kept is decided in feature 5 E.
+RETRIEVAL_K_BOUNDS = (5, 20)
+
+def _view_k_from_env(env) -> dict:
+    """{"timeline": k} from RETRIEVAL_TIMELINE_K, or {} when unset or not a whole number in RETRIEVAL_K_BOUNDS
+    (said in the log, and the view keeps RETRIEVAL_K: a typo must not change what the answers read)."""
+    raw = (env.get("RETRIEVAL_TIMELINE_K") or "").strip()
+    if not raw:
+        return {}
+    low, high = RETRIEVAL_K_BOUNDS
+    try:
+        k = int(raw)
+    except ValueError:
+        k = None
+    if k is None or not low <= k <= high:
+        print(f"[WARN] RETRIEVAL_TIMELINE_K={raw!r} ignored: a whole number from {low} to {high} is expected; "
+              f"the timeline keeps k={RETRIEVAL_K}")
+        return {}
+    return {"timeline": k}
+
+RETRIEVAL_K_BY_VIEW = _view_k_from_env(os.environ)
+
+def retrieval_k(view: str) -> int:
+    """How many chunks this view's answer gets: its own k if one is set, else RETRIEVAL_K."""
+    return RETRIEVAL_K_BY_VIEW.get(view, RETRIEVAL_K)
+
 # How each prompt type picks its chunks. All three show the model the user's own query.
 # "rerank" (feature 4, Section D), used only while RERANK_MODE=on: how the reranker's scores reorder the
 # search's ranking of the whole index, before the per-story cap:
@@ -232,6 +262,8 @@ ANSWER_CONFIG = {
     "max_output_tokens": MAX_OUTPUT_TOKENS,
     # Feature 4: the reranker's mode, engine and models (the per-view method is in "retrieval")
     "rerank": rerank_service.summary(),
+    # Feature 5: only when a view has its own k, so the config version stays the same while it's off
+    **({"retrieval_k_by_view": RETRIEVAL_K_BY_VIEW} if RETRIEVAL_K_BY_VIEW else {}),
 }
 CONFIG_VERSION = prompts.version_of(json.dumps(ANSWER_CONFIG, sort_keys=True))
 
@@ -740,7 +772,8 @@ async def _retrieve(vector_store, query, prompt_type):
             search_query, k=index_size, fetch_k=index_size, lambda_mult=settings["lambda_mult"])
     else:
         ranked = await vector_store.asimilarity_search(search_query, k=index_size)
-    pick = lambda pool: _cap_per_story(pool, RETRIEVAL_K, STORY_CAP)
+    k = retrieval_k(prompt_type)
+    pick = lambda pool: _cap_per_story(pool, k, STORY_CAP)
     searched = ranked
     ranked, rerank_info = await _rerank(vector_store, query, search_query, ranked, settings, prompt_type)
     if rerank_info["reranked"]:
@@ -752,7 +785,7 @@ async def _retrieve(vector_store, query, prompt_type):
     # None of them about the query: "not enough coverage" in enforce mode, before Gemini is called (J #79)
     await relevance.coverage(query, documents, prompt_type,
                              refuse=lambda d: errors.not_enough_coverage(query, prompt_type, f"{prompt_type}: {d.label}"))
-    observability.annotate(search=settings["search"], query_suffix=settings.get("query_suffix"), k=RETRIEVAL_K,
+    observability.annotate(search=settings["search"], query_suffix=settings.get("query_suffix"), k=k,
                            story_cap=STORY_CAP, index_size=index_size,
                            stories=len({_story(doc.metadata) for doc in documents}), rerank=rerank_info)
     return documents
@@ -863,7 +896,7 @@ async def run_rag_query_with_store(query, vector_store, prompt_type):
                 usage.forget(observability.close_open_llm_runs(DEADLINE_CANCELLED))
             raise errors.report_failed(e, prompt_type) from e
 
-        summary = _retrieval_summary(documents, vector_store.index.ntotal, RETRIEVAL_K, STORY_CAP)
+        summary = _retrieval_summary(documents, vector_store.index.ntotal, retrieval_k(prompt_type), STORY_CAP)
         print(f"[INFO] RAG [{prompt_type}, {search}]: Retrieved {summary}")
         # The request's canary in the answer: withheld in enforce mode, cut out in monitor (D #36)
         answer = await canary.check_text(answer or "", marker, where="answer", prompt_type=prompt_type)
@@ -883,5 +916,5 @@ async def run_rag_query_with_store(query, vector_store, prompt_type):
         result["notes"] = (await faithfulness.check_answer(prompt_type, result["answer"], faithfulness.rows_of(documents)))["notes"]
         # The free code checks on this answer (Section I): feedback on the trace, never an error
         online_checks.answer(prompt_type, result["answer"], documents, list(vector_store.docstore._dict.values()),
-                             RETRIEVAL_K, STORY_CAP)
+                             retrieval_k(prompt_type), STORY_CAP)
         return result

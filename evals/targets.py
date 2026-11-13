@@ -7,15 +7,19 @@ context frozen in Section F, so an answer differs from another only by what an e
 """
 import asyncio
 import sys
+import time
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from langchain_classic.chains.combine_documents import create_stuff_documents_chain
+from langchain_core.callbacks import AsyncCallbackHandler
 from langchain_core.documents import Document
+from langchain_core.runnables import RunnableLambda
 
 from services import prompts, rag_service as rag
+from services.safety import gemini
 
 
 def documents(context: list[dict]) -> list[Document]:
@@ -30,11 +34,39 @@ async def generate_answer(query: str, view: str, context: list[dict], template=N
     older text); default the app's. Sent as the app sends it (system + user parts, feature 3 E)."""
     template = rag.as_prompt(view, template or rag.ANSWER_PROMPTS[view])
     prompt, marker = rag.answer_prompt(template)        # the canary too, when the prompt has one
-    chain = create_stuff_documents_chain(rag.pick_chat_model(rag.llm, rag.llm_fallback_only), prompt, document_prompt=rag.DOCUMENT_PROMPT)
+    # As the app calls it (feature 5 E1): the view's output cap (#66) and the block check, so an answer cut
+    # off at its cap shows here too. finish_reason is read on the way, as in run_rag_query_with_store.
+    finish = {}
+
+    def note_finish(message):
+        finish["reason"] = gemini.finish_reason(message)
+        return message
+    model = rag.with_cap(rag.pick_chat_model(rag.llm, rag.llm_fallback_only), view)
+    chain = create_stuff_documents_chain(model | rag.BLOCK_CHECK | RunnableLambda(note_finish, name="finish_reason"), prompt,
+                                         document_prompt=rag.DOCUMENT_PROMPT)
+    measured = Measured()
+    started = time.perf_counter()
     answer = await asyncio.wait_for(
         chain.ainvoke({"input": rag.as_query(query), "context": rag._with_source_headers(documents(context)),
                        **({"canary": marker} if marker else {})},
-                      config={"run_name": "generate", "tags": [view, "eval"],
+                      config={"run_name": "generate", "tags": [view, "eval"], "callbacks": [measured],
                               "metadata": {**rag.prompt_metadata(view, template), "config_version": rag.CONFIG_VERSION}}),
         rag.CHAT_DEADLINE_SECONDS)
-    return {"answer": answer.strip(), "prompt_version": template.version, "config_version": rag.CONFIG_VERSION}
+    # Feature 5 #26: the answer's time (retries and fallback included) and the tokens of the attempt that answered
+    return {"answer": answer.strip(), "prompt_version": template.version, "config_version": rag.CONFIG_VERSION,
+            "seconds": round(time.perf_counter() - started, 2), "finish_reason": finish.get("reason"), **measured.tokens}
+
+
+class Measured(AsyncCallbackHandler):
+    """The input and output tokens of the last chat attempt that ended (the one whose answer is used)."""
+
+    def __init__(self):
+        self.tokens = {}
+
+    async def on_llm_end(self, response, **kwargs):
+        try:
+            usage = response.generations[0][0].message.usage_metadata or {}
+        except (AttributeError, IndexError):
+            return
+        if usage:
+            self.tokens = {"input_tokens": usage.get("input_tokens"), "output_tokens": usage.get("output_tokens")}
