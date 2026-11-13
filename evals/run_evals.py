@@ -9,6 +9,7 @@ and compares it with the baseline.
   .local/venv/Scripts/python.exe evals/run_evals.py status
   .local/venv/Scripts/python.exe evals/run_evals.py compare <experiment A> <experiment B> [--pairwise]
   .local/venv/Scripts/python.exe evals/run_evals.py rescore <experiment>
+  .local/venv/Scripts/python.exe evals/run_evals.py rescore <experiment> --cached   (today's metrics on its saved outputs, no calls)
   .local/venv/Scripts/python.exe evals/run_evals.py run retrieval --name cohere-v4pro --rerank cohere --rerank-model rerank-v4.0-pro
   .local/venv/Scripts/python.exe evals/run_evals.py run retrieval --name cf-fusion --rerank cloudflare --rerank-method fusion
 
@@ -314,11 +315,16 @@ def score(dataset: str, inputs: dict, reference: dict, output: dict, verdict: di
         # the first version cut at 10 and showed k=15 as identical to k=10 (Section H)
         from services import rag_service as rag
         k = len(output["retrieved"])
-        raw = scores.retrieval_scores(output["retrieved"], reference["grades"], reference["dated"], k=k)
-        out.update({re.sub(r"@\d+$", "@k", name): v for name, v in raw.items() if name not in ("retrieved", "relevant")})
         topic = next(t for t in data.topics() if t["slug"] == inputs["topic"])
         articles = {a["n"]: a for a in topic["articles"]}
         index = [{"theme_id": articles[c["article"]].get("theme_id", -1), "source": articles[c["article"]]["url"]} for c in topic["chunks"]]
+        # Each chunk's story, as the app's cap sees it (rag_service._story): a duplicate group, or the article alone
+        stories = {c["id"]: rag._story(m) for c, m in zip(topic["chunks"], index)}
+        raw = scores.retrieval_scores(output["retrieved"], reference["grades"], reference["dated"], k=k,
+                                      stories=stories, cap=rag.STORY_CAP)
+        out.update({re.sub(r"@\d+$", "@k", name): v for name, v in raw.items() if name not in ("retrieved", "relevant")})
+        # Feature 5 #3: the chunks actually sent. More chunks raise recall by themselves, so every comparison shows them
+        out["chunks@k"] = float(raw["retrieved"])
         cap = checks.check_retrieval([{"theme_id": t, "source": s} for t, s in zip(output["theme_ids"], output["sources"])],
                                      k=rag.RETRIEVAL_K, cap=rag.STORY_CAP, index=index)
         out["story_cap"] = float(cap["checks"]["story_cap"])
@@ -660,6 +666,60 @@ async def rescore(name: str, max_calls, reserve):
                      True, None, False)
 
 
+def rescore_cached(name: str) -> int:
+    """
+    Feature 5 #4: scores an experiment's saved outputs again with today's metrics, in its own folder.
+    No generation, no judge and no upload, so no calls. `run` can't do this for an older experiment: its
+    fingerprint holds the app's config at the time, so a run today would get another name (and folder)
+    and generate everything again. Examples without a saved output (a topic added later) are left out
+    and counted. A saved verdict is reused as it is.
+    """
+    folder = RUNS / name
+    if not (folder / "manifest.json").exists():
+        print(f"[H] {name}: no such experiment")
+        return 1
+    manifest = json.loads((folder / "manifest.json").read_text(encoding="utf-8"))
+    dataset = manifest["dataset"]
+    Variant.from_dict(manifest.get("variant", {})).apply()      # its k and cap, which the scores read
+    old = json.loads((folder / "summary.json").read_text(encoding="utf-8")) if (folder / "summary.json").exists() else {}
+    jdirs = sorted(folder.glob("judged-*"))
+    jdir = jdirs[-1] if old.get("judged") and jdirs else None
+    rows, missing = [], 0
+    for e in examples(dataset):
+        key = input_key(e["inputs"])
+        path = folder / "outputs" / f"{key}.json"
+        if not path.exists():
+            missing += 1
+            continue
+        verdict = None
+        if jdir and (jdir / f"{key}.json").exists():
+            verdict = json.loads((jdir / f"{key}.json").read_text(encoding="utf-8"))
+            verdict = None if verdict.get("nothing_to_judge") else verdict
+        rows.append({"key": e["metadata"]["key"], "input_key": key,
+                     "metrics": score(dataset, e["inputs"], e["outputs"], json.loads(path.read_text(encoding="utf-8")), verdict)})
+    if not rows:
+        print(f"[H] {name}: no saved outputs to score")
+        return 1
+    summary = summarize(rows)
+    baseline_name = old.get("baseline") or _baselines().get(dataset)
+    baseline = None
+    if baseline_name and baseline_name != name and (RUNS / baseline_name / "summary.json").exists():
+        baseline = json.loads((RUNS / baseline_name / "summary.json").read_text(encoding="utf-8"))["summary"]
+    broken = gate(dataset, summary, baseline)
+    (folder / "summary.json").write_text(json.dumps({"name": name, "summary": summary, "rows": rows, "baseline": baseline_name,
+                                                    "broken": broken, "judged": bool(jdir), "trusted": trusted_fields(),
+                                                    "scored_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                                                    "rescored_cached": True, "examples_missing": missing},
+                                                   indent=1), encoding="utf-8")
+    _print_summary(name, summary, baseline, baseline_name)
+    if missing:
+        print(f"[H] {name}: {len(rows)} examples scored; {missing} have no saved output (a topic added after it ran). "
+              f"They're left out, so its means cover fewer topics than today's dataset")
+    for b in broken:
+        print(f"[H] THRESHOLD BROKEN: {b}")
+    return 1 if broken else 0
+
+
 def status():
     if not RUNS.exists():
         print("[H] no experiments yet")
@@ -705,6 +765,8 @@ def main(argv=None) -> int:
     s.add_argument("name")
     s.add_argument("--max-calls", type=int)
     s.add_argument("--reserve", type=int, default=2)
+    s.add_argument("--cached", action="store_true", help="score the saved outputs again with today's metrics, in place: "
+                                                         "no generation, no judge, no upload, no calls (feature 5)")
     sub.add_parser("status")
     args = parser.parse_args(argv)
 
@@ -718,6 +780,8 @@ def main(argv=None) -> int:
         if args.pairwise:
             asyncio.run(pairwise(args.a, args.b, args.max_calls, args.reserve))
         return 0
+    if args.cmd == "rescore" and args.cached:
+        return rescore_cached(args.name)
     if args.cmd == "rescore":
         return asyncio.run(rescore(args.name, args.max_calls, args.reserve))
     variant = Variant(k=args.k, cap=args.cap, prompt_files=dict(x.split("=", 1) for x in args.prompt), retrieve=args.retrieve,

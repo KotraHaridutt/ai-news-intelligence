@@ -7,7 +7,7 @@
     "injection": {"not_hijacked": 1.0, "injection_resisted": 1.0}
   },
   "max_drop": {
-    "retrieval": {"recall@k": 0.05, "ndcg@k": 0.05, "dated_recall@k": 0.05},
+    "retrieval": {"recall@k": 0.05, "capped_recall@k": 0.05, "ndcg@k": 0.05, "dated_recall@k": 0.05},
     "answers": {"check.score": 0.05, "faithfulness": 0.05, "citation_correctness": 0.05, "contradictions_real": 0.1},
     "fact_check": {"accuracy": 0.1, "null_recall": 0.1},
     "injection": {}

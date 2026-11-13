@@ -11,6 +11,8 @@ table    reads each experiment's summary.json and outputs (no calls) and prints:
             so one topic can't decide alone (#26)
          4. time: the first view of each topic makes the reranker call (the other views read the cache)
          5. the gates from evals/thresholds.json against the baseline
+         6. recall per topic (feature 5): found, capped, and the best any ranking could reach with the same
+            places and the per-story cap; and the chunks sent, since more chunks raise recall by themselves
 planted  the planted-instruction topic (.local/evals/injection.json): where its injected chunks rank in the
          search's order and in the reranker's, and whether they reach the answer's 10 (#25). One reranker
          call per engine (cached).
@@ -31,7 +33,9 @@ from evals import data, run_evals  # noqa: E402
 
 RUNS = run_evals.RUNS
 ALONE = ("ndcg_full", "mrr_full")
-ANSWER = ("ndcg@k", "recall@k", "precision@k", "useful_precision@k", "mrr", "dated_recall@k", "stories@k", "off_topic@k")
+ANSWER = ("ndcg@k", "recall@k", "capped_recall@k", "reachable_recall@k", "precision@k", "useful_precision@k", "mrr",
+          "dated_recall@k", "stories@k", "off_topic@k", "chunks@k")
+RECALL = ("recall@k", "capped_recall@k", "reachable_recall@k", "chunks@k")
 PER_VIEW = {"report": ("ndcg@k", "precision@k", "mrr"), "timeline": ("ndcg@k", "precision@k", "dated_recall@k"),
             "contradictions": ("ndcg@k", "precision@k", "stories@k")}
 WIN = 0.02
@@ -67,12 +71,16 @@ def table(baseline: str, names: list[str]):
     width = max(len(labels[n]) for n in runs) + 2
     base_rows = sums[baseline]["rows"]
 
-    print("\n== 1. Mean over 15 examples (delta vs the baseline)")
+    counts = sorted({len(sums[n]["rows"]) for n in runs})
+    print(f"\n== 1. Mean over {' / '.join(map(str, counts))} examples (delta vs the baseline)"
+          + ("; experiments with fewer examples cover fewer topics, so their means aren't comparable" if len(counts) > 1 else ""))
     for group, metrics in (("the reranker alone (whole index, before the cap)", ALONE), ("what the answer gets (after the cap)", ANSWER)):
         print(f"\n   {group}")
-        print(" " * (width + 3) + "".join(f"{m:>15}" for m in metrics))
+        cols = {m: max(16, len(m) + 2) for m in metrics}          # long names (reachable_recall@k) keep their own column
+        print(" " * (width + 3) + "".join(f"{m:>{cols[m]}}" for m in metrics))
         for n in runs:
-            row = "".join(_fmt(_mean(sums[n]["rows"], m), None if n == baseline else _mean(base_rows, m)) for m in metrics)
+            row = "".join(_fmt(_mean(sums[n]["rows"], m), None if n == baseline else _mean(base_rows, m)).rjust(cols[m])
+                          for m in metrics)
             print(f"   {labels[n]:<{width}}{row}")
 
     print("\n== 2. Per view")
@@ -92,7 +100,7 @@ def table(baseline: str, names: list[str]):
         for t in topics:
             keep = lambda key, t=t: key.startswith(t + "/")
             value, base = _mean(sums[n]["rows"], "ndcg@k", keep), _mean(base_rows, "ndcg@k", keep)
-            if n != baseline:
+            if n != baseline and value is not None:          # None: a topic the experiment didn't have (added later)
                 wins += value - base >= WIN
                 losses += base - value >= WIN
             cells.append(_fmt(value, None if n == baseline else base))
@@ -114,6 +122,15 @@ def table(baseline: str, names: list[str]):
     for n in names:
         broken = run_evals.gate("retrieval", sums[n]["summary"], base)
         print(f"   {labels[n]:<{width}} " + ("passes" if not broken else "BROKEN: " + "; ".join(broken)))
+
+    print("\n== 6. Recall per topic (mean over its views): found / capped / best reachable / chunks sent")
+    for t in topics:
+        keep = lambda key, t=t: key.startswith(t + "/")
+        print(f"\n   {t}")
+        print(" " * (width + 3) + "".join(f"{m:>20}" for m in RECALL))
+        for n in runs:
+            values = [_mean(sums[n]["rows"], m, keep) for m in RECALL]
+            print(f"   {labels[n]:<{width}}" + "".join(f"{'-':>20}" if v is None else f"{v:20.3f}" for v in values))
 
 
 async def planted(rerank, rerank_model, rerank_method=None, rerank_query=None):
