@@ -23,6 +23,15 @@ import numpy as np
 MODELS_DIR = Path(__file__).resolve().parent / "models"
 FORMAT = 1
 
+# Feature 3 N #108: the checksum each shipped file must have. The checksum inside a file only shows it
+# was edited after training: a file trained again (a re-run of scripts/train_safety_classifier.py,
+# which overwrites it) or swapped whole carries a matching checksum of its own. Pinned here, in
+# reviewed code, a new file is used only once this line changes with it. The training script prints
+# the line to paste. A file not listed here isn't loaded.
+PINNED = {
+    "intent": "910a0c30b40e87fe2338f9f7acb250d8ef5fcdeaafe045cb560eca30c71b3101",
+}
+
 
 class ClassifierError(Exception):
     """A classifier file that can't be used: missing, changed, or trained on other vectors."""
@@ -106,8 +115,23 @@ _failed: dict[str, str] = {}
 _done = False
 
 
-def load_all(directory: Path = MODELS_DIR) -> tuple[dict[str, Classifier], dict[str, str]]:
-    """Loads every models/*.json. Returns (classifiers, {name: why it didn't load}). Never raises."""
+def check_pinned(stem: str, data: dict, pinned: dict = PINNED) -> None:
+    """N #108: the file is the one the code names: its name matches the file's, and its checksum is the
+    pinned one. Raises ClassifierError."""
+    name = data.get("name")
+    if name != stem:
+        raise ClassifierError(f"{stem}.json says it is {name!r}")
+    expected = pinned.get(stem)
+    if expected is None:
+        raise ClassifierError(f"{stem}: not pinned in classifier.PINNED (a file only loads once its checksum is pinned)")
+    if data.get("checksum") != expected:
+        raise ClassifierError(f"{stem}: checksum {str(data.get('checksum'))[:12]}... isn't the pinned {expected[:12]}... "
+                              f"(trained again or replaced: pin the new checksum in classifier.PINNED after checking it)")
+
+
+def load_all(directory: Path = MODELS_DIR, pinned: dict | None = None) -> tuple[dict[str, Classifier], dict[str, str]]:
+    """Loads every models/*.json. Returns (classifiers, {name: why it didn't load}). Never raises.
+    `pinned` replaces PINNED (tests)."""
     global _done
     # Imported here: rag_service imports the safety package (Section D), so a top-level import
     # would be circular. Its constants are what the app's vectors really are.
@@ -119,6 +143,7 @@ def load_all(directory: Path = MODELS_DIR) -> tuple[dict[str, Classifier], dict[
         try:
             data = json.loads(path.read_text(encoding="utf-8"))
             clf = from_dict(data, rag_service.EMBEDDING_MODEL, tasks)
+            check_pinned(path.stem, data, PINNED if pinned is None else pinned)
             _loaded[clf.name] = clf
         except (ClassifierError, ValueError, KeyError, TypeError) as e:
             _failed[path.stem] = str(e)

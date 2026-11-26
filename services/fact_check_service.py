@@ -8,7 +8,7 @@ from langchain_core.exceptions import OutputParserException
 from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_core.runnables import RunnableLambda
 
-from services import errors, observability, online_checks, prompts, usage
+from services import errors, model_versions, observability, online_checks, prompts, usage
 from services import rag_service as rag
 from services.novelty_service import SHOWN, NOTHING_NEW, UNJUDGED
 from services.safety import articles as safety_articles, canary, faithfulness, gemini, privacy, provenance
@@ -240,7 +240,8 @@ async def run_fact_check(query, stories, known_stories, told) -> dict:
     async with observability.span("fact_check", inputs={"query": query, "stories": [s["id"] for s in stories]},
                                   metadata={**versions, "new": new_count, "known": len(stories) - new_count, "articles": articles,
                                             "chunks": excerpts, "prompt_chars": prompt_chars, "chunks_per_article": CHUNKS_PER_ARTICLE,
-                                            "chat_model": rag.CHAT_MODEL, "fallback_model": rag.FALLBACK_CHAT_MODEL},
+                                            "chat_model": rag.CHAT_MODEL, "fallback_model": rag.FALLBACK_CHAT_MODEL,
+                                            **model_versions.trace_metadata(rag.CHAT_MODEL, rag.FALLBACK_CHAT_MODEL)},
                                   tags=["answer"]) as run:
         model = rag.pick_chat_model(fact_check_llm, fact_check_fallback_only)
         try:

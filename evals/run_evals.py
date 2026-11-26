@@ -206,6 +206,51 @@ def examples(dataset: str) -> list[dict]:
             "injection": b.injection_examples}[dataset]()
 
 
+# --- What a run read (feature 3, Section N #109) ---
+# The fingerprint (Variant.fingerprint) names the app's settings and prompt versions, so a changed prompt
+# makes a new experiment. The files the examples and scores come from didn't show anywhere: a label
+# reviewed again, a topic re-frozen, a threshold edited between two runs moved the metrics with nothing
+# in the results saying why. Each run now keeps the sha256 of every file it read (inputs.files), of the
+# --prompt files it tried (inputs.prompt_files) and the judges' prompt versions (inputs.judge_versions),
+# in its manifest when it starts and in its summary when it's scored. A file that changed in between is
+# printed and listed (inputs_changed), and `compare` lists the files that differ between two runs.
+# Not in the fingerprint: older experiments keep their names and their saved outputs.
+
+def input_hashes(dataset: str, variant: "Variant") -> tuple[list[dict], dict]:
+    """The dataset's examples, and the hashes of everything they and their scores were read from."""
+    data.forget_reads()
+    exs = examples(dataset)
+    files = data.files_read()
+    for path in (THRESHOLDS, data.EVALS / "calibration" / "agreement.json"):
+        if path.exists():
+            files[data.name_of(path)] = data.file_hash(path.read_text(encoding="utf-8"))
+    inputs = {"files": dict(sorted(files.items()))}
+    if variant.prompts:
+        inputs["prompt_files"] = {view: data.file_hash(value if isinstance(value, str) else json.dumps(value, sort_keys=True))
+                                  for view, value in sorted(variant.prompts.items())}
+    if dataset in CHAT_DATASETS:
+        from evals import judges
+        inputs["judge_versions"] = dict(sorted(judges.JUDGE_VERSIONS.items()))
+    return exs, inputs
+
+
+def changed_inputs(before: dict | None, after: dict | None) -> list[str]:
+    """What differs between two `inputs` records, one line each ("labels/reviewed/x.json changed")."""
+    if not before or not after:
+        return []
+    lines = []
+    for part in sorted(set(before) | set(after)):
+        a, b = before.get(part) or {}, after.get(part) or {}
+        for key in sorted(set(a) | set(b)):
+            if key not in a:
+                lines.append(f"{part}: {key} added")
+            elif key not in b:
+                lines.append(f"{part}: {key} removed")
+            elif a[key] != b[key]:
+                lines.append(f"{part}: {key} changed ({a[key][:8]} -> {b[key][:8]})")
+    return lines
+
+
 # --- 1. generate ---
 
 _stores = {}
@@ -491,7 +536,15 @@ class Run:
 
 async def run(dataset, name, variant, judge_too, max_calls, reserve, upload, baseline_name, set_baseline) -> int:
     r = Run(dataset, name, variant)
-    exs = [e for e in examples(dataset) if variant.covers(e)]
+    all_examples, inputs = input_hashes(dataset, variant)
+    exs = [e for e in all_examples if variant.covers(e)]
+    # N #109: the inputs when the run started; a run continued another day says what changed since
+    if "inputs" not in r.manifest:
+        r.manifest["inputs"] = inputs
+        r._save_manifest()
+    inputs_changed = changed_inputs(r.manifest["inputs"], inputs)
+    for line in inputs_changed:
+        print(f"[H] input changed since this run started: {line}")
     if not exs:
         print(f"[H] {r.name}: no examples for views {variant.views}")
         return 1
@@ -569,7 +622,8 @@ async def run(dataset, name, variant, judge_too, max_calls, reserve, upload, bas
     broken = gate(dataset, summary, baseline)
     (r.dir / "summary.json").write_text(json.dumps({"name": r.name, "summary": summary, "rows": rows, "baseline": baseline_name,
                                                     "broken": broken, "judged": bool(jdir), "trusted": trusted_fields(),
-                                                    "scored_at": datetime.now(timezone.utc).isoformat(timespec="seconds")},
+                                                    "scored_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                                                    "inputs": inputs, "inputs_changed": inputs_changed},
                                                    indent=1), encoding="utf-8")
     _print_summary(r.name, summary, baseline, baseline_name)
     if upload:
@@ -724,6 +778,15 @@ def compare(a: str, b: str):
                 changes.append((abs(vb - va), row["key"], metric, va, vb))
     for _, key, metric, va, vb in sorted(changes, reverse=True)[:10]:
         print(f"      biggest change: {key} {metric} {va} -> {vb}")
+    # N #109: a metric that moved because its data did, not the setting being compared
+    if sa.get("inputs") and sb.get("inputs"):
+        differ = changed_inputs(sa["inputs"], sb["inputs"])
+        print("      inputs: " + ("the same files" if not differ else f"{len(differ)} differ"))
+        for line in differ:
+            print(f"      input {line}")
+    else:
+        print("      inputs: not recorded for " + " and ".join(n for n, s in ((a, sa), (b, sb)) if not s.get("inputs"))
+              + " (scored before feature 3 N)")
 
 
 async def rescore(name: str, max_calls, reserve):
@@ -755,7 +818,12 @@ def rescore_cached(name: str) -> int:
     jdirs = sorted(folder.glob("judged-*"))
     jdir = jdirs[-1] if old.get("judged") and jdirs else None
     rows, missing = [], 0
-    for e in examples(dataset):
+    all_examples, inputs = input_hashes(dataset, variant)
+    # N #109: against what it was last scored on (older runs have no record: nothing to compare)
+    inputs_changed = changed_inputs(old.get("inputs") or manifest.get("inputs"), inputs)
+    for line in inputs_changed:
+        print(f"[H] input changed since {name} was last scored: {line}")
+    for e in all_examples:
         if not variant.covers(e):
             continue
         key = input_key(e["inputs"])
@@ -781,7 +849,8 @@ def rescore_cached(name: str) -> int:
     (folder / "summary.json").write_text(json.dumps({"name": name, "summary": summary, "rows": rows, "baseline": baseline_name,
                                                     "broken": broken, "judged": bool(jdir), "trusted": trusted_fields(),
                                                     "scored_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
-                                                    "rescored_cached": True, "examples_missing": missing},
+                                                    "rescored_cached": True, "examples_missing": missing,
+                                                    "inputs": inputs, "inputs_changed": inputs_changed},
                                                    indent=1), encoding="utf-8")
     _print_summary(name, summary, baseline, baseline_name)
     if missing:

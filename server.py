@@ -21,7 +21,7 @@ import time
 # --- Our Services ---
 # observability first: it decides whether traces are sent before any model is called
 from services import observability
-from services import cache_service, errors, feedback_service, follow_service, rerank_service, safety
+from services import cache_service, errors, feedback_service, follow_service, model_versions, rag_service, rerank_service, safety
 from services.errors import AppError
 from services.pipeline_service import get_pipeline_data, build_time
 from services.rag_service import run_rag_query_with_store
@@ -55,8 +55,12 @@ async def lifespan(app: FastAPI):
     await safety.startup()
     print("[INFO] API docs: " + ("on at /docs, /redoc and /openapi.json (APP_ENV=dev)." if API_DOCS
                                  else "off (set APP_ENV=dev to see them locally)."))
-    # Reranking (feature 4): which engine orders the chunks, its fallback, and what's used of the free limits
-    await asyncio.gather(rerank_service.load_usage(), rerank_service.warm_up())
+    # Reranking (feature 4): which engine orders the chunks, its fallback, and what's used of the free limits.
+    # Alongside it, the versions Google reports for the Gemini models (feature 3 N #106: one metadata call
+    # each, at most 5 s, never stops the app)
+    await asyncio.gather(rerank_service.load_usage(), rerank_service.warm_up(),
+                         model_versions.startup([rag_service.CHAT_MODEL, rag_service.FALLBACK_CHAT_MODEL,
+                                                 rag_service.EMBEDDING_MODEL]))
     print(f"[INFO] {rerank_service.status()}.")
     yield
     # Shutdown: send the traces still queued. Render's free plan stops an idle app, and
@@ -224,6 +228,8 @@ async def remember_answer(query: str, view: str, text: str, built_at) -> dict:
         "built_at": built_at,
         "created_at": build_time(),
         **{key: totals[key] for key in ("answered_by", "prompt_version", "config_version") if key in totals},
+        # The version Google reported at startup for the model that answered (feature 3 N #106)
+        **({"model_version": v} if (v := model_versions.version_of(totals.get("answered_by"))) else {}),
         **(trace or {}),
     })
     return {"answer_id": answer_id if saved else None, "can_rate": bool(saved and trace)}

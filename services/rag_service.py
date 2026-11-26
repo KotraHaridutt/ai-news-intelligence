@@ -9,7 +9,7 @@ from dotenv import load_dotenv
 
 # observability sets up tracing (one client, redaction) for every model call made from here,
 # also when a script imports this module without server.py
-from services import cache_service, errors, observability, online_checks, prompts, rerank_service, usage  # noqa: F401
+from services import cache_service, errors, model_versions, observability, online_checks, prompts, rerank_service, usage  # noqa: F401
 from services.news_fetcher import has_enough_text
 from services.safety import articles as safety_articles, canary, faithfulness, gemini, privacy, provenance, relevance
 from services.safety.text import strip_invisible
@@ -277,8 +277,10 @@ def prompt_metadata(name: str, prompt) -> dict:
     from ("code", "hub:<tag>", or "patched" when something replaced the registry's prompt)."""
     prompt, registered = as_prompt(name, prompt), prompts.get(name)
     same = (prompt.system, prompt.template) == (registered.system, registered.template)
+    # The Hub commit it was loaded from (feature 3 N #107), only for a Hub prompt: a moved tag shows up here
+    commit = {"prompt_commit": registered.commit} if same and registered.commit else {}
     return {"prompt_name": name, "prompt_version": prompt.version, "prompt_source": registered.source if same else "patched",
-            "prompt_parts": 2 if prompt.system else 1}
+            "prompt_parts": 2 if prompt.system else 1, **commit}
 
 def answer_prompt(prompt) -> tuple:
     """
@@ -869,6 +871,7 @@ async def run_rag_query_with_store(query, vector_store, prompt_type):
     observability.add_totals(prompt_version=versions["prompt_version"], config_version=CONFIG_VERSION)
     async with observability.span(prompt_type, inputs={"query": query, "view": prompt_type},
                                   metadata={**versions, "chat_model": CHAT_MODEL, "fallback_model": FALLBACK_CHAT_MODEL,
+                                            **model_versions.trace_metadata(CHAT_MODEL, FALLBACK_CHAT_MODEL),
                                             "thinking_level": THINKING_LEVEL, "timeout_s": CHAT_TIMEOUT_SECONDS,
                                             "attempts": CHAT_ATTEMPTS, "deadline_s": CHAT_DEADLINE_SECONDS},
                                   tags=["answer"]) as run:

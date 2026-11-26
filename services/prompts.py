@@ -1,4 +1,5 @@
 import hashlib
+import re
 import os
 import string
 from dataclasses import dataclass
@@ -14,6 +15,15 @@ from dataclasses import dataclass
 # LangSmith. PROMPT_SOURCE=hub:<tag> loads the Hub's tagged versions instead, at startup, to try a
 # prompt without a deploy; any prompt that can't be loaded, or whose variables don't match, falls
 # back to the code's version with a warning.
+#
+# --- By commit (feature 3, Section N #107) ---
+# A tag can be moved to another commit by anyone with write access to the Hub, so what "hub:prod"
+# loads can change without a deploy or a trace saying so. A commit can't change. Each prompt has its
+# own history on the Hub, so a commit is given per prompt: PROMPT_SOURCE=hub:report=1a2b3c4d (the hash
+# push_prompts.py prints, 8 or more hex characters; more prompts comma-separated, the others stay the
+# code's). Either way the commit actually loaded is printed at startup ("report 606b6fbd (hub:prod @
+# 1a2b3c4d)") and goes on every trace as prompt_commit, so a moved tag shows up. A commit that comes
+# back as another hash is refused (the code's version is used, with a warning).
 #
 # --- System and user parts (feature 3, Section E) ---
 # Each answer prompt has two parts. The SYSTEM part holds the role, the rules, the output format,
@@ -143,8 +153,9 @@ _PARTS = "\n\n--- user part ---\n\n"
 class Prompt:
     name: str
     template: str                 # the user part (all of it, for a prompt with one part)
-    source: str = "code"          # "code" or "hub:<tag>"
+    source: str = "code"          # "code" or "hub:<tag or commit>"
     system: str = ""              # the system part, sent as Gemini's system_instruction (feature 3 E)
+    commit: str = ""              # the Hub commit it was loaded from (feature 3 N #107); "" for the code's
 
     @property
     def version(self) -> str:
@@ -186,12 +197,53 @@ def parts_of(obj) -> tuple[str, str]:
     return "\n\n".join(system), "\n\n".join(user)
 
 
-def _from_hub(tag: str) -> dict[str, Prompt]:
+_COMMIT = re.compile(r"[0-9a-f]{8,64}")
+
+
+def is_commit(ref: str) -> bool:
+    """Whether a PROMPT_SOURCE ref is a commit hash (8-64 lowercase hex) rather than a tag."""
+    return bool(_COMMIT.fullmatch(ref))
+
+
+def commit_of(obj) -> str:
+    """The Hub commit a pulled prompt came from: langsmith puts it in the template's metadata."""
+    metadata = getattr(obj, "metadata", None) or {}
+    return str(metadata.get("lc_hub_commit_hash") or "")
+
+
+def refs_of(spec: str) -> dict[str, str]:
     """
-    The Hub's prompts tagged `tag`, each checked to fill the same variables as the code's.
-    Any one that fails keeps the code's version, with a warning: a bad pull never stops the app.
+    What PROMPT_SOURCE=hub:<spec> loads, as {prompt name: tag or commit}:
+      "prod"                           every prompt at the tag "prod" (or every prompt at one commit hash)
+      "report=1a2b3c4d,timeline=prod"  only these prompts, each at its own ref; the rest stay the code's
+    A commit belongs to one prompt's history on the Hub, so pinning by commit is the second form
+    (push_prompts.py prints each prompt's commit). Raises ValueError for a name that isn't a prompt.
     """
+    if "=" not in spec:
+        return {name: spec for name in CODE_PROMPTS}
+    refs = {}
+    for part in spec.split(","):
+        name, _, ref = part.partition("=")
+        name, ref = name.strip(), ref.strip()
+        if name not in CODE_PROMPTS or not ref:
+            raise ValueError(f"{part.strip()!r}: expected NAME=REF with NAME one of {', '.join(CODE_PROMPTS)}")
+        refs[name] = ref
+    return refs
+
+
+def _from_hub(spec: str) -> dict[str, Prompt]:
+    """
+    The Hub's prompts at the refs in `spec` (refs_of: a tag, or per prompt a tag or a commit hash, N #107),
+    each checked to fill the same variables as the code's. Any one that fails keeps the code's version,
+    with a warning: a bad pull never stops the app.
+    """
+    tag = spec                    # the warnings name the whole setting, as before N
     loaded = dict(CODE_PROMPTS)
+    try:
+        refs = refs_of(spec)
+    except ValueError as e:
+        print(f"[WARN] PROMPT_SOURCE=hub:{tag}: {e}. Using the code's prompts.")
+        return loaded
     try:
         # The key is in .env: without it LangSmith answers 400 (not 401) to every pull, which is how
         # this was found when the module was imported before anything else had loaded .env
@@ -202,14 +254,23 @@ def _from_hub(tag: str) -> dict[str, Prompt]:
     except Exception as e:
         print(f"[WARN] PROMPT_SOURCE=hub:{tag}: no LangSmith client ({type(e).__name__}: {e}). Using the code's prompts.")
         return loaded
-    for name, code in CODE_PROMPTS.items():
+    for name, ref in refs.items():
+        code = CODE_PROMPTS[name]
         try:
-            system, template = parts_of(client.pull_prompt(f"{code.hub_name}:{tag}"))
+            obj = client.pull_prompt(f"{code.hub_name}:{ref}")
+            system, template = parts_of(obj)
         except Exception as e:
             print(f"[WARN] PROMPT_SOURCE=hub:{tag}: couldn't load {code.hub_name} ({type(e).__name__}: {str(e)[:150]}). "
                   f"Using the code's version {code.version}.")
             continue
-        pulled = Prompt(name, template, source=f"hub:{tag}", system=system)
+        commit = commit_of(obj)
+        if is_commit(ref):
+            if commit and not commit.startswith(ref):
+                print(f"[WARN] PROMPT_SOURCE=hub:{tag}: {code.hub_name} came back as commit {commit[:12]}, not {ref}. "
+                      f"Using the code's version {code.version}.")
+                continue
+            commit = commit or ref
+        pulled = Prompt(name, template, source=f"hub:{ref}", system=system, commit=commit)
         if pulled.variables != code.variables:
             print(f"[WARN] PROMPT_SOURCE=hub:{tag}: {code.hub_name} fills {sorted(pulled.variables)}, the code needs "
                   f"{sorted(code.variables)}. Using the code's version {code.version}.")
@@ -228,11 +289,21 @@ def _load() -> dict[str, Prompt]:
         loaded = _from_hub(setting[4:])
     else:
         if setting != "code":
-            print(f"[WARN] PROMPT_SOURCE={setting!r} isn't 'code' or 'hub:<tag>'. Using the code's prompts.")
+            print(f"[WARN] PROMPT_SOURCE={setting!r} isn't 'code' or 'hub:<tag>' / 'hub:<name>=<commit>'. Using the code's prompts.")
         loaded = dict(CODE_PROMPTS)
-    print("[INFO] Prompts: " + ", ".join(f"{p.name} {p.version}" + ("" if p.source == "code" else f" ({p.source})")
-                                         for p in loaded.values()))
+    print("[INFO] Prompts: " + ", ".join(f"{p.name} {p.version}" + _origin(p) for p in loaded.values()))
     return loaded
+
+
+def _origin(p: Prompt) -> str:
+    """" (hub:prod @ 1a2b3c4d)" for a Hub prompt loaded by tag (the commit the tag pointed at, N #107),
+    " (hub:1a2b3c4d)" for one loaded by commit, "" for the code's."""
+    if p.source == "code" or p.source == "patched":
+        return ""
+    ref = p.source.removeprefix("hub:")
+    if p.commit and not is_commit(ref):
+        return f" ({p.source} @ {p.commit[:8]})"
+    return f" ({p.source})"
 
 
 PROMPTS = _load()

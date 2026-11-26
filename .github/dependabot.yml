@@ -1,0 +1,26 @@
+# Feature 3 N #105: GitHub reads requirements.txt (every package pinned, #103) into the repository's
+# dependency graph, and Dependabot alerts when a new advisory names a pinned version, so a vulnerability
+# is reported without anyone running scripts/audit_deps.ps1. Alerts themselves are switched on in the
+# repository's Settings -> Advanced Security (Dependency graph + Dependabot alerts); this file adds the
+# update pull requests.
+#
+# Update PRs: one grouped PR a month for version updates, so the pins don't go stale, and Dependabot's
+# security-update PRs (when switched on in the same settings page) as soon as a fix exists. A release
+# must be 7 days old before Dependabot proposes it, the same wait as pin_requirements.py --releases:
+# hijacked releases are usually pulled within days. A PR is only a proposal: it's merged after the tests
+# pass on .local/venv with the new versions and requirements.txt is rewritten by pin_requirements.py.
+version: 2
+updates:
+  - package-ecosystem: "pip"
+    directory: "/"
+    schedule:
+      interval: "monthly"
+    open-pull-requests-limit: 1
+    cooldown:
+      default-days: 7
+    groups:
+      python-packages:
+        patterns:
+          - "*"
+    commit-message:
+      prefix: "chore(deps)"
