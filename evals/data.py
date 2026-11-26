@@ -5,6 +5,7 @@ Shared by review_labels.py, build_datasets.py and the experiment runner.
 Labels come in two kinds, per topic: proposed (drafted by Claude, each with a reason) and reviewed
 (saved from the review page by a person). A reviewed file replaces the proposed one completely.
 """
+import hashlib
 import json
 from pathlib import Path
 
@@ -12,9 +13,40 @@ ROOT = Path(__file__).resolve().parents[1]
 EVALS = ROOT / ".local" / "evals"
 VIEWS = ("report", "timeline", "contradictions")
 
+# Feature 3 N #109: every file read here, with the sha256 of exactly the text read. The experiment
+# runner saves them with each run, so a run whose topics, cases or labels changed (a label reviewed
+# again between two runs, say) shows it, instead of the metric moving for no visible reason.
+_hashes: dict[str, str] = {}
+
+
+def file_hash(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()[:16]
+
+
+def name_of(path: Path) -> str:
+    """A path as runs record it: relative to .local/evals (or to the repo), with forward slashes."""
+    path = Path(path).resolve()
+    for base in (EVALS.resolve(), ROOT.resolve()):
+        try:
+            return path.relative_to(base).as_posix()
+        except ValueError:
+            continue
+    return path.as_posix()
+
 
 def _read(path: Path):
-    return json.loads(path.read_text(encoding="utf-8"))
+    text = path.read_text(encoding="utf-8")
+    _hashes[name_of(path)] = file_hash(text)
+    return json.loads(text)
+
+
+def files_read() -> dict[str, str]:
+    """{file: sha256[:16]} of every data file read so far in this process, sorted."""
+    return dict(sorted(_hashes.items()))
+
+
+def forget_reads():
+    _hashes.clear()
 
 
 def topics() -> list[dict]:

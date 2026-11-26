@@ -302,6 +302,9 @@ async def main():
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(json.dumps(data, separators=(",", ":")), encoding="utf-8")
     print(f"Wrote {out.relative_to(ROOT)} ({out.stat().st_size / 1024:.0f} KB)")
+    # Feature 3 N #108: the app loads it only once its checksum is pinned in the code
+    print(f"The app won't load it until classifier.PINNED says so. After checking the numbers above, set in "
+          f"services/safety/classifier.py:\n    \"{args.model}\": \"{data['checksum']}\",")
     from services import usage
     await usage.drain()
 

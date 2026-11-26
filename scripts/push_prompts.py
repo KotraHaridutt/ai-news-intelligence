@@ -113,6 +113,11 @@ def main(argv=None):
     results = push(client, actions, args.tag, _git_commit())
     for r in results:
         print(f"  {r['name']:22} {r['version']}  {r['action']:9}  commit {r['commit']}" + (f"  tag {args.tag}" if args.tag else ""))
+    # Feature 3 N #107: a commit can't be moved like a tag; each prompt has its own commits
+    by_hub_name = {p.hub_name: name for name, p in prompts.CODE_PROMPTS.items()}
+    pins = ",".join(f"{by_hub_name[r['name']]}={r['commit']}" for r in results if r.get("commit") and r["name"] in by_hub_name)
+    if pins:
+        print(f"To load exactly these commits: PROMPT_SOURCE=hub:{pins}")
     return results
 
 
