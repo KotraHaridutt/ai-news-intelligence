@@ -1,12 +1,15 @@
 from dataclasses import asdict, dataclass
 
 from services import observability
+from services.safety import summary
 
 # --- Safety events (feature 3, Section B #12) ---
 # One shape for what every guard decided, so safety can be measured the same way everywhere.
 # Each event goes on the current trace span (metadata "safety", a list, and a tag
 # safety:<check>:<verdict>), into the request's totals, and into the log as one [SAFETY] line.
 # An event never carries the text that was checked: only scores and a short hash of the text.
+# Section O: the request also keeps its events (summary.collect), and when the request ends its root
+# run gets one summary, the tags of every check and the safety.* feedback scores (summary.py).
 
 VERDICTS = ("allow", "flag", "block")
 
@@ -56,6 +59,9 @@ def record(event: SafetyEvent):
     if run is not None:
         earlier = (run.metadata or {}).get("safety") or []
         run.add_metadata({"safety": [*earlier, event.as_dict()]})
-        run.add_tags([f"safety:{event.check}:{event.verdict}"])
+        tag = f"safety:{event.check}:{event.verdict}"
+        if tag not in (run.tags or []):           # a check run twice on one span: one tag (Section O)
+            run.add_tags([tag])
     observability.add_totals(**{f"safety_{event.verdict}s": 1, "safety_ms": round(event.ms)})
+    summary.collect(event)
     print(event.log_line())

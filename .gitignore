@@ -3,6 +3,7 @@ __pycache__/
 *.py[cod]
 .pytest_cache/
 
+.claude/worktrees/
 docs/
 gaps/
 implemented/

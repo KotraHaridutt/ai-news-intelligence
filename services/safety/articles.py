@@ -148,7 +148,9 @@ async def clean_articles(articles: list[dict], splitter, where: str, max_chunks:
         return None
     observability.annotate(injection_scan={**found.summary(), "seconds": round(time.perf_counter() - started, 2),
                                            "enforced": bool(decision and decision.enforced)})
-    observability.add_totals(injection_chunks_flagged=found.flagged, injection_removed=found.removals if decision.enforced else 0)
+    # Section O: what the scan would remove in monitor mode too (injection_found), and what it did remove
+    observability.add_totals(injection_chunks_flagged=found.flagged, injection_found=found.removals,
+                             injection_removed=found.removals if decision.enforced else 0)
     if found.removals:
         print(f"[INFO] Injection scan ({where}): {decision.label}" + ("; removed" if decision.enforced else "; monitor mode, kept"))
     return cleaned(articles, found) if decision.enforced else None
