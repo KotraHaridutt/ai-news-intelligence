@@ -8,6 +8,7 @@ import httpx
 from dotenv import load_dotenv
 
 from services import cache_service, observability
+from services.safety import summary
 
 # --- Clef client (feature 3, Section B #15a) ---
 # Clef (@cf/cloudflare/clef) is Cloudflare's decision model on Workers AI: it takes text in `state`
@@ -198,6 +199,8 @@ def _add_neurons(neurons: float, failed: bool = False, usage: str = "clef"):
     if _spent["day"] != day:
         _spent.update(day=day, neurons=0.0)
     _spent["neurons"] += neurons
+    if usage == "clef":
+        summary.note_clef(neurons=neurons)            # Section O: the request's own Clef neurons
     _check_levels()
     try:
         task = asyncio.get_running_loop().create_task(_count_neurons(day, neurons, failed, usage))
@@ -364,25 +367,36 @@ async def _call_once(questions: dict, state: dict, timeout: float, label: str) -
             "clef", run_type="tool",
             inputs={"label": label, "questions": list(questions), "state_chars": {k: len(v) for k, v in state.items()}},
             metadata={"ls_provider": "cloudflare", "ls_model_name": MODEL, "estimated_state_tokens": estimated}) as run:
-        response, neurons, attempt = await post_run(payload, timeout, run, skip=backing_off)
-
         try:
-            result = response.json()["result"]
-            raw_answers = result["answers"]
-        except (ValueError, KeyError, TypeError) as e:
-            raise ClefError("bad_response", f"no result in the reply ({type(e).__name__})") from e
-        answers = {name: _parse(name, raw_answers.get(name)) for name in questions}
-        _call_worked()
-        input_tokens = int((result.get("usage") or {}).get("input_tokens") or 0)
-        reply = {"answers": answers, "input_tokens": input_tokens, "neurons": neurons, "model": result.get("model"),
-                 "log_id": response.headers.get("cf-aig-log-id")}
-        run.add_metadata({"neurons": neurons, "input_tokens": input_tokens, "model_reported": result.get("model"),
-                          "cf_aig_log_id": reply["log_id"], "attempts": attempt})
-        run.add_outputs({"answers": {n: a.get("noul", a.get("probabilities")) for n, a in answers.items()}})
-        # Clef doesn't say when it cut the state; a reply at the window's edge is the only sign
-        if input_tokens >= CONTEXT_TOKENS - CUT_MARGIN_TOKENS:
-            raise ClefError("cut", f"{input_tokens} input tokens: the state may have been cut")
-        return reply
+            return _read_reply(questions, run, await post_run(payload, timeout, run, skip=backing_off))
+        except ClefError:
+            summary.note_clef(failed=True)            # Section O: the request's Clef errors
+            raise
+
+
+def _read_reply(questions: dict, run, posted) -> dict:
+    """The typed answers of one Clef response, recorded on its span. Raises ClefError (bad_response, cut)."""
+    response, neurons, attempt = posted
+    try:
+        result = response.json()["result"]
+        raw_answers = result["answers"]
+    except (ValueError, KeyError, TypeError) as e:
+        raise ClefError("bad_response", f"no result in the reply ({type(e).__name__})") from e
+    answers = {name: _parse(name, raw_answers.get(name)) for name in questions}
+    _call_worked()
+    input_tokens = int((result.get("usage") or {}).get("input_tokens") or 0)
+    reply = {"answers": answers, "input_tokens": input_tokens, "neurons": neurons, "model": result.get("model"),
+             "log_id": response.headers.get("cf-aig-log-id")}
+    run.add_metadata({"neurons": neurons, "input_tokens": input_tokens, "model_reported": result.get("model"),
+                      "cf_aig_log_id": reply["log_id"], "attempts": attempt})
+    # Section O #112a: the request's summary lists its Clef calls, so one copy of a log id finds the
+    # full request and response in the AI Gateway's logs
+    summary.note_clef(call=True, log_id=reply["log_id"])
+    run.add_outputs({"answers": {n: a.get("noul", a.get("probabilities")) for n, a in answers.items()}})
+    # Clef doesn't say when it cut the state; a reply at the window's edge is the only sign
+    if input_tokens >= CONTEXT_TOKENS - CUT_MARGIN_TOKENS:
+        raise ClefError("cut", f"{input_tokens} input tokens: the state may have been cut")
+    return reply
 
 
 async def ask(state: dict[str, str], questions: dict[str, dict], timeout: float, label: str = "") -> dict:

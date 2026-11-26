@@ -470,8 +470,11 @@ def _root_start(run) -> str | None:
         return None
 
 
-# Where answers to look at go: every 👎 (added by the rating endpoint) and every answer that
-# failed a code check (added by a LangSmith rule, scripts/setup_review_queue.py). Section J #71.
+# Where answers to look at go: every 👎 (added by the rating endpoint), every answer that failed a
+# code check and a sample of the requests a safety check blocked or flagged (feature 3 O #115), both
+# added by LangSmith rules (scripts/setup_review_queue.py). Section J #71.
+REVIEW_QUEUE_DESCRIPTION = ("Answers to review: every 👎 from a reader, every answer that failed a code check, "
+                            "and a sample of requests a safety check blocked or flagged.")
 REVIEW_QUEUE = "ai-news-review"
 _review_queue_id: str | None = None
 
@@ -482,7 +485,7 @@ def review_queue_id() -> str:
     if _review_queue_id is None:
         found = list(_client.list_annotation_queues(name=REVIEW_QUEUE))
         queue = found[0] if found else _client.create_annotation_queue(
-            name=REVIEW_QUEUE, description="Answers to review: every 👎 from a reader and every answer that failed a code check.")
+            name=REVIEW_QUEUE, description=REVIEW_QUEUE_DESCRIPTION)
         _review_queue_id = str(queue.id)
     return _review_queue_id
 
@@ -609,6 +612,15 @@ def _record_failure(run, e: BaseException):
 # Called when a request's root span opens (feature 3 L: the limits middleware's events for a request it
 # served in monitor mode go on that request's trace). Registered, like the redactors above.
 _request_hooks: list = []
+# Called when it closes, inside it, on success and on failure alike: fn(run, error) with error None on
+# success (feature 3 O #111-#112: the request's safety summary, root tags and feedback).
+_request_end_hooks: list = []
+
+# Per-request working state for other modules (feature 3 O: the request's safety events), set by
+# request_span like the totals: work started inside the request (the build task) sees the same dict.
+# Unlike the totals it is never recorded as it is: a module reads its part at the end and records
+# what it chooses.
+_request_state: ContextVar[dict | None] = ContextVar("request_state", default=None)
 
 
 def add_request_hook(fn):
@@ -617,12 +629,31 @@ def add_request_hook(fn):
         _request_hooks.append(fn)
 
 
+def add_request_end_hook(fn):
+    """Adds fn(run, error) to what runs when a request's root span closes. Adding the same fn twice does nothing."""
+    if fn not in _request_end_hooks:
+        _request_end_hooks.append(fn)
+
+
+def request_state() -> dict | None:
+    """The current request's working state (a dict), or None outside a request."""
+    return _request_state.get()
+
+
 def _run_request_hooks():
     for fn in _request_hooks:
         try:
             fn()
         except Exception as e:          # a hook's bug must not fail the request
             print(f"[WARN] A request hook failed: {type(e).__name__}: {e}")
+
+
+def _run_request_end_hooks(run, error: BaseException | None):
+    for fn in _request_end_hooks:
+        try:
+            fn(run, error)
+        except Exception as e:          # a hook's bug must not fail the request (or hide its error)
+            print(f"[WARN] A request end hook failed: {type(e).__name__}: {e}")
 
 
 def request_span(name: str, view: str | None = None):
@@ -638,6 +669,7 @@ def request_span(name: str, view: str | None = None):
             totals = {}
             token = _totals.set(totals)
             open_runs_token = _open_llm_runs.set({})
+            state_token = _request_state.set({})
             try:
                 # LangSmith passes a span's tags and metadata down to the runs started inside it, so
                 # the view tag marks every run of that answer ("all report runs"); requests themselves
@@ -652,17 +684,20 @@ def request_span(name: str, view: str | None = None):
                         result = await fn(*args, **kwargs)
                     except BaseException as e:
                         _record_failure(run, e)
+                        _run_request_end_hooks(run, e)
                         _record_totals(run, totals)
                         raise
                     if isinstance(result, dict) and result.get("watch_id") and "thread_id" not in metadata:
                         run.add_metadata({"thread_id": short_hash(result["watch_id"])})
                     run.add_outputs({"status": 200, "seconds": round(time.perf_counter() - started, 2),
                                      "response": summarize(result)})
+                    _run_request_end_hooks(run, None)
                     _record_totals(run, totals)
                     return result
             finally:
                 _totals.reset(token)
                 _open_llm_runs.reset(open_runs_token)
+                _request_state.reset(state_token)
         return wrapper
     return decorate
 

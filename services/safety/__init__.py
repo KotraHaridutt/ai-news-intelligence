@@ -21,6 +21,8 @@ LLM safety (feature 3). The shared core every guard uses (Section B):
   agency       no tool is bound to any chat model: walked at startup and in the tests (Section M #96)
   network      the scraper's SSRF guard: public addresses only, checked on every hop and connection (M #98)
   endpoints    JSON bodies only (415) and SAFETY_ORIGIN, requests from other sites (M #100)
+  summary      one safety summary per request on its root run: every check's verdict, the tags, the safety.*
+               feedback scores, the time safety took, the request's Clef calls and gateway log ids (Section O)
 
 The guards themselves (Sections C-L) call check() with a run() that usually calls judge().
 """

@@ -8,6 +8,7 @@ Everything is defined here, so it can be rebuilt exactly; running it again repla
   .local/venv/Scripts/python.exe scripts/setup_monitoring.py --project ai-news-dev              prices and dashboards, then
                                                                                                the alert settings to enter in the UI
   .local/venv/Scripts/python.exe scripts/setup_monitoring.py --markdown                         the doc's chart and alert tables
+  .local/venv/Scripts/python.exe scripts/setup_monitoring.py --markdown safety                  ... of the safety dashboard (feature 3 O)
 
 1. Prices (#73): services/usage.MODEL_PRICES mirrored into the workspace's model price map, so
    LangSmith's own cost numbers match ours, including the dated price change (2027-01-01).
@@ -16,6 +17,10 @@ Everything is defined here, so it can be rebuilt exactly; running it again repla
 3. Alerts (#76): three alert rules, sent to ntfy.sh (NTFY_ALERT_TOPIC in .env), which turns
    LangSmith's alert JSON into a phone notification. They are made in the LangSmith UI: the API
    answered 200 to every create but kept none (2026-10-20), so this prints the exact settings.
+4. Feature 3, Section O (#113, #114): a fourth dashboard, "ai-news · Safety", and five safety alerts
+   (printed with the others). They read what services/safety/summary.py writes on each request's root
+   run: tags safety:<check>:<verdict>, safety:<check>:enforced, safety:block / flag / enforced /
+   fallback / failed_open, clef_budget_warning / _fallback, and the safety.* feedback keys.
 
 How LangSmith's chart API behaves (found in Section K): saved charts must use its "V2" definitions
 (metric_definition, filter_definition), but its public API returns data only for "V1" series
@@ -66,7 +71,7 @@ def name_in(names) -> str:
 
 
 # A series, once: {"name", "kind", "filter", "group", ...}. kind: count | sum (field) |
-# percentile (p) | error_rate | feedback_avg (key) | feedback_count (key).
+# percentile (p) | error_rate | feedback_avg (key) | feedback_count (key) | feedback_sum (key, feature 3 O).
 def series(name, kind, filter=None, group=None, **extra):
     return {"name": name, "kind": kind, "filter": filter, "group": group, **extra}
 
@@ -114,7 +119,7 @@ def to_v1(s: dict) -> dict:
         out = {"metric": "error_rate"}
     elif kind == "feedback_avg":
         out = {"metric": "feedback_score_avg", "feedback_key": s["key"]}
-    else:                                              # feedback_count
+    else:                                              # feedback_count, feedback_sum (V1 has no sum: the count checks the filter)
         out = {"metric": "feedback", "feedback_key": s["key"]}
     out.update(name=s["name"], filters={"filter": s["filter"] or ROOT_FILTER})
     if s["group"]:
@@ -136,6 +141,10 @@ def to_v2(s: dict, project_id: str) -> dict:
         metric = {"type": "ratio", "numerator": {"type": "count", "filter": ERRORED}, "denominator": {"type": "count"}}
     elif kind == "feedback_avg":
         metric = {"type": "avg", "field": "feedback_score", "params": {"feedback_key": s["key"]}}
+    elif kind == "feedback_sum":
+        # Feature 3 O: like avg, summed (Clef neurons per day). The API can't check it (V2 returns no data
+        # there): whether it draws is checked in the UI, as feature 2 K did for every chart
+        metric = {"type": "sum", "field": "feedback_score", "params": {"feedback_key": s["key"]}}
     else:
         metric = {"type": "count", "entity": "feedback", "params": {"feedback_key": s["key"]}}
     out = {"name": s["name"], "metric_definition": metric,
@@ -275,6 +284,133 @@ def alert_rules() -> list[dict]:
     ]
 
 
+# --- Safety (feature 3, Section O #113, #114) ---
+# What services/safety/summary.py puts on each request's root run. A check's tag is also on the step
+# where it ran, so every series is filtered to root runs: one count per request.
+# The checks by where they sit: services/safety/settings.CHECKS, plus the two that only record events and
+# always act: "gemini" (Gemini's own filter, F) and "ssrf" (a scrape refused for a private address, M #98).
+QUERY_CHECKS = ["origin", "intent", "text_shape", "pii", "names", "comment", "rate_limit"]
+ARTICLE_CHECKS = ["ssrf", "injection", "relevance", "coverage"]
+ANSWER_CHECKS = ["canary", "output", "faithfulness", "sensitive_topic", "toxicity", "leak", "balance", "gemini"]
+EVENT_ONLY_CHECKS = ["gemini", "ssrf"]
+# In enforce mode, a block of these refuses the request or withholds the answer (origin isn't here: in enforce
+# its middleware refuses before a trace starts, so the series would always be 0; its refusals are in the log) ...
+REFUSING_CHECKS = ["intent", "text_shape", "rate_limit", "coverage", "canary", "toxicity", "gemini"]
+# ... and of these it changes what is used or shown: removes, masks, swaps, drops a page, or adds a note
+CHANGING_CHECKS = ["pii", "names", "ssrf", "injection", "relevance", "output", "faithfulness", "sensitive_topic"]
+# Checks whose events can be "flag": the meaning checks (uncertain band, or failed open) and I's format flags
+FLAGGING_CHECKS = ["intent", "text_shape", "comment", "names", "injection", "relevance", "coverage",
+                   "output", "faithfulness", "sensitive_topic", "toxicity", "leak", "balance"]
+CLEF = 'eq(name, "clef")'                           # each Clef call is a span named clef (B #15a)
+FAITHFULNESS = "safety.faithfulness"                # J #74's score, sent by faithfulness.verify
+
+
+def tagged(tag: str) -> str:
+    return f'and({ROOT_FILTER}, has(tags, "{tag}"))'
+
+
+def per_check(checks, verdict: str) -> list[dict]:
+    """One count per check: requests whose root run has safety:<check>:<verdict>."""
+    return [count(check, tagged(f"safety:{check}:{verdict}")) for check in checks]
+
+
+def safety_dashboard(project: str) -> dict:
+    """The fourth dashboard: what the safety checks decided, what they cost, and who decided."""
+    return {
+        "title": f"{PREFIX} · Safety · {project}",
+        "description": "Feature 3: each safety check's verdicts per day, what was enforced, injection and personal data finds, "
+                       "Gemini's blocks, answer support, the time and Clef neurons safety costs, and how often the fallback decided (#113).",
+        "charts": [
+            chart("Requests safety acted on (period)", "kpi", [count("requests", tagged("safety:enforced"))],
+                  "Requests a check refused or changed (enforce mode). In monitor mode this stays 0: read the blocks below."),
+            chart("Requests with a block, a flag, or an action", "bar",
+                  [count("a block", tagged("safety:block")), count("a flag", tagged("safety:flag")),
+                   count("acted on", tagged("safety:enforced"))],
+                  "Block: some check's verdict was block (in monitor mode it would have acted). Flag: uncertain, or no engine could decide."),
+            chart("Blocks per day: query checks", "bar", per_check(QUERY_CHECKS, "block"),
+                  "Requests sent by another website (origin, monitor mode: in enforce they're refused before a trace), intent and text shape "
+                  "of the query, personal data in the query or a comment (pii), names in comments, per-visitor limits."),
+            chart("Blocks per day: article checks", "bar", per_check(ARTICLE_CHECKS, "block"),
+                  "Scrapes refused for a private or internal address (ssrf, always on), article text written to the AI (injection), "
+                  "off-topic chunks (relevance), every chunk off-topic (coverage)."),
+            chart("Blocks per day: answer checks", "bar", per_check(ANSWER_CHECKS, "block"),
+                  "The canary in an answer, outside links or images, unsupported sentences, loaded wording, leaks, one-sidedness, Gemini's own filter."),
+            chart("Flags per day: query and article checks", "bar",
+                  per_check([c for c in FLAGGING_CHECKS if c in QUERY_CHECKS + ARTICLE_CHECKS], "flag"),
+                  "Uncertain verdicts and checks that failed open: where to look for false alarms (#115)."),
+            chart("Flags per day: answer checks", "bar",
+                  per_check([c for c in FLAGGING_CHECKS if c in ANSWER_CHECKS], "flag"),
+                  "Uncertain verdicts, sensitive topics, cut or malformed answers (output), checks that failed open."),
+            chart("Enforced: requests refused or answers withheld", "bar", per_check(REFUSING_CHECKS, "enforced"),
+                  "The user got an error message instead of an answer. Cross-site requests (origin) and the middleware's 429s are refused "
+                  "before a trace starts: they're only in the log."),
+            chart("Enforced: text removed, masked, swapped or noted", "bar", per_check(CHANGING_CHECKS, "enforced"),
+                  "The user got an answer, changed: a page not fetched (ssrf), injected text removed, personal data masked, chunks swapped, "
+                  "links dropped, a note added."),
+            chart("Injection scan per request", "line",
+                  [feedback_avg("would remove", "safety.injection_found"), feedback_avg("removed", "safety.injection_removed")],
+                  "Sentences, titles and outlets the scan found written to the AI, and those removed (enforce). Averages over requests that scanned."),
+            chart("Personal data found per request", "line", [feedback_avg("places", "safety.pii_found", by("name"))],
+                  "How many of the places checked (query, comment, answer, texts) held an email, phone, card, Aadhaar, PAN, IBAN or IP."),
+            chart("Rate limits per day", "bar",
+                  [count("429 on a traced request", tagged("error:429")), count("over a limit (monitor)", tagged("safety:rate_limit:block"))],
+                  "In enforce mode the limits middleware refuses before a trace starts, so those 429s are only in the log; "
+                  "fresh-build 429s (inside the pipeline) and monitor-mode overs are here."),
+            chart("Gemini's own blocks per day", "bar", [count("blocked", tagged("safety:gemini:block"), by("name"))],
+                  "Gemini's filter (F) refused the prompt (422) or the answer (502). Its reason and ratings are the event's label."),
+            chart("Answer support over time", "line", [feedback_avg("supported share", FAITHFULNESS, by("name"))],
+                  "Share of an answer's sentences Clef matched to its sources (J). A drop after a prompt change is worth a look."),
+            chart("Time safety added per request (s)", "line", [feedback_avg("seconds", "safety.seconds", by("name"))],
+                  "Wall time during which a safety check ran (checks side by side counted once)."),
+            chart("Reader ratings where safety acted or flagged: share of 👍", "line",
+                  [series("acted on", "feedback_avg", tagged("safety:enforced"), key="user_rating"),
+                   series("flagged", "feedback_avg", tagged("safety:flag"), key="user_rating"),
+                   series("a block (monitor)", "feedback_avg", tagged("safety:block"), key="user_rating"),
+                   feedback_avg("all answers", "user_rating")],
+                  "A 👎 rate on changed answers well above 'all answers' means a check is hurting answers."),
+            chart("Clef neurons per day (free: 10,000)", "bar",
+                  [series("neurons", "feedback_sum", ROOT_FILTER, key="safety.clef_neurons")],
+                  "Neurons the safety checks spent, summed over requests. The reranker's Cloudflare share counts against the same 10,000 "
+                  "(the startup line and Redis hold the exact day total); warning at 7,000, fallback at 9,500."),
+            chart("Clef neurons per request", "line", [feedback_avg("neurons", "safety.clef_neurons", by("name"))],
+                  "A fresh report measured ~505 (K); a cached view far less. A jump means more text is being judged."),
+            chart("Clef latency per call, p50 and p95 (s)", "line", [latency("p50", 0.5, CLEF), latency("p95", 0.95, CLEF)],
+                  "Each Clef call's span: the slot wait, the call and its retry. Query checks time out at 2 s, chunks at 3 s, others 5 s."),
+            chart("Clef calls and errors", "bar", [count("calls", CLEF), count("failed", f"and({CLEF}, {ERRORED})")],
+                  "A failed call (timeout, 429/5xx after a retry, an unreadable or cut reply) sends its check to the fallback."),
+            chart("Who decided: fallback, fail-open, budget", "bar",
+                  [count("fallback decided a check", tagged("safety:fallback")), count("no engine (failed open)", tagged("safety:failed_open")),
+                   count("crossed the 9,500 switch", tagged("clef_budget_fallback"))],
+                  "Requests where the embedding classifier decided at least one check, where no engine could (#18), and the one that crossed the neuron switch."),
+            chart("Share of meaning checks the fallback decided", "line", [feedback_avg("fallback share", "safety.fallback_share")],
+                  "0 when Clef decided everything. An alert fires when it's most checks for an hour."),
+        ],
+    }
+
+
+def all_dashboards(project: str) -> list[dict]:
+    """Feature 2's three dashboards and feature 3's safety dashboard: what setup and --preview build."""
+    return dashboards(project) + [safety_dashboard(project)]
+
+
+def safety_alert_rules() -> list[dict]:
+    """Feature 3 O #114. The tags are on the root run (summary.py), so Is Trace and the tag together match."""
+    return [
+        {"name": f"{PREFIX}: canary leaked", "metric": "Run Count", "aggregation": "Count", "condition": "at least 1",
+         "window_minutes": 15, "filter": "Is Trace = true, Tag = safety:canary:block"},
+        {"name": f"{PREFIX}: safety blocks spiking", "metric": "Run Count", "aggregation": "Count", "condition": "at least 10",
+         "window_minutes": 15, "filter": "Is Trace = true, Tag = safety:block"},
+        # Alerts can't group by query: the runs link lists the requests, and their queries show the topic
+        {"name": f"{PREFIX}: injection found again and again", "metric": "Run Count", "aggregation": "Count", "condition": "at least 3",
+         "window_minutes": 60, "filter": "Is Trace = true, Tag = safety:injection:block"},
+        # Set once a day, on the request that crossed the 7,000 warning level (clef._check_levels)
+        {"name": f"{PREFIX}: Clef past its neuron warning", "metric": "Run Count", "aggregation": "Count", "condition": "at least 1",
+         "window_minutes": 15, "filter": "Is Trace = true, Tag = clef_budget_warning"},
+        {"name": f"{PREFIX}: fallback deciding most checks", "metric": "Feedback Score (key safety.fallback_share)",
+         "aggregation": "Average", "condition": "greater than 0.5", "window_minutes": 60, "filter": "Is Trace = true"},
+    ]
+
+
 def ntfy_url(topic: str) -> str:
     """LangSmith posts its alert JSON (alert_rule_name, triggered_metric_value, ...) and appends its own
     keys; it substitutes nothing. ntfy's templates (tpl=yes) read those keys into the notification.
@@ -296,6 +432,9 @@ def alert_settings(project: str, topic: str | None) -> str:
              "      Body:    {}",
              "      Press Test before saving: the phone gets a notification titled with the rule's name."]
     for r in alert_rules():
+        lines.append(f"    - {r['name']}: {r['metric']} / {r['aggregation']}, {r['condition']}, {r['window_minutes']} min, filter: {r['filter']}")
+    lines.append("    Safety (feature 3 O), with the same channel, URL, headers and body:")
+    for r in safety_alert_rules():
         lines.append(f"    - {r['name']}: {r['metric']} / {r['aggregation']}, {r['condition']}, {r['window_minutes']} min, filter: {r['filter']}")
     return "\n".join(lines)
 
@@ -329,7 +468,7 @@ def preview(api, project_id: str, days: int = 14) -> int:
     """Runs every series' V1 form on the last `days` days: a filter or grouping LangSmith doesn't accept fails here."""
     now = datetime.now(timezone.utc)
     bucket = {"start_time": (now - timedelta(days=days)).isoformat(), "end_time": now.isoformat(), "stride": {"days": 1}}  # max 7 days
-    boards = dashboards("preview")
+    boards = all_dashboards("preview")
     # Filters used only inside a V2 metric get a chart of their own here
     boards.append({"title": "x · V2-only filters", "charts": [chart("error-rate numerator", "bar", [count("errored", f"and({ROOT_FILTER}, {ERRORED})")], "")]})
     bad = 0
@@ -385,7 +524,7 @@ def setup_dashboards(api, project: str, project_id: str, dry_run: bool) -> list[
     sections = api.call("GET", "/charts/section", params={"limit": 100}) or []
     sections = sections if isinstance(sections, list) else sections.get("items", [])
     ids = []
-    for index, board in enumerate(dashboards(project)):
+    for index, board in enumerate(all_dashboards(project)):
         old = [s for s in sections if s.get("title") == board["title"]]
         if dry_run:
             print(f"[K] dashboard '{board['title']}': would {'replace' if old else 'create'} ({len(board['charts'])} charts)")
@@ -406,14 +545,19 @@ def describe(s: dict) -> str:
     kind = s["kind"]
     return {"count": "runs", "sum": f"sum of {s.get('field')}", "percentile": f"p{round(s.get('p', 0) * 100)} latency",
             "error_rate": "errored / all", "feedback_avg": f"avg feedback {s.get('key')}",
-            "feedback_count": f"count of feedback {s.get('key')}"}[kind]
+            "feedback_count": f"count of feedback {s.get('key')}", "feedback_sum": f"sum of feedback {s.get('key')}"}[kind]
 
 
-def markdown() -> str:
-    """The doc's tables (#77), made from the definitions above, so the doc can't drift from what's built."""
+def markdown(part: str = "feature2") -> str:
+    """The doc's tables (#77), made from the definitions above, so the doc can't drift from what's built.
+    part "feature2": feature 2 K's three dashboards and alerts; "safety": feature 3 O's dashboard and alerts."""
     cell = lambda text: (text or "").replace("|", "\\|")
     lines = []
-    for board in dashboards("<project>"):
+    if part == "feature2":
+        boards, rules = dashboards("<project>"), alert_rules()
+    else:
+        boards, rules = [safety_dashboard("<project>")], safety_alert_rules()
+    for board in boards:
         lines += [f"#### {board['title']}", "", board["description"], "",
                   "| # | Chart | Type | Series: metric | Filter | Grouped by |", "|---|---|---|---|---|---|"]
         for n, ch in enumerate(board["charts"], 1):
@@ -423,7 +567,7 @@ def markdown() -> str:
                              f"{cell(s['name'])}: {describe(s)} | `{cell(s['filter'] or ROOT_FILTER)}` | {group} |")
         lines.append("")
     lines += ["#### Alerts (made in the UI)", "", "| Alert | Metric / aggregation | Fires when | Window | Filter |", "|---|---|---|---|---|"]
-    for r in alert_rules():
+    for r in rules:
         lines.append(f"| {r['name']} | {r['metric']} / {r['aggregation']} | {r['condition']} | {r['window_minutes']} min | {cell(r['filter'])} |")
     return "\n".join(lines)
 
@@ -448,12 +592,13 @@ def main(project: str, dry_run: bool, do_preview: bool):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="LangSmith prices, dashboards and alerts for a project (feature 2, Section K).")
     parser.add_argument("--project", help="e.g. ai-news-dev or ai-news-prod (required except with --markdown)")
-    parser.add_argument("--markdown", action="store_true", help="print the doc's chart and alert tables; no API calls")
+    parser.add_argument("--markdown", nargs="?", const="feature2", choices=["feature2", "safety"],
+                        help="print the doc's chart and alert tables (feature 2's, or 'safety': feature 3 O's); no API calls")
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--preview", action="store_true", help="run every series' filter and grouping on recent data; create nothing")
     a = parser.parse_args()
     if a.markdown:
-        print(markdown())
+        print(markdown(a.markdown))
     elif not a.project:
         parser.error("--project is required")
     else:

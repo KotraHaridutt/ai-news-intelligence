@@ -6,7 +6,7 @@ from dataclasses import dataclass, field
 import numpy as np
 
 from services import observability
-from services.safety import clef, facts, questions, settings
+from services.safety import clef, facts, questions, settings, summary
 from services.safety.engine import Decision
 from services.safety.guard import check
 
@@ -262,6 +262,9 @@ async def check_answer(where: str, text: str, rows: list[dict]) -> dict:
         return {"notes": []}
     started = time.perf_counter()
     j = await judge_answer(text, rows, support=support_on, topic=topic_on, review=review)
+    # Section O #112: the one call that judges the answer runs before the checks below read it, so its
+    # time is noted here (each check's own event times only its reading)
+    summary.note_time(started)
     notes = []
 
     if support_on:
