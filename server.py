@@ -7,6 +7,7 @@ for _stream in (sys.stdout, sys.stderr):
         _stream.reconfigure(errors="backslashreplace")
 
 import asyncio
+import os
 from contextlib import asynccontextmanager
 from pathlib import Path
 from fastapi import FastAPI, Request
@@ -24,15 +25,36 @@ from services import cache_service, errors, feedback_service, follow_service, re
 from services.errors import AppError
 from services.pipeline_service import get_pipeline_data, build_time
 from services.rag_service import run_rag_query_with_store
-from services.safety import limits, output, privacy
+from services.safety import endpoints, limits, output, privacy
 from services.safety.input_rails import check_query, checked_query
 
 BASE_DIR = Path(__file__).resolve().parent
+
+# --- API docs (feature 3, Section M #101) ---
+# FastAPI serves /docs, /redoc and /openapi.json by default: a map of every endpoint and the fields it
+# takes, for anyone. They're on only when APP_ENV=dev is set (.env.example has it; render.yaml sets
+# APP_ENV=prod). Unset counts as prod here, so losing the setting on Render never turns them back on.
+DEV_ENVS = ("dev", "development")
+
+
+def api_docs_on(environ=None) -> bool:
+    environ = os.environ if environ is None else environ
+    return (environ.get("APP_ENV") or "").strip().lower() in DEV_ENVS
+
+
+def api_docs_settings(environ=None) -> dict:
+    """FastAPI's arguments for the docs: none in dev (its defaults), every docs URL off otherwise."""
+    return {} if api_docs_on(environ) else {"docs_url": None, "redoc_url": None, "openapi_url": None}
+
+
+API_DOCS = api_docs_on()
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # Safety (feature 3): loads the fallback classifiers, reads today's Clef neurons, one log line
     await safety.startup()
+    print("[INFO] API docs: " + ("on at /docs, /redoc and /openapi.json (APP_ENV=dev)." if API_DOCS
+                                 else "off (set APP_ENV=dev to see them locally)."))
     # Reranking (feature 4): which engine orders the chunks, its fallback, and what's used of the free limits
     await asyncio.gather(rerank_service.load_usage(), rerank_service.warm_up())
     print(f"[INFO] {rerank_service.status()}.")
@@ -41,7 +63,7 @@ async def lifespan(app: FastAPI):
     # traces queued at that moment would be lost. Waits at most 5 s; never raises.
     await asyncio.to_thread(observability.shutdown)
 
-app = FastAPI(title="AI News Intelligence API", lifespan=lifespan)
+app = FastAPI(title="AI News Intelligence API", lifespan=lifespan, **api_docs_settings())
 
 # --- Security headers on every response (feature 3 #70) ---
 # The answer is model output written from scraped pages, so the page assumes some text in it could be
@@ -49,8 +71,8 @@ app = FastAPI(title="AI News Intelligence API", lifespan=lifespan)
 # CSS built into static/tailwind.css), load nothing from other sites (an image link in an answer can't
 # send data out, #68), talk only to this server, and not be framed. Inline scripts, inline styles and
 # onclick="" attributes are refused by the browser, so injected HTML that got past the server still
-# couldn't run. FastAPI's /docs and /redoc pages load Swagger from a CDN: they get the headers without
-# the CSP (Section M #101 turns them off in prod).
+# couldn't run. FastAPI's /docs and /redoc pages load Swagger from a CDN: in dev, where they exist
+# (Section M #101), they get the headers without the CSP. In prod nothing is exempt.
 CONTENT_SECURITY_POLICY = ("default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self'; connect-src 'self'; "
                            "font-src 'self'; object-src 'none'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'")
 SECURITY_HEADERS = {
@@ -58,12 +80,17 @@ SECURITY_HEADERS = {
     "Referrer-Policy": "no-referrer",          # opening a source sends it nothing about this app
     "X-Frame-Options": "DENY",                 # frame-ancestors for older browsers
 }
-CSP_EXEMPT = ("/docs", "/redoc")
+CSP_EXEMPT = ("/docs", "/redoc") if API_DOCS else ()
+
+
+def csp_exempt(path: str) -> bool:
+    """Swagger's pages in dev: /docs, /redoc and /docs/oauth2-redirect (not /docsx). Nothing in prod."""
+    return any(path == prefix or path.startswith(prefix + "/") for prefix in CSP_EXEMPT)
 
 
 def security_headers(path: str) -> dict:
     headers = dict(SECURITY_HEADERS)
-    if not path.startswith(CSP_EXEMPT):
+    if not csp_exempt(path):
         headers["Content-Security-Policy"] = CONTENT_SECURITY_POLICY
     return headers
 
@@ -92,13 +119,17 @@ class SecurityHeaders:
 # Who the visitor is, the request body cap (413), and the per-visitor limits per minute and per day
 # (429, SAFETY_RATE_LIMIT), before the body is parsed and before a trace starts. Added first, so it
 # runs inside SecurityHeaders: its own 413 / 429 responses get the security headers too.
+# --- Endpoint checks (feature 3, Section M #100) ---
+# Inside ClientLimits (the visitor is known, and a flagged request's event reaches its trace): a body
+# that isn't JSON -> 415, a request sent by another website -> flagged, or 403 with SAFETY_ORIGIN=enforce.
+# No CORS middleware, on purpose: no other site may call the API from a browser (a test keeps it so).
+app.add_middleware(endpoints.RequestOrigin)
 app.add_middleware(limits.ClientLimits)
 app.add_middleware(SecurityHeaders)
 
 # Setup templates and static files
 templates = Jinja2Templates(directory=str(BASE_DIR / "templates"))
 # Ensure static directory exists before mounting
-import os
 static_dir = BASE_DIR / "static"
 if static_dir.exists():
     app.mount("/static", StaticFiles(directory=str(static_dir)), name="static")

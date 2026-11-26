@@ -15,7 +15,7 @@ import lxml.html
 from bs4 import BeautifulSoup
 
 from services import errors, observability, usage
-from services.safety import privacy
+from services.safety import events, network, privacy
 
 # Building a TLS context loads the CA bundle, which blocks for ~0.5 s. Build it once
 # at import and share it, instead of once per AsyncClient (i.e. per request).
@@ -317,9 +317,14 @@ def _failure_reason(e: Exception) -> str:
     Groups a scrape failure so the logs show which fix would pay off:
     HTTP errors point to blocking, too little text to paywalls or empty pages.
     ScrapeFailed reasons: "HTTP <code>", "not HTML (<type>)", "too little text".
+    Feature 3 #98: "blocked address (<why>)" from the SSRF guard, "too many redirects" past MAX_REDIRECTS.
     """
     if isinstance(e, ScrapeFailed):
         return str(e)
+    if isinstance(e, network.BlockedAddress):
+        return f"blocked address ({e.reason})"
+    if isinstance(e, httpx.TooManyRedirects):
+        return f"too many redirects (over {network.MAX_REDIRECTS})"
     if isinstance(e, (asyncio.TimeoutError, TimeoutError)):
         return f"timeout (page took over {PAGE_DEADLINE_SECONDS:.0f} s)"
     if isinstance(e, httpx.TimeoutException):
@@ -406,6 +411,10 @@ async def fetch_one_article(client: httpx.AsyncClient, url: str) -> dict:
     except Exception as e:
         reason = _failure_reason(e)
         print(f"[WARN] Scrape failed ({reason}): {url}")
+        if isinstance(e, network.BlockedAddress):
+            # Feature 3 #98: on the scrape's span and in the log, so an attempt shows on the dashboards (O)
+            events.record(events.SafetyEvent(check="ssrf", verdict="block", mode="enforce", where="scrape", score=None,
+                                             threshold=None, engine="code", ms=0.0, label=e.reason, enforced=True))
         return {
             "url": url,
             "full_text": None,
@@ -432,8 +441,13 @@ async def scrape_results(urls: list[str]) -> list[dict]:
     if not urls:
         return []
 
-    async with httpx.AsyncClient(verify=SSL_CONTEXT, headers=SCRAPE_HEADERS,
-                                 limits=httpx.Limits(max_connections=20)) as client:
+    # Feature 3 #98: every hop is checked (check_request) and every connection goes only to a public
+    # address that was checked when its name was resolved (guarded_transport); at most 5 redirects
+    limits = httpx.Limits(max_connections=20)
+    async with httpx.AsyncClient(verify=SSL_CONTEXT, headers=SCRAPE_HEADERS, limits=limits,
+                                 transport=network.guarded_transport(SSL_CONTEXT, limits),
+                                 max_redirects=network.MAX_REDIRECTS,
+                                 event_hooks={"request": [network.check_request]}) as client:
         print(f"[INFO] Starting parallel scrape for {len(urls)} articles...")
         results = await asyncio.gather(*(fetch_one_article(client, url) for url in urls))
 

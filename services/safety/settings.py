@@ -51,6 +51,9 @@ CHECKS = {
     # L: per visitor. The other limits (body size, build queue, scrape caps, GNews, embedding and Clef
     # budgets) protect the server itself and are always on.
     "rate_limit": Check("L", "per-visitor limits per minute, daily shares of chat calls and of new follows", built=True),
+    # M: the browser says which site sent the request (Sec-Fetch-Site, Origin). The JSON-only rule
+    # (415), the SSRF guard on scrapes and the API docs being off in prod are always on.
+    "origin": Check("M", "API requests sent by another website (cross-site): refused with 403 in enforce", built=True),
 }
 
 # Not a check: sites the operator decided never to use (feature 3, G #54). Exact domains, comma- or

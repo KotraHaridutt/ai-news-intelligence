@@ -279,6 +279,15 @@ def follow_limit(seconds_left=None, log=""):
     return AppError(429, "You've followed the maximum number of topics for today. Please try again tomorrow.",
                     log, _retry_after(seconds_left))
 
+def not_json(log=""):
+    """M #100: a request body that isn't sent as JSON (the page always sends application/json)."""
+    return AppError(415, "The request wasn't sent the way this app's page sends it. Please reload the page and try again.", log)
+
+def cross_site_request(log=""):
+    """M #100: a request that changes or costs something, sent by another website (enforce mode)."""
+    return AppError(403, "This request came from another website, so it wasn't accepted. "
+                         "Please use the app's own page and try again.", log)
+
 
 # --- Following a topic (feature 1) ---
 

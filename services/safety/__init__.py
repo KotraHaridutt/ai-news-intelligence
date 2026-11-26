@@ -18,6 +18,9 @@ LLM safety (feature 3). The shared core every guard uses (Section B):
                and timeline format flags (Section I)
   limits       per-visitor limits (per minute, daily shares), the body-size cap, the ClientLimits middleware
                (Section L; the GNews and embedding budgets are in services/usage.py)
+  agency       no tool is bound to any chat model: walked at startup and in the tests (Section M #96)
+  network      the scraper's SSRF guard: public addresses only, checked on every hop and connection (M #98)
+  endpoints    JSON bodies only (415) and SAFETY_ORIGIN, requests from other sites (M #100)
 
 The guards themselves (Sections C-L) call check() with a run() that usually calls judge().
 """
@@ -35,7 +38,7 @@ async def startup():
     """At app start: loads the classifiers, reads today's Clef neurons, warms the Clef connection,
     prints the one safety line."""
     from services import usage            # usage imports this package
-    from services.safety import limits
+    from services.safety import agency, endpoints, limits, network
     classifier.load_all()
     await asyncio.gather(clef.load_today(), clef.warm_up(), usage.load_today())
     if settings.engine() == "clef" and not clef.available():
@@ -48,3 +51,6 @@ async def startup():
     print(f"[INFO] Limits: {limits.status()}; GNews {usage.gnews_sent_today()}/{usage.GNEWS_DAILY_LIMIT} today; "
           f"{usage.embedding_requests_today()}/{usage.EMBED_REQUESTS_PER_DAY} embedding requests today "
           f"(safety stops at {usage.SAFETY_EMBED_DAY_MAX}).")
+    # Section M: no tools on any chat model (#96), scrapes reach public addresses only (#98), API requests (#100)
+    print(f"[INFO] Agency: {agency.status()}; scrapes: public addresses only, checked on every connection, "
+          f"at most {network.MAX_REDIRECTS} redirects; requests: {endpoints.status()}.")

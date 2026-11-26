@@ -165,7 +165,7 @@ def _event(where: str, count: int, limit: int, per: str, client: str, mode: str)
         ms=0.0, label=f"{count}/{limit} {per}", text_hash=client, enforced=mode == "enforce")
 
 
-def _note(event: events.SafetyEvent):
+def note_event(event: events.SafetyEvent):
     """An over-limit request in monitor mode is served: its event waits for the request's trace to open
     (flush_events, an observability request hook), so it lands on the root span. Outside a request: logged."""
     state = _request.get()
@@ -226,7 +226,7 @@ async def check_route(bucket: str, daily: str | None, client: str, state: dict |
         if mode == "enforce":
             events.record(event)                  # no trace yet: the log line
             return errors.rate_limited(reset, f"{bucket}: {count} requests this minute (limit {limit}), client {client}")
-        _note(event)
+        note_event(event)
     if daily and used is not None:
         share = _DAILY[daily]()
         if used >= share:
@@ -236,7 +236,7 @@ async def check_route(bucket: str, daily: str | None, client: str, state: dict |
                 log = f"{daily}: {used} today (limit {share}), client {client}"
                 return (errors.daily_share_used(until_reset, log) if daily == "chat"
                         else errors.follow_limit(until_reset, log))
-            _note(event)
+            note_event(event)
     return None
 
 
@@ -296,7 +296,7 @@ def status() -> str:
 
 # --- The middleware ---
 
-async def _send_error(error: errors.AppError, scope, receive, send, extra_headers: dict | None = None):
+async def send_error(error: errors.AppError, scope, receive, send, extra_headers: dict | None = None):
     print(f"[WARN] {scope.get('path')} -> {error.status}: {error.log}")
     headers = {**(extra_headers or {}), **(error.headers or {})}
     await JSONResponse(status_code=error.status, content={"detail": error.message}, headers=headers)(scope, receive, send)
@@ -351,17 +351,17 @@ class ClientLimits:
         if method in _BODY_METHODS:
             length = (_header_values(scope, b"content-length") or [""])[0].strip()
             if length.isdigit() and int(length) > MAX_BODY_BYTES:
-                return await _send_error(errors.request_too_large(f"Content-Length {length} (limit {MAX_BODY_BYTES})"),
+                return await send_error(errors.request_too_large(f"Content-Length {length} (limit {MAX_BODY_BYTES})"),
                                          scope, receive, send)
         route = route_of(method, path)
         if route is not None:
             error = await check_route(*route, client, state)
             if error is not None:
-                return await _send_error(error, scope, receive, send, state["headers"])
+                return await send_error(error, scope, receive, send, state["headers"])
         if method in _BODY_METHODS:
             messages, size = await _read_body(receive, MAX_BODY_BYTES)
             if messages is None:
-                return await _send_error(errors.request_too_large(f"body over {MAX_BODY_BYTES} bytes, no Content-Length"),
+                return await send_error(errors.request_too_large(f"body over {MAX_BODY_BYTES} bytes, no Content-Length"),
                                          scope, receive, send)
             original = receive
 
